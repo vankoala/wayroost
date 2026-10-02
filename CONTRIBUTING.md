@@ -13,8 +13,8 @@ someone's machine, so correctness and safety come first.
 ## Development setup
 
 ```bash
-git clone https://github.com/vankoala/signalbox
-cd signalbox
+git clone https://github.com/vankoala/wayroost
+cd wayroost
 npm ci --ignore-scripts
 npm test
 npm run build:web && npm run demo    # http://127.0.0.1:8795 with demo data

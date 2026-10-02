@@ -6,11 +6,11 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/vankoala/signalbox.git"
+    "url": "https://github.com/vankoala/wayroost.git"
   },
-  "homepage": "https://github.com/vankoala/signalbox#readme",
+  "homepage": "https://github.com/vankoala/wayroost#readme",
   "bugs": {
-    "url": "https://github.com/vankoala/signalbox/issues"
+    "url": "https://github.com/vankoala/wayroost/issues"
   },
   "keywords": [
     "ai-agents",

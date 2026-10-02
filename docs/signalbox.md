@@ -178,7 +178,7 @@ every step is safe to repeat. In short:
    Debian's group-writable `/usr/local/src`.
 
    ```bash
-   sudo git clone https://github.com/vankoala/signalbox /opt/src/signalbox
+   sudo git clone https://github.com/vankoala/wayroost /opt/src/signalbox
    ```
 
 2. **Create a Cloudflare Access application** (Zero Trust → Access →

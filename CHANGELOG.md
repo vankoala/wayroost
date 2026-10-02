@@ -350,4 +350,4 @@ The first public release, to be tagged 0.1.0.
 - An independent adversarial review covered the whole codebase before this
   release. Its findings and fixes are listed in [SECURITY.md](SECURITY.md).
 
-[Unreleased]: https://github.com/vankoala/signalbox/commits/main
+[Unreleased]: https://github.com/vankoala/wayroost/commits/main

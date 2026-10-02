@@ -38,7 +38,7 @@ swap the code. That rules out your home directory, and also Debian's
 `/opt` works:
 
 ```bash
-sudo git clone https://github.com/vankoala/signalbox /opt/src/signalbox
+sudo git clone https://github.com/vankoala/wayroost /opt/src/signalbox
 ```
 
 ## 2. Create the Cloudflare Access application
