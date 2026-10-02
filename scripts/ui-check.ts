@@ -12,6 +12,7 @@ import { EventHub } from '../server/src/hub.js';
 import { createAccessVerifier } from '../server/src/security/access.js';
 import { demoAssist, demoConnectors, demoDashboard, demoHelper, demoPaseoSchedules } from './demo-connectors.js';
 import { Schedules } from '../server/src/schedules.js';
+import { SafetyCommandsSetting } from '../server/src/hermes/safety.js';
 import { demoSkills } from './demo-skills.js';
 import { DEMO_TRANSCRIPT, DemoSpeech } from './demo-speech.js';
 import { demoFeed } from './demo-feed.js';
@@ -61,6 +62,8 @@ const app = await buildApp({
   whatsappRouting: demoHelper,
   phone: demoHelper,
   skills: demoSkills,
+  // Settings → Security reads this on every Settings screen; off, as on a fresh install.
+  safetyCommands: new SafetyCommandsSetting(config.stateDir),
   speech,
   logger: false,
 });
