@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  ui:
+    name: UI check (headless Chrome)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check:ui
+        env:
+          CHROME: /usr/bin/google-chrome
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: ui-screenshots
+          path: ui-shots/
+
+  paseo-compat:
+    name: Paseo ${{ matrix.paseo }} compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The pinned 0.5.1 run is required. The latest Paseo release is checked too,
+    # as an early warning, but its failure doesn't fail CI.
+    continue-on-error: ${{ matrix.paseo == 'latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        paseo: ['0.5.1', 'latest']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Install Paseo daemon ${{ matrix.paseo }}
+        env:
+          PASEO_VERSION: ${{ matrix.paseo }}
+        run: npm install --prefix "$RUNNER_TEMP/paseo" --ignore-scripts --no-audit --no-fund "@getpaseo/server@$PASEO_VERSION"
+      - name: Run Signalbox against a real Paseo daemon (fake ACP agent)
+        run: npm run check:paseo -- "$RUNNER_TEMP/paseo/node_modules/@getpaseo/server"

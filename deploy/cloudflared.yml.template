@@ -1,0 +1,19 @@
+# Cloudflare Tunnel for Signalbox. Only the Signalbox app is routed; Hermes (9119)
+# and Paseo (6777) are never exposed. cloudflared also checks the Access token
+# before forwarding anything (second check; the app verifies it a third time).
+tunnel: __TUNNEL_ID__
+no-autoupdate: true
+# QUIC (UDP) keeps timing out through WSL2 NAT; HTTP/2 over TCP is steady.
+protocol: http2
+# Fixed local readiness endpoint (GET /ready) for health checks.
+metrics: 127.0.0.1:8791
+ingress:
+  - hostname: __HOSTNAME__
+    service: http://127.0.0.1:__PORT__
+    originRequest:
+      access:
+        required: true
+        teamName: __TEAM_NAME__
+        audTag:
+          - __AUD__
+  - service: http_status:404

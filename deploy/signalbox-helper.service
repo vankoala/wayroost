@@ -1,0 +1,49 @@
+[Unit]
+Description=Signalbox helper (Google sign-in and mail triggers for Signalbox Connectors)
+Documentation=file:///opt/signalbox/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Filled in by deploy/setup-helper.sh: the user Hermes runs as, and its home.
+User=@USER@
+Environment=HERMES_HOME=@HERMES_HOME@
+Environment=SIGNALBOX_HELPER_PORT=@PORT@
+# Optional: the shopping Chrome's DevTools address (for example http://<windows-host>:9227), set in a drop-in.
+# Only /json/version is asked, to show whether it's running.
+# The shared secret Signalbox sends; the same file reaches Signalbox the same way.
+LoadCredential=token:/etc/signalbox/helper.token
+ExecStart=/usr/bin/python3 /opt/signalbox/bin/signalbox-helper.py
+Restart=on-failure
+RestartSec=3
+
+# It only needs Hermes' home (Google skill files, trigger folders, the gate script).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@HERMES_HOME@
+# Settings → Skills keeps these the same as the shared folder ("-": skipped when missing).
+ReadWritePaths=-@HOME@/.agents/skills -@HOME@/.claude/skills -@HOME@/.codex/skills -@HOME@/.pi/agent/skills -@HOME@/.config/opencode/skills
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,66 @@
+[Unit]
+Description=Signalbox speech service (speech-to-text and text-to-speech on the CPU, for voice mode)
+Documentation=file:///opt/signalbox/README.md
+Requires=signalbox-speech.socket
+After=signalbox-speech.socket
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Root-owned venv and models from deploy/setup-speech.sh; the script from install.sh.
+ExecStart=/opt/signalbox-speech/venv/bin/python /opt/signalbox/bin/signalbox-speech.py
+Environment=SPEECH_MODELS=/opt/signalbox-speech/models
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=OMP_NUM_THREADS=4
+Restart=on-failure
+RestartSec=5
+
+# Its whole world is an empty, root-owned directory with only the system's
+# programs and libraries, its own program and its models mounted in, read-only:
+# no /etc (but the loader's cache), /home, /root, /var, /run (other services'
+# sockets) or /mnt (the Windows drives). Its socket arrives from systemd already
+# open, so it needs no path to it. setup-speech.sh makes the directory.
+RootDirectory=/opt/signalbox-speech/root
+BindReadOnlyPaths=/usr /lib /lib64 /etc/ld.so.cache /opt/signalbox-speech/venv /opt/signalbox-speech/models /opt/signalbox/bin/signalbox-speech.py
+# /usr/local holds this machine's own source trees and tools: none of its business.
+TemporaryFileSystem=/usr/local:ro
+MountAPIVFS=yes
+DynamicUser=yes
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# This hides /proc/cpuinfo, so ONNX Runtime logs "Error in cpuinfo" at start. Harmless:
+# it detects CPU features itself (measured the same speed with and without).
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=3G
+TasksMax=64
+
+[Install]
+# Started at boot so the models are loaded before the first voice message.
+WantedBy=multi-user.target

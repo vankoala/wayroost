@@ -1,0 +1,7 @@
+name: signalbox-identity
+version: "0.2.0"
+description: "Tells the Signalbox project bridge which Hermes chat is calling it (the hidden _signalbox_caller argument on mcp__signalbox__* calls, sent as a header), and reports once per process which agent's shell started this Hermes (launcher ids from the starting environment only), so Signalbox can nest it. Does nothing in Hermes agents that Paseo runs."
+author: "Signalbox"
+provides_hooks:
+  - on_session_start
+  - pre_tool_call

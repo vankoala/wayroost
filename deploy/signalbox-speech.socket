@@ -1,0 +1,16 @@
+[Unit]
+Description=Signalbox speech service socket (voice mode)
+Documentation=file:///opt/signalbox/README.md
+
+[Socket]
+# Only root and the signalbox-voice group (Signalbox, through a drop-in
+# deploy/setup-speech.sh adds) can connect. systemd makes it, so nobody else
+# can put a socket of their own at this path.
+ListenStream=/run/signalbox-speech.sock
+SocketUser=root
+SocketGroup=signalbox-voice
+SocketMode=0660
+Accept=no
+
+[Install]
+WantedBy=sockets.target

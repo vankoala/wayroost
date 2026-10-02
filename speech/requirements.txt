@@ -1,0 +1,9 @@
+# The speech service's Python packages, pinned by hash (pip --require-hashes).
+# deploy/setup-speech.sh installs them into the root-owned venv /opt/signalbox-speech/venv
+# with the system Python 3.12 on Linux x86_64, wheels only.
+sherpa-onnx==1.13.8 \
+    --hash=sha256:6949773017647febc0c3696dffb2c67dd3febd4737b87e3dd135a42773704a06
+sherpa-onnx-core==1.13.8 \
+    --hash=sha256:4da90acf435373d7b2ba9cc0be806e7e274d28f63f5780880b5dea6721626e36
+numpy==2.5.3 \
+    --hash=sha256:b7e18c623bb5c95acb3b3328861272816ba199fb531921c5d6d0b675f1fde9e3

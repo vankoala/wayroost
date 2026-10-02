@@ -1,0 +1,12 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 8790 },
+  "publicOrigin": "https://signalbox.example.com",
+  "access": {
+    "teamDomain": "https://YOUR-TEAM.cloudflareaccess.com",
+    "aud": "YOUR-ACCESS-APPLICATION-AUD-TAG",
+    "allowedEmails": ["you@example.com"]
+  },
+  "hermes": { "enabled": true, "url": "http://127.0.0.1:9119" },
+  "paseo": { "enabled": true, "url": "ws://127.0.0.1:6777" },
+  "stateDir": "/var/lib/signalbox"
+}

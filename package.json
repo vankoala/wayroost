@@ -1,0 +1,73 @@
+{
+  "name": "signalbox",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A self-hosted, phone-first control room for your AI agents (Hermes Agent + Paseo), behind Cloudflare Access.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vankoala/signalbox.git"
+  },
+  "homepage": "https://github.com/vankoala/signalbox#readme",
+  "bugs": {
+    "url": "https://github.com/vankoala/signalbox/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "hermes-agent",
+    "paseo",
+    "coding-agents",
+    "cloudflare-access",
+    "cloudflare-tunnel",
+    "self-hosted",
+    "pwa",
+    "mobile"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev:web": "vite --config web/vite.config.ts",
+    "build": "npm run build:web && npm run build:server",
+    "build:web": "vite build --config web/vite.config.ts",
+    "build:server": "node scripts/build-server.mjs",
+    "start": "node dist/server/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
+    "test": "vitest run",
+    "demo": "tsx scripts/demo.ts",
+    "check:ui": "npm run build:web && tsx scripts/ui-check.ts ui-shots",
+    "check:paseo": "tsx scripts/paseo-compat/run.ts"
+  },
+  "dependencies": {
+    "@fastify/static": "10.1.5",
+    "@fastify/websocket": "11.3.1",
+    "@getpaseo/client": "0.5.1",
+    "@getpaseo/protocol": "0.5.1",
+    "fastify": "5.12.5",
+    "jose": "6.2.12",
+    "ws": "8.22.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/jsdom": "30.0.0",
+    "@types/markdown-it": "14.2.0",
+    "@types/node": "22.20.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/ws": "8.18.1",
+    "@vitejs/plugin-react": "6.1.1",
+    "dompurify": "3.4.16",
+    "esbuild": "0.28.2",
+    "jsdom": "30.1.1",
+    "lucide-react": "1.48.0",
+    "markdown-it": "15.0.2",
+    "playwright-core": "1.63.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vite": "8.3.1",
+    "vitest": "5.0.2"
+  }
+}

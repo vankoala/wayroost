@@ -1,0 +1,55 @@
+[Unit]
+Description=Signalbox web app (remote control for Hermes and Paseo)
+Documentation=file:///opt/signalbox/README.md
+After=network-online.target
+Wants=network-online.target
+# Give up after 5 failed starts in a minute (e.g. a bad config) instead of
+# retrying every 3 s forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/signalbox/dist/server/index.js
+WorkingDirectory=/opt/signalbox
+Environment=NODE_ENV=production
+Environment=SIGNALBOX_CONFIG=/etc/signalbox/config.json
+Restart=on-failure
+RestartSec=3
+
+# Runs as a throwaway system user with no home and no access to /home.
+DynamicUser=yes
+StateDirectory=signalbox
+StateDirectoryMode=0700
+UMask=0077
+
+# Sandbox
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=768M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

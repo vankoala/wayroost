@@ -1,0 +1,372 @@
+/* Settings → Skills (components/SkillsSheet.tsx). Uses the tokens in styles.css. */
+
+/* Wraps instead of scrolling sideways: a sideways-scrolling row inside the scrolled sheet
+   stops being painted in Chrome once the sheet scrolls. */
+.skills-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.skills-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.skills-chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.skills-chip[aria-pressed='true'] {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--bg);
+}
+
+.skills-chip .count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 6px;
+  background: var(--warn);
+  color: #1b1300;
+  font-size: 11px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.skills-views {
+  margin-bottom: 12px;
+}
+
+.skills-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  margin: 12px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  color: var(--text-3);
+}
+
+.skills-search input {
+  flex: 1;
+  min-width: 0;
+  height: 40px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 16px; /* no zoom on iPhone */
+  outline: none;
+}
+
+.skills-search .btn {
+  margin: 4px 0;
+}
+
+.skills-filters {
+  margin-bottom: 12px;
+  align-items: center;
+}
+
+.skills-count {
+  color: inherit;
+  opacity: 0.7;
+  font-size: 12px;
+}
+
+.skills-app-select {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.skills-list {
+  padding: 0;
+  /* Keeps any drawing glitch inside the list (Chrome GPU raster drew a screen-size pill once). */
+  contain: layout paint;
+}
+
+.skill-row,
+.market-row {
+  border-bottom: 1px solid var(--border);
+}
+
+.skill-row:last-child,
+.market-row:last-child {
+  border-bottom: 0;
+}
+
+.skill-head {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 12px 14px;
+  color: inherit;
+}
+
+.skill-head:hover {
+  background: var(--bg-hover);
+}
+
+.skill-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.skill-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.skill-origin,
+.skill-trust {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 8px;
+  color: var(--text-2);
+  background: var(--bg-elev-2);
+}
+
+.skill-origin.shared {
+  color: var(--success);
+}
+
+.skill-origin.hermes-hub,
+.skill-origin.hermes-bundled,
+.skill-origin.hermes-made {
+  color: var(--hermes);
+  background: var(--hermes-bg);
+}
+
+.skill-trust.builtin,
+.skill-trust.trusted {
+  color: var(--success);
+}
+
+.skill-trust.community {
+  color: var(--warn);
+}
+
+.warn-icon {
+  color: var(--warn);
+}
+
+.skill-desc {
+  margin-top: 2px;
+  max-height: 2.8em;
+  line-height: 1.4;
+  overflow: hidden;
+  font-size: 13px;
+}
+
+.skill-summary {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.skill-summary-warn {
+  color: var(--warn);
+}
+
+.skill-apps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.skill-app {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.skill-app.ok {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.skill-app.warn {
+  color: var(--warn);
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+}
+
+.skill-app.off {
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
+.skill-detail {
+  padding: 0 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.skill-detail p {
+  margin: 0;
+}
+
+.skill-copies {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.skill-copy {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.skill-copy dt {
+  color: var(--text-2);
+}
+
+.skill-copy dd {
+  margin: 0;
+  text-align: right;
+  color: var(--text-3);
+}
+
+.skill-edited,
+.skill-switches {
+  border-top: 1px solid var(--border);
+}
+
+.skill-edited .kv {
+  flex-wrap: wrap;
+}
+
+.skill-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-start;
+}
+
+.skill-scan {
+  border: 1px solid var(--warn-border);
+  background: var(--warn-bg);
+  border-radius: var(--radius-sm);
+  padding: 0 12px 12px;
+}
+
+.skill-scan.bad {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.skill-findings {
+  margin: 0 0 10px;
+  padding-left: 18px;
+  font-size: 13px;
+}
+
+.skill-findings .sev {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+.skill-findings .sev.critical,
+.skill-findings .sev.high {
+  color: var(--danger);
+}
+
+.skill-findings .sev.medium {
+  color: var(--warn);
+}
+
+.skill-view pre {
+  max-height: 420px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--code-bg);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.skills-news .kv {
+  align-items: flex-start;
+}
+
+.skills-news .dot {
+  margin-top: 6px;
+  flex-shrink: 0;
+}
+
+.skills-when {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.skills-more {
+  width: 100%;
+  margin-top: 10px;
+}
+
+.skills-foot {
+  font-size: 12px;
+  margin-top: 12px;
+}
+
+.market-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.market-detail h3 {
+  margin: 10px 0 2px;
+}
+
+.market-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.market-detail p {
+  margin: 0;
+}
