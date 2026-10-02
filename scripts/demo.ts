@@ -10,6 +10,7 @@ import { EventHub } from '../server/src/hub.js';
 import { createAccessVerifier } from '../server/src/security/access.js';
 import { demoAssist, demoConnectors, demoDashboard, demoHelper, demoPaseoSchedules } from './demo-connectors.js';
 import { Schedules } from '../server/src/schedules.js';
+import { SafetyCommandsSetting } from '../server/src/hermes/safety.js';
 import { DemoHermes, DemoPaseo, startDemoBridge } from './demo-sources.js';
 import { demoFeed } from './demo-feed.js';
 import { createLocalAccess, startEdge } from './lib/local-access.js';
@@ -51,6 +52,8 @@ const app = await buildApp({
   whatsappRouting: demoHelper,
   phone: demoHelper,
   feed,
+  // Settings → Security reads this on every Settings screen; off, as on a fresh install.
+  safetyCommands: new SafetyCommandsSetting(config.stateDir),
   logger: false,
 });
 await app.listen({ host: '127.0.0.1', port: APP_PORT });
