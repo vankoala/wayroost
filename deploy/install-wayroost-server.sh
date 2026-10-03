@@ -16,7 +16,7 @@ while (( $# )); do
     --dry-run) DRY_RUN=1; shift ;;
     --remove) REMOVE=1; shift ;;
     --root|--paseo-password-file|--safety-owner|--safety-paseo-config)
-      (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || fail "Missing value for $1."
+      if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then fail "Missing value for $1."; fi
       case "$1" in
         --root) ROOT_PREFIX="$2" ;;
         --paseo-password-file) PASSWORD_FILE="$2" ;;

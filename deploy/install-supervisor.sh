@@ -23,7 +23,7 @@ while (( $# )); do
     --status-only) STATUS_ONLY=true; shift ;;
     --enable-actions) STATUS_ONLY=false; shift ;;
     --root|--launch-script|--coder-script|--hold-dir|--components-file)
-      (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || fail "Missing value for $1."
+      if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then fail "Missing value for $1."; fi
       case "$1" in
         --root) ROOT_PREFIX="$2" ;;
         --launch-script) LAUNCH_SCRIPT="$2" ;;
