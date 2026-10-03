@@ -58,6 +58,8 @@ contains "WRITE $ROOT/etc/wayroost/server-key mode=0600 owner=root:root"
 contains 'DISPLAY rescue key ONCE on /dev/tty only'
 plan "$REPO/deploy/install-supervisor.sh"
 contains '"statusOnly": true'
+# npm 10 refuses one file loaded as both user and global config.
+contains 'NPM_CONFIG_USERCONFIG=/dev/null'; absent 'NPM_CONFIG_GLOBALCONFIG=/dev/null'
 contains "WRITE $ROOT/etc/wayroost/components.local.json mode=0600 owner=root:root"
 contains '"id": "main-model"'; contains '"url": "http://127.0.0.1:19001/health"'
 plan "$REPO/deploy/install-supervisor.sh" --enable-actions

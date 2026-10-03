@@ -78,7 +78,9 @@ install_build() {
     run rsync -a --delete -- "$REPO/dist/web" "$(path_at_root "$dest")/dist/"
   fi
   run install -m 0644 -o root -g root -- "$REPO/package.json" "$REPO/package-lock.json" "$(path_at_root "$dest")/"
-  run env NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG=/dev/null NPM_CONFIG_CACHE="$(path_at_root "$dest")/.npm-cache" \
+  # npm 10 refuses one file as both user and global config ("double-loading config"),
+  # so the global config is a path that never exists, inside the root-only destination.
+  run env NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG="$(path_at_root "$dest")/.npm-no-globalconfig" NPM_CONFIG_CACHE="$(path_at_root "$dest")/.npm-cache" \
     "$npm" ci --prefix "$(path_at_root "$dest")" --omit=dev --ignore-scripts --no-audit --no-fund
   run rm -rf -- "$(path_at_root "$dest")/.npm-cache"
   run chown -R root:root -- "$(path_at_root "$dest")"
