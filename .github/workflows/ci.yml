@@ -21,7 +21,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
       - run: npm ci --ignore-scripts
+      # The root typecheck reads the desktop app's Electron types.
+      - run: npm ci --ignore-scripts --prefix desktop
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
