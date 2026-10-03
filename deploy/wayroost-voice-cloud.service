@@ -1,0 +1,57 @@
+[Unit]
+Description=Wayroost optional ElevenLabs output voice
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/opt/wayroost/server/voice-node /opt/wayroost/server/dist/server/voice-cloud.js
+# The installer resolves the trusted runtime and binds only that file here.
+BindReadOnlyPaths=/usr/bin/node:/opt/wayroost/server/voice-node
+WorkingDirectory=/opt/wayroost/server
+Environment=WAYROOST_VOICE_CLOUD_SOCKET=/run/wayroost-voice-cloud/voice.sock
+LoadCredential=elevenlabs-api-key:/etc/wayroost/elevenlabs-api-key
+DynamicUser=yes
+Group=wayroost-voice-cloud
+RuntimeDirectory=wayroost-voice-cloud
+RuntimeDirectoryMode=0750
+UMask=0007
+Restart=on-failure
+RestartSec=3
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/mnt -/media -/srv -/opt/signalbox -/usr/local -/run/wayroost -/run/wayroost-paseo-safety -/run/signalbox-speech.sock
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+# Permit only the system resolver stub within the blocked localhost range.
+IPAddressAllow=127.0.0.53
+TemporaryFileSystem=/tmp:ro /var/tmp:ro
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+# The sole HTTPS destination is fixed in cloud-api.ts; redirects are never followed.
+ReadWritePaths=/run/wayroost-voice-cloud
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

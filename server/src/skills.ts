@@ -1,3 +1,4 @@
+import { checkDeviceSignal, actionSignal } from './security/device-signal.js';
 import type {
   MarketInstall,
   MarketPreview,
@@ -8,6 +9,7 @@ import type {
 } from '../../shared/skills.js';
 import type { Dashboard } from './connectors/service.js';
 import { UserFacingError } from './sources.js';
+import { shadowBackground, type BackgroundGate } from './background.js';
 
 // Settings → Skills: every agent's skills, kept the same everywhere. The helper (running
 // as the Hermes user) reads the skill folders, spreads the shared folder (~/.agents/skills)
@@ -35,6 +37,7 @@ export interface SkillsHelperApi {
 }
 
 export interface SkillsDeps {
+  background?: BackgroundGate;
   helper: SkillsHelperApi;
   /** Hermes' dashboard, for the marketplace (undefined before you sign in to Hermes). */
   dashboard: () => Dashboard | undefined;
@@ -67,6 +70,7 @@ export class Skills {
 
   /** Watch the helper's change counter so open pages refresh by themselves. */
   start(): void {
+    if ((this.deps.background ?? shadowBackground).role !== 'primary') return;
     const tick = async () => {
       try {
         const version = await this.deps.helper.skillsVersion();
@@ -131,10 +135,11 @@ export class Skills {
     if (!dashboard) throw new UserFacingError('Sign in to Hermes in Settings first: the marketplace is its skills hub.', 409);
     let res: Response;
     try {
+      checkDeviceSignal();
       res = await dashboard.fetch(path, {
         method,
         ...(body === undefined ? {} : { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: actionSignal(AbortSignal.timeout(timeoutMs)),
       });
     } catch {
       throw new UserFacingError("The skills hub didn't answer in time. Try again.", 504);

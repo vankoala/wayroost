@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,14 +29,34 @@ import { parseConfig, type AppConfig } from '../src/config.js';
 import type { Connectors } from '../src/connectors/service.js';
 import type { SpeechService } from '../src/speech.js';
 import type { Feed } from '../src/feed/service.js';
+import { Devices } from '../src/devices.js';
 import { EventHub } from '../src/hub.js';
+import type { PowerOptions } from '../src/power.js';
+import type { SupervisorApi } from '../src/supervisor-client.js';
 import { createAccessVerifier } from '../src/security/access.js';
 import type { CreatePaseoAgentInput, HermesSource, PaseoSource } from '../src/sources.js';
 
 export const ISSUER = 'https://testteam.cloudflareaccess.com';
 export const AUD = 'test-aud-0123456789abcdef';
 export const EMAIL = 'owner@example.com';
-export const ORIGIN = 'https://signalbox.example.com';
+export const ORIGIN = 'https://wayroost.example.com';
+
+/** Obviously fake paired devices every test app starts with (see seedDevices). */
+export const TEST_DESKTOP = { id: `dv_${'0'.repeat(23)}1`, secret: `desktop_test_secret_${'d'.repeat(23)}` };
+export const TEST_PHONE = { id: `dv_${'0'.repeat(23)}2`, secret: `phone_test_secret_${'p'.repeat(25)}` };
+export const DESKTOP_COOKIE = `wr_device=${TEST_DESKTOP.id}.${TEST_DESKTOP.secret}`;
+export const PHONE_COOKIE = `wr_device=${TEST_PHONE.id}.${TEST_PHONE.secret}`;
+
+/** Writes devices.json with the test desktop and phone, as if both had paired. */
+export function seedDevices(stateDir: string): void {
+  const hash = (secret: string) => createHash('sha256').update(secret).digest('hex');
+  const at = 1_700_000_000_000;
+  const devices = [
+    { ...TEST_DESKTOP, name: 'Test desktop', kind: 'desktop', scopes: [] },
+    { ...TEST_PHONE, name: 'Test phone', kind: 'phone', scopes: [] },
+  ].map(({ secret, ...d }) => ({ ...d, created: at, lastSeen: at, secretHash: hash(secret) }));
+  writeFileSync(join(stateDir, 'devices.json'), JSON.stringify({ version: 1, devices }), { mode: 0o600 });
+}
 
 export interface Keys {
   privateKey: CryptoKey;
@@ -73,21 +94,25 @@ export async function makeToken(
     .sign(overrides.key ?? keys.privateKey);
 }
 
-export function makeConfig(staticDir?: string): AppConfig {
+/** A config with Access and device sign-in, its state directory seeded with the test devices. */
+export function makeConfig(staticDir?: string, extra: Record<string, unknown> = {}): AppConfig {
+  const stateDir = mkdtempSync(join(tmpdir(), 'sb-state-'));
+  seedDevices(stateDir);
   return parseConfig({
     publicOrigin: ORIGIN,
     access: { teamDomain: ISSUER, aud: AUD, allowedEmails: [EMAIL] },
-    stateDir: mkdtempSync(join(tmpdir(), 'sb-state-')),
+    stateDir,
     ...(staticDir ? { staticDir } : {}),
+    ...extra,
   });
 }
 
 export function makeStaticDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'sb-static-'));
   mkdirSync(join(dir, 'assets'));
-  writeFileSync(join(dir, 'index.html'), '<!doctype html><title>Signalbox</title><div id="root"></div>');
+  writeFileSync(join(dir, 'index.html'), '<!doctype html><title>Wayroost</title><div id="root"></div>');
   writeFileSync(join(dir, 'assets', 'app.js'), 'console.log(1)');
-  writeFileSync(join(dir, 'manifest.webmanifest'), '{"name":"Signalbox"}');
+  writeFileSync(join(dir, 'manifest.webmanifest'), '{"name":"Wayroost"}');
   return dir;
 }
 
@@ -187,7 +212,7 @@ export class FakeHermes implements HermesSource {
   }
   async newChatOptions(): Promise<HermesOptions> {
     this.calls.push('options');
-    return { models: [{ id: '["local","flash-next"]', label: 'flash-next', group: 'Local' }], defaultModel: '["local","flash-next"]' };
+    return { models: [{ id: '["local","main-model"]', label: 'main-model', group: 'Local' }], defaultModel: '["local","main-model"]' };
   }
   async setCredentials(username: string) {
     this.calls.push(`creds:${username}`);
@@ -272,44 +297,70 @@ export async function makeApp(
     wsMaxLifetimeMs?: number;
     connectors?: Connectors;
     speech?: SpeechService;
+    cloudSpeech?: AppDeps['cloudSpeech'];
     whatsappRouting?: AppDeps['whatsappRouting'];
     phone?: AppDeps['phone'];
     schedules?: AppDeps['schedules'];
     /** Builds For you from this app's hub and fake Hermes. */
     feed?: (deps: { hub: EventHub; hermes: FakeHermes; stateDir: string }) => Feed;
     skills?: AppDeps['skills'];
+    /** Status & power: a supervisor to talk to (the fake in power.test.ts). */
+    supervisor?: SupervisorApi;
+    /** Status & power: short confirm life, a clock the test drives. */
+    power?: PowerOptions;
+    /** Capture what the server would log instead of turning logging off. */
+    logger?: boolean | Record<string, unknown>;
+    /** Config fields on top of the test config (e.g. device sign-in off). */
+    configExtra?: Record<string, unknown>;
+    workerApprovals?: AppDeps['workerApprovals'];
+    safetyCommands?: AppDeps['safetyCommands'];
+    tasks?: AppDeps['tasks'];
+    bridge?: AppDeps['bridge'];
+    workerUpdates?: AppDeps['workerUpdates'];
   } = {},
 ) {
-  const config = makeConfig(options.staticDir);
+  const config = makeConfig(options.staticDir, options.configExtra);
+  // The app's own device store, so a test can pair another device.
+  const devices = config.devices.enabled ? new Devices(config.stateDir) : undefined;
   const hub = new EventHub();
   const hermes = new FakeHermes();
   const paseo = new FakePaseo();
-  const verifier = createAccessVerifier({ ...config.access, keySource: keys.keySource });
+  const verifier = createAccessVerifier({ ...config.access!, keySource: keys.keySource });
   const feed = options.feed?.({ hub, hermes, stateDir: config.stateDir });
   const app = await buildApp({
     config,
     verifier,
+    ...(devices ? { devices } : {}),
     hub,
     sources: { hermes, paseo },
-    logger: false,
+    logger: options.logger ?? false,
     ...(options.wsMaxLifetimeMs ? { wsMaxLifetimeMs: options.wsMaxLifetimeMs } : {}),
     ...(options.connectors ? { connectors: options.connectors } : {}),
     ...(options.speech ? { speech: options.speech } : {}),
+    ...(options.cloudSpeech ? { cloudSpeech: options.cloudSpeech } : {}),
     ...(options.whatsappRouting ? { whatsappRouting: options.whatsappRouting } : {}),
     ...(options.phone ? { phone: options.phone } : {}),
     ...(options.schedules ? { schedules: options.schedules } : {}),
+    ...(options.supervisor ? { supervisor: options.supervisor } : {}),
+    ...(options.power ? { power: options.power } : {}),
     ...(feed ? { feed } : {}),
     ...(options.skills ? { skills: options.skills } : {}),
+    ...(options.workerApprovals ? { workerApprovals: options.workerApprovals } : {}),
+    ...(options.safetyCommands ? { safetyCommands: options.safetyCommands } : {}),
+    ...(options.tasks ? { tasks: options.tasks } : {}),
+    ...(options.bridge ? { bridge: options.bridge } : {}),
+    ...(options.workerUpdates ? { workerUpdates: options.workerUpdates } : {}),
   });
-  return { app, config, hub, hermes, paseo, feed };
+  return { app, config, hub, hermes, paseo, feed, devices };
 }
 
-/** Headers our own frontend sends on an API call from the public origin. */
+/** Headers our own frontend sends on an API call from the public origin, signed in as the test desktop. */
 export function apiHeaders(token: string, extra: Record<string, string> = {}): Record<string, string> {
   return {
     host: new URL(ORIGIN).host,
     'cf-access-jwt-assertion': token,
-    'x-signalbox-request': '1',
+    cookie: DESKTOP_COOKIE,
+    'x-wayroost-request': '1',
     'sec-fetch-site': 'same-origin',
     ...extra,
   };

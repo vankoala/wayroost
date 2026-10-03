@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -100,7 +101,7 @@ describe('app: tidying up threads', () => {
     const body = { threads: [{ source: 'paseo', id: 'p1' }] };
     expect((await post(app, '/api/threads/delete', body, { host, origin: ORIGIN, 'content-type': 'application/json' })).statusCode).toBe(401);
     const crossSite: Record<string, string> = { ...postHeaders(token), origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' };
-    delete crossSite['x-signalbox-request'];
+    delete crossSite['x-wayroost-request'];
     expect((await post(app, '/api/threads/delete', body, crossSite)).statusCode).toBe(403);
     expect((await post(app, '/api/cleanup', { idleDays: 1 }, crossSite)).statusCode).toBe(403);
     expect(paseo.tidying.calls).toEqual([]);
@@ -177,7 +178,7 @@ describe('hermes: archive, restore, delete, idle', () => {
     hub.add({ readyState: 1, bufferedAmount: 0, send: (p: string) => events.push(JSON.parse(p)), terminate() {} } as never, 'x');
     const stateDir = mkdtempSync(join(tmpdir(), 'sb-tidy-'));
     new SecretStore(stateDir).writeHermes(FAKE_USER);
-    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog);
+    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { background: new BackgroundGate('primary') });
   });
 
   afterEach(async () => {
@@ -299,6 +300,11 @@ function fakePaseo() {
       return () => {};
     },
     on: () => () => {},
+    observeEvents: () => ({
+      ready: Promise.resolve({ subscriptionId: 'fake-events' }),
+      subscribe: () => () => {},
+      release: async () => {},
+    }),
     connect: async () => statusListener?.({ status: 'connected' }),
     close: async () => {},
     getLastServerInfoMessage: () => null,
@@ -306,6 +312,11 @@ function fakePaseo() {
     fetchAgents: async (options: { filter?: { includeArchived?: boolean } }) => ({
       entries: [...listed, ...(options.filter?.includeArchived ? archived : [])].map((a) => ({ agent: a, project: null })),
       pageInfo: { hasMore: false, nextCursor: null },
+    }),
+    observeAgents: () => ({
+      ready: client.fetchAgents({}).then((page) => ({ ...page, subscriptionId: 'fake-agents' })),
+      subscribe: () => () => {},
+      release: async () => {},
     }),
     fetchAgent: async ({ agentId }: { agentId: string }) => {
       const found = archived.find((a) => a.id === agentId);
@@ -334,7 +345,7 @@ describe('paseo: archive, restore, delete, idle', () => {
     const hub = new EventHub();
     events = [];
     hub.add({ readyState: 1, bufferedAmount: 0, send: (p: string) => events.push(JSON.parse(p)), terminate() {} } as never, 'x');
-    const adapter = new PaseoAdapter('ws://127.0.0.1:6777', hub, quietLog, 'cid_test', () => daemon.client as never);
+    const adapter = new PaseoAdapter('ws://127.0.0.1:19007', hub, quietLog, 'cid_test', () => daemon.client as never, new BackgroundGate('primary'));
     adapter.start();
     await expect.poll(() => adapter.status().state).toBe('connected');
     return { adapter, daemon };

@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { randomBytes } from 'node:crypto';
 import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
@@ -31,6 +32,7 @@ import {
   SLASH_MESSAGE,
   WAIT_NEEDS_IDENTITY,
   type BridgeIdentity,
+  type SystemMessage,
 } from '../src/bridge/service.js';
 import { readOrCreateBridgeToken } from '../src/bridge/token.js';
 import { ConfigError, parseConfig } from '../src/config.js';
@@ -264,12 +266,14 @@ function setup(options: { busyAfterSend?: boolean } = {}) {
     'owner@example.com',
   );
   const { lines, log } = recordingLog();
-  const bridge = new Bridge({ sources: fakeSources(world), hub, log, port: 8792, now: () => now, pollMs: 0 });
+  const sources = fakeSources(world);
+  const bridge = new Bridge({ background: new BackgroundGate('primary'), sources, hub, log, port: 19012, now: () => now, pollMs: 0 });
   const from = (identity: BridgeIdentity) => ({
     call: (tool: string, args: object = {}) => bridge.call(tool, args, identity),
   });
   return {
     world,
+    sources,
     bridge,
     events,
     logs: lines,
@@ -439,7 +443,7 @@ describe('bridge: send_message', () => {
     const { from, world } = setup();
     expect(await from({ cwd: `${APP}/server` }).call('send_message', { chat: 'paseo:idle', text: 'a' })).toEqual({
       delivered: 'now',
-      note: "Delivered. Signalbox couldn't identify your chat, so they can't reply to you through the bridge.",
+      note: "Delivered. Wayroost couldn't identify your chat, so they can't reply to you through the bridge.",
     });
     await from({ cwd: `${APP}/server` }).call('send_message', { chat: 'hermes:h-app', text: 'b', backend_hint: 'hermes' });
     await from({ cwd: '/home/me' }).call('send_message', { chat: 'paseo:caller', text: 'c', project: APP });
@@ -497,6 +501,93 @@ describe('bridge: send_message', () => {
     advance(10_000);
     await bridge.deliverQueued();
     expect(texts()).toEqual(['one', 'two']);
+  });
+
+  it.each(['503', 'ECONNRESET'] as const)('keeps ordinary messages and their send attempts through a readiness lookup outage: %s', async (kind) => {
+    const { caller, bridge, set, world, texts } = setup();
+    await caller.call('send_message', { chat: 'paseo:busy', text: 'Demo queued message' });
+    set('busy', { status: 'idle' });
+    const source = Reflect.get(bridge, 'options').sources.paseo as PaseoSource;
+    const list = source.listConversations.bind(source);
+    source.listConversations = async () => {
+      throw kind === '503' ? new UserFacingError('Demo lookup unavailable', 503)
+        : Object.assign(new Error('Demo reset'), { code: 'ECONNRESET' });
+    };
+    for (let i = 0; i < 8; i++) await bridge.tick();
+    expect(world.sent).toEqual([]);
+    expect((Reflect.get(bridge, 'queues') as Map<string, unknown[]>).get('paseo:busy')).toHaveLength(1);
+    source.listConversations = list;
+    // Two real send failures still leave the third attempt available.
+    world.sendError = new UserFacingError('Demo send rejected', 502);
+    await bridge.tick(); await bridge.tick();
+    expect((Reflect.get(bridge, 'queues') as Map<string, unknown[]>).get('paseo:busy')).toHaveLength(1);
+    world.sendError = null;
+    await bridge.tick();
+    expect(texts()).toEqual(['Demo queued message']);
+    bridge.stop();
+  });
+
+  it('keeps ordinary messages through readiness holds in the guarded send without spending attempts', async () => {
+    const { caller, bridge, sources, set, texts } = setup();
+    set('h-app', { status: 'running' });
+    await caller.call('send_message', { chat: 'hermes:h-app', text: 'Demo queued message' });
+    set('h-app', { status: 'idle' });
+    let holding = true;
+    sources.hermes.sendMessageWhenIdle = async (id, text, beforeSubmit) => {
+      await beforeSubmit?.();
+      if (holding) throw new UserFacingError('Demo recipient readiness is unknown', 503);
+      await sources.hermes.sendMessage(id, text);
+    };
+    for (let i = 0; i < 8; i++) await bridge.tick();
+    expect(texts()).toEqual([]);
+    expect((Reflect.get(bridge, 'queues') as Map<string, Array<{ attempts: number }>>).get('hermes:h-app')?.[0]?.attempts).toBe(0);
+    holding = false;
+    await bridge.tick();
+    expect(texts()).toEqual(['Demo queued message']);
+    bridge.stop();
+  });
+
+  it('checks the continuation settling window before delivering a retargeted ordinary message', async () => {
+    const { caller, bridge, sources, world, set, advance, texts } = setup();
+    set('h-app', { status: 'running' });
+    await caller.call('send_message', { chat: 'hermes:h-app', text: 'Demo queued message' });
+    world.chats.push(chat('hermes', 'demo-continuation', APP));
+    await caller.call('send_message', { chat: 'hermes:demo-continuation', text: 'Demo current activity' });
+    sources.hermes.resolveChat = (id) => id === 'h-app' ? 'demo-continuation' : id;
+    await bridge.tick(); await bridge.tick();
+    expect(texts()).toEqual(['Demo current activity']);
+    advance(11_000);
+    await bridge.tick();
+    expect(texts()).toEqual(['Demo current activity', 'Demo queued message']);
+    expect(world.sent.map((m) => m.chat)).toEqual(['hermes:demo-continuation', 'hermes:demo-continuation']);
+    bridge.stop();
+  });
+
+  it('does not also hand an ordinary message to a wait while its adapter is sending it', async () => {
+    const { caller, bridge, sources, set, texts } = setup();
+    set('h-app', { status: 'running' });
+    await caller.call('send_message', { chat: 'hermes:h-app', text: 'Demo queued message' });
+    set('h-app', { status: 'idle' });
+    let release!: () => void;
+    let started!: () => void;
+    const sending = new Promise<void>((resolve) => { started = resolve; });
+    const response = new Promise<void>((resolve) => { release = resolve; });
+    const send = sources.hermes.sendMessage.bind(sources.hermes);
+    sources.hermes.sendMessage = async (id, text) => { started(); await response; await send(id, text); };
+    const delivery = bridge.tick();
+    await sending;
+    const hangUp = new AbortController();
+    const wait = bridge.call('wait_for_reply', { chat: 'paseo:caller' }, { hermesSession: 'h-app', cwd: APP },
+      { signal: hangUp.signal }).catch(() => 'hung up');
+    try {
+      await expect.poll(() => bridge.activeWaits).toBe(1);
+      release();
+      await delivery;
+      expect(texts()).toEqual(['Demo queued message']);
+      expect(bridge.activeWaits).toBe(1);
+      hangUp.abort();
+      expect(await wait).toBe('hung up');
+    } finally { release(); hangUp.abort(); bridge.stop(); }
   });
 
   it('keeps at most 5 messages waiting for one chat', async () => {
@@ -709,7 +800,7 @@ describe('bridge: the kill switch and activity counts', () => {
     await caller.call('send_message', { chat: 'paseo:idle', text: 'now' });
     await caller.call('send_message', { chat: 'paseo:busy', text: 'later' });
     await caller.call('start_chat', { backend: 'hermes', text: 'new chat' });
-    expect(bridge.status()).toEqual({ enabled: true, paused: false, port: 8792, recent: { sent: 1, queued: 1, started: 1 } });
+    expect(bridge.status()).toEqual({ enabled: true, paused: false, port: 19012, recent: { sent: 1, queued: 1, started: 1 } });
 
     expect(bridge.setPaused(true)).toMatchObject({ paused: true });
     const calls: Array<[string, object]> = [
@@ -1142,7 +1233,7 @@ describe('bridge: wait_for_reply', () => {
 // ---- the loopback listener -------------------------------------------------------
 
 const TOKEN = randomBytes(32).toString('base64url');
-const PORT = 8792;
+const PORT = 19012;
 
 function stubBridge(answer: (tool: string) => unknown = () => ({ hello: 'world' })) {
   const seen: Array<{ tool: string; args: unknown; identity: BridgeIdentity }> = [];
@@ -1157,7 +1248,7 @@ function stubBridge(answer: (tool: string) => unknown = () => ({ hello: 'world' 
 
 async function listener(bridge = stubBridge()) {
   const { lines, log } = recordingLog();
-  const app = await buildBridgeServer({ bridge, token: TOKEN, port: PORT, log });
+  const app = await buildBridgeServer({ background: new BackgroundGate('primary'), bridge, token: TOKEN, port: PORT, log });
   cleanups.push(() => app.close());
   const post = (tool: string, body: unknown, headers: Record<string, string> = {}) =>
     app.inject({
@@ -1176,7 +1267,7 @@ describe('bridge listener', () => {
     for (const authorization of ['', `Bearer ${wrong}`, `Basic ${TOKEN}`, `Bearer ${TOKEN}x`, 'Bearer']) {
       const res = await post('list_chats', {}, { authorization });
       expect(res.statusCode, authorization).toBe(401);
-      expect(res.json()).toEqual({ ok: false, error: "Signalbox didn't accept the bridge token." });
+      expect(res.json()).toEqual({ ok: false, error: "Wayroost didn't accept the bridge token." });
     }
     const noAuth = await app.inject({
       method: 'POST',
@@ -1236,7 +1327,7 @@ describe('bridge listener', () => {
     expect(refusedRes.json()).toEqual({ ok: false, error: NOT_IN_PROJECT });
     const broken = await post('start_chat', {});
     expect(broken.statusCode).toBe(500);
-    expect(broken.json()).toEqual({ ok: false, error: 'Something went wrong in Signalbox.' });
+    expect(broken.json()).toEqual({ ok: false, error: 'Something went wrong in Wayroost.' });
     expect(logs.some((l) => l.msg === 'bridge request failed')).toBe(true);
     expect(bridge.seen.map((s) => s.tool)).toEqual(['read_chat', 'start_chat']);
   });
@@ -1260,8 +1351,8 @@ describe('bridge listener', () => {
   it('holds wait_for_reply open over TCP until the answer, and drops it when the caller hangs up', async () => {
     const port = await freePort();
     const world = makeWorld();
-    const bridge = new Bridge({ sources: fakeSources(world), hub: new EventHub(), log: recordingLog().log, port, pollMs: 0 });
-    const app = await buildBridgeServer({ bridge, token: TOKEN, port, log: recordingLog().log });
+    const bridge = new Bridge({ background: new BackgroundGate('primary'), sources: fakeSources(world), hub: new EventHub(), log: recordingLog().log, port, pollMs: 0 });
+    const app = await buildBridgeServer({ background: new BackgroundGate('primary'), bridge, token: TOKEN, port, log: recordingLog().log });
     cleanups.push(() => app.close());
     await app.listen({ host: '127.0.0.1', port });
     const call = (tool: string, body: object, agent: string, signal?: AbortSignal) =>
@@ -1292,8 +1383,8 @@ describe('bridge listener', () => {
   it("works over TCP with Node's fetch, end to end", async () => {
     const port = await freePort();
     const world = makeWorld();
-    const bridge = new Bridge({ sources: fakeSources(world), hub: new EventHub(), log: recordingLog().log, port, pollMs: 0 });
-    const app = await buildBridgeServer({ bridge, token: TOKEN, port, log: recordingLog().log });
+    const bridge = new Bridge({ background: new BackgroundGate('primary'), sources: fakeSources(world), hub: new EventHub(), log: recordingLog().log, port, pollMs: 0 });
+    const app = await buildBridgeServer({ background: new BackgroundGate('primary'), bridge, token: TOKEN, port, log: recordingLog().log });
     cleanups.push(() => app.close());
     await app.listen({ host: '127.0.0.1', port });
 
@@ -1342,10 +1433,10 @@ describe('app: /api/bridge', () => {
   async function app(withBridge: boolean) {
     const config = makeConfig();
     const hub = new EventHub();
-    const bridge = new Bridge({ sources: fakeSources(makeWorld()), hub, log: recordingLog().log, port: PORT, pollMs: 0 });
+    const bridge = new Bridge({ background: new BackgroundGate('primary'), sources: fakeSources(makeWorld()), hub, log: recordingLog().log, port: PORT, pollMs: 0 });
     const instance = await buildApp({
       config,
-      verifier: createAccessVerifier({ ...config.access, keySource: keys.keySource }),
+      verifier: createAccessVerifier({ ...config.access!, keySource: keys.keySource }),
       hub,
       sources: { hermes: new FakeHermes(), paseo: new FakePaseo() },
       logger: false,
@@ -1385,7 +1476,7 @@ describe('app: /api/bridge', () => {
     expect(get.json()).toEqual({ enabled: false, paused: false, recent: { sent: 0, queued: 0, started: 0 } });
     const res = await put({ paused: true });
     expect(res.statusCode).toBe(409);
-    expect(res.json()).toEqual({ error: 'The Signalbox bridge is turned off in the server config.' });
+    expect(res.json()).toEqual({ error: 'The Wayroost bridge is turned off in the server config.' });
   });
 });
 
@@ -1393,19 +1484,19 @@ describe('app: /api/bridge', () => {
 
 describe('bridge config and token', () => {
   const valid = {
-    publicOrigin: 'https://signalbox.example.com',
+    publicOrigin: 'https://wayroost.example.com',
     access: { teamDomain: 'https://myteam.cloudflareaccess.com', aud: 'abc123', allowedEmails: ['me@example.com'] },
     stateDir: '/var/lib/signalbox',
   };
 
-  it('is off by default on port 8792, and validated strictly', () => {
-    expect(parseConfig(valid).bridge).toEqual({ enabled: false, port: 8792 });
-    expect(parseConfig({ ...valid, bridge: { enabled: true } }).bridge).toEqual({ enabled: true, port: 8792 });
+  it('is off by default on port 19012, and validated strictly', () => {
+    expect(parseConfig(valid).bridge).toEqual({ enabled: false, port: 19012 });
+    expect(parseConfig({ ...valid, bridge: { enabled: true } }).bridge).toEqual({ enabled: true, port: 19012 });
     expect(parseConfig({ ...valid, bridge: { enabled: true, port: 9000 } }).bridge).toEqual({ enabled: true, port: 9000 });
     const bad = [
-      { bridge: { enabled: true, port: 8790 } }, // the app's own port
+      { bridge: { enabled: true, port: 19010 } }, // the app's own port
       { listen: { host: '127.0.0.1', port: 9000 }, bridge: { enabled: true, port: 9000 } },
-      { bridge: { enabled: true, port: 8791 } }, // cloudflared metrics
+      { bridge: { enabled: true, port: 19011 } }, // cloudflared metrics
       { bridge: { enabled: 'yes' } },
       { bridge: { enabled: true, host: '0.0.0.0' } },
       { bridge: { port: 70000 } },
@@ -1415,18 +1506,454 @@ describe('bridge config and token', () => {
 
   it('creates a private random token once and keeps it', () => {
     const dir = mkdtempSync(join(tmpdir(), 'sb-bridge-'));
-    const token = readOrCreateBridgeToken(dir);
+    const token = readOrCreateBridgeToken(dir, new BackgroundGate('primary'));
     expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
     const file = join(dir, 'bridge-token');
     expect(statSync(file).mode & 0o777).toBe(0o600);
     expect(readFileSync(file, 'utf8')).toBe(token);
-    expect(readOrCreateBridgeToken(dir)).toBe(token);
+    expect(readOrCreateBridgeToken(dir, new BackgroundGate('primary'))).toBe(token);
 
     chmodSync(file, 0o644);
-    expect(readOrCreateBridgeToken(dir)).toBe(token);
+    expect(readOrCreateBridgeToken(dir, new BackgroundGate('primary'))).toBe(token);
     expect(statSync(file).mode & 0o777).toBe(0o600);
 
     writeFileSync(file, 'short');
-    expect(() => readOrCreateBridgeToken(dir)).toThrow(/usable bridge token/);
+    expect(() => readOrCreateBridgeToken(dir, new BackgroundGate('primary'))).toThrow(/usable bridge token/);
+  });
+});
+
+describe('messages from Signalbox itself (the task log)', () => {
+  function system(key: string, target: { source: Source; id: string }, extra: Partial<SystemMessage> = {}) {
+    const outcome = { delivered: [] as number[], dropped: [] as string[] };
+    const message: SystemMessage = {
+      key,
+      target,
+      sender: 'Signalbox task log',
+      text: `[Worker update] ${key}`,
+      delivered: (at) => outcome.delivered.push(at),
+      dropped: (reason) => outcome.dropped.push(reason),
+      ...extra,
+    };
+    return { message, outcome };
+  }
+
+  it('removes an acknowledged system entry after an equal-time update sorts ahead of it', async () => {
+    const { bridge, sources, world, advance } = setup();
+    const high = system('task:demo-z:finished#1', { source: 'hermes', id: 'h-app' });
+    const low = system('task:demo-a:finished#1', { source: 'hermes', id: 'h-app' });
+    let release!: () => void;
+    let started!: () => void;
+    const acknowledgement = new Promise<void>((resolve) => { release = resolve; });
+    const submission = new Promise<void>((resolve) => { started = resolve; });
+    const send = sources.hermes.sendMessage.bind(sources.hermes);
+    sources.hermes.sendMessage = async (id, text) => {
+      await send(id, text);
+      if (world.sent.length === 1) { started(); await acknowledgement; }
+    };
+    try {
+      bridge.deliverSystem(high.message);
+      const delivery = bridge.tick();
+      await submission;
+      bridge.deliverSystem(low.message);
+      release();
+      await delivery;
+      for (let i = 0; i < 3; i++) { advance(11_000); await bridge.tick(); }
+      expect(world.sent.map((m) => m.text)).toEqual([
+        bridgeEnvelope(high.message.sender, high.message.text), bridgeEnvelope(low.message.sender, low.message.text),
+      ]);
+      expect(high.outcome).toEqual({ delivered: [T0], dropped: [] });
+      expect(low.outcome).toEqual({ delivered: [T0 + 11_000], dropped: [] });
+    } finally { release(); bridge.stop(); }
+  });
+
+  it('preserves a replacement with the same system key when the earlier send is acknowledged', async () => {
+    const { bridge, sources, world, advance } = setup();
+    const original = system('task:demo:finished#1', { source: 'hermes', id: 'h-app' }, { text: '[Worker update] Demo original' });
+    const replacement = system(original.message.key, original.message.target, { text: '[Worker update] Demo replacement' });
+    let release!: () => void;
+    let started!: () => void;
+    const acknowledgement = new Promise<void>((resolve) => { release = resolve; });
+    const submission = new Promise<void>((resolve) => { started = resolve; });
+    const send = sources.hermes.sendMessage.bind(sources.hermes);
+    sources.hermes.sendMessage = async (id, text) => {
+      await send(id, text);
+      if (world.sent.length === 1) { started(); await acknowledgement; }
+    };
+    try {
+      bridge.deliverSystem(original.message);
+      const delivery = bridge.tick();
+      await submission;
+      expect(bridge.withdrawSystem(original.message.key)).toBe(true);
+      bridge.deliverSystem(replacement.message);
+      release();
+      await delivery;
+      expect(replacement.outcome).toEqual({ delivered: [], dropped: [] });
+      advance(11_000);
+      await bridge.tick();
+      expect(world.sent.map((m) => m.text)).toEqual([
+        bridgeEnvelope(original.message.sender, original.message.text), bridgeEnvelope(replacement.message.sender, replacement.message.text),
+      ]);
+      expect(original.outcome).toEqual({ delivered: [T0], dropped: ['withdrawn'] });
+      expect(replacement.outcome).toEqual({ delivered: [T0 + 11_000], dropped: [] });
+    } finally { release(); bridge.stop(); }
+  });
+
+  it.each([502, 504])('charges repeated permanent %s failures instead of holding forever', async (status) => {
+    const { bridge, world } = setup();
+    const { message, outcome } = system('task:demo:finished#1', { source: 'hermes', id: 'h-app' });
+    bridge.deliverSystem(message);
+    world.sendError = new UserFacingError('Demo permanent RPC failure', status);
+    for (let i = 0; i < 20; i++) await bridge.tick();
+    expect(outcome).toEqual({ delivered: [], dropped: ['failed'] });
+    bridge.stop();
+  });
+
+  it.each(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'])('preserves a queued update during a connection-level %s failure', async (code) => {
+    const { bridge, world } = setup();
+    const { message, outcome } = system('task:demo:finished#1', { source: 'hermes', id: 'h-app' });
+    bridge.deliverSystem(message);
+    world.sendError = Object.assign(new Error('Demo connection unavailable'), { code });
+    for (let i = 0; i < 20; i++) await bridge.tick();
+    expect(outcome).toEqual({ delivered: [], dropped: [] });
+    world.sendError = null;
+    await bridge.tick();
+    expect(outcome).toEqual({ delivered: [T0], dropped: [] });
+    bridge.stop();
+  });
+
+  it('holds unknown readiness without spending permanent attempts or sending to an older chat', async () => {
+    const world = makeWorld();
+    const sources = fakeSources(world);
+    sources.hermes.listConversations = async () => [];
+    sources.hermes.resolveChat = () => 'demo-current';
+    const bridge = new Bridge({ sources, hub: new EventHub(), log: recordingLog().log, now: () => T0, pollMs: 0 });
+    const { message, outcome } = system('task:demo:finished#1', { source: 'hermes', id: 'h-app' });
+    bridge.deliverSystem(message);
+    for (let i = 0; i < 20; i++) await bridge.tick();
+    expect(world.sent).toEqual([]);
+    expect(outcome).toEqual({ delivered: [], dropped: [] });
+    bridge.stop();
+  });
+
+  it.each([503])('keeps a system update through repeated transient %s errors', async (status) => {
+    const { bridge, world } = setup();
+    const { message, outcome } = system('task:demo:finished#1', { source: 'hermes', id: 'h-app' });
+    bridge.deliverSystem(message);
+    world.sendError = new UserFacingError('Demo connection is temporarily unavailable', status);
+    for (let i = 0; i < 20; i++) await bridge.tick();
+    expect(outcome).toEqual({ delivered: [], dropped: [] });
+    world.sendError = null;
+    await bridge.tick();
+    expect(outcome).toEqual({ delivered: [T0], dropped: [] });
+    expect(world.sent).toHaveLength(1);
+  });
+
+  it('holds a system update if the source disconnects during evidence lookup', async () => {
+    const world = makeWorld();
+    const sources = fakeSources(world);
+    let connected = true;
+    sources.hermes.status = () => ({ source: 'hermes', state: connected ? 'connected' : 'disconnected' });
+    const bridge = new Bridge({ sources, hub: new EventHub(), log: recordingLog().log, now: () => T0, pollMs: 0 });
+    const { message, outcome } = system('task:demo:finished#1', { source: 'hermes', id: 'h-app' }, {
+      stillWanted: async () => { connected = false; return true; },
+    });
+    bridge.deliverSystem(message);
+    await bridge.tick();
+    expect(world.sent).toEqual([]);
+    expect(outcome).toEqual({ delivered: [], dropped: [] });
+    connected = true;
+    message.stillWanted = async () => true;
+    await bridge.tick();
+    expect(outcome.delivered).toEqual([T0]);
+  });
+
+  it('waits for the chat to be idle and settled, then delivers once, signed by Signalbox', async () => {
+    const { bridge, world, set } = setup();
+    set('h-app', { status: 'running' });
+    const { message, outcome } = system('task:w1:finished#1', { source: 'hermes', id: 'h-app' });
+    expect(bridge.deliverSystem(message)).toBe('queued');
+    expect(bridge.deliverSystem(message)).toBe('already queued');
+    await bridge.tick();
+    expect(world.sent).toEqual([]);
+    set('h-app', { status: 'idle' });
+    await bridge.tick();
+    expect(world.sent).toEqual([{ chat: 'hermes:h-app', text: bridgeEnvelope('Signalbox task log', '[Worker update] task:w1:finished#1') }]);
+    expect(parseBridgeEnvelope(world.sent[0]!.text)).toEqual({ sender: 'Signalbox task log', text: '[Worker update] task:w1:finished#1' });
+    expect(outcome).toEqual({ delivered: [T0], dropped: [] });
+    await bridge.tick();
+    expect(world.sent).toHaveLength(1);
+    // Not agents' activity: Settings' counts leave it out.
+    expect(bridge.status().recent).toEqual({ sent: 0, queued: 0, started: 0 });
+  });
+
+  it("never holds back an agent's message or uses up its queue limit", async () => {
+    const { bridge, world, caller, set } = setup();
+    set('idle', { status: 'running' });
+    for (let i = 1; i <= 6; i++) bridge.deliverSystem(system(`task:w${i}:finished#1`, { source: 'paseo', id: 'idle' }).message);
+    // Five agents' messages may still wait, as before.
+    for (let i = 0; i < 4; i++) await caller.call('send_message', { chat: 'paseo:idle', text: `queued ${i}` });
+    set('idle', { status: 'idle' });
+    // Idle again: an agent's message goes out now, not behind Signalbox's.
+    const fresh = setup();
+    fresh.bridge.deliverSystem(system('task:x:finished#1', { source: 'paseo', id: 'idle' }).message);
+    expect(await fresh.caller.call('send_message', { chat: 'paseo:idle', text: 'now' })).toMatchObject({ delivered: 'now' });
+    expect(world.sent).toEqual([]);
+  });
+
+  it('keeps at most ten of its own messages waiting for one chat', async () => {
+    const { bridge, set } = setup();
+    set('h-app', { status: 'running' });
+    for (let i = 1; i <= 10; i++) expect(bridge.deliverSystem(system(`task:w${i}:finished#1`, { source: 'hermes', id: 'h-app' }).message)).toBe('queued');
+    expect(bridge.deliverSystem(system('task:w11:finished#1', { source: 'hermes', id: 'h-app' }).message)).toBe('full');
+  });
+
+  it('holds while paused and goes out once resumed', async () => {
+    const { bridge, world } = setup();
+    bridge.setPaused(true);
+    const { message, outcome } = system('task:w1:finished#1', { source: 'hermes', id: 'h-app' });
+    bridge.deliverSystem(message);
+    await bridge.tick();
+    expect(world.sent).toEqual([]);
+    bridge.setPaused(false);
+    await bridge.tick();
+    expect(world.sent).toHaveLength(1);
+    expect(outcome.delivered).toHaveLength(1);
+  });
+
+  it.each([
+    { status: 'running' as const, pendingApprovals: 0 },
+    { status: 'needs_approval' as const, pendingApprovals: 1 },
+    { status: 'idle' as const, pendingApprovals: 1 },
+  ])('rechecks readiness after evidence lookup: %j', async (state) => {
+    const { bridge, world, set } = setup();
+    const { message, outcome } = system('task:demo:finished#1', { source: 'hermes', id: 'h-app' }, {
+      stillWanted: async () => {
+        set('h-app', state);
+        return true;
+      },
+    });
+    bridge.deliverSystem(message);
+    await bridge.tick();
+    expect(world.sent).toEqual([]);
+    expect(outcome).toEqual({ delivered: [], dropped: [] });
+    message.stillWanted = async () => true;
+    set('h-app', { status: 'idle', pendingApprovals: 0 });
+    await bridge.tick();
+    expect(outcome.delivered).toEqual([T0]);
+  });
+
+  it('rechecks the delivery reservation after another message goes out during evidence lookup', async () => {
+    const { bridge, world, caller, advance } = setup();
+    const { message, outcome } = system('task:demo:finished#1', { source: 'paseo', id: 'idle' }, {
+      stillWanted: async () => {
+        await caller.call('send_message', { chat: 'paseo:idle', text: 'Check the docs' });
+        return true;
+      },
+    });
+    bridge.deliverSystem(message);
+    await bridge.tick();
+    expect(world.sent).toHaveLength(1);
+    expect(outcome.delivered).toEqual([]);
+    message.stillWanted = async () => true;
+    advance(11_000);
+    await bridge.tick();
+    expect(outcome.delivered).toEqual([T0 + 11_000]);
+  });
+
+  it('checks the continuation delivery reservation when a system message is retargeted', async () => {
+    const { bridge, world, caller, advance } = setup();
+    let target: SystemMessage['target'] = { source: 'hermes', id: 'h-app' };
+    const { message, outcome } = system('task:demo:compressed#1', target, {
+      resolveTarget: async () => target,
+      stillWanted: async () => {
+        target = { source: 'paseo', id: 'idle' };
+        await caller.call('send_message', { chat: 'paseo:idle', text: 'Demo activity' });
+        return true;
+      },
+    });
+    bridge.deliverSystem(message);
+    await bridge.tick();
+    message.stillWanted = async () => true;
+    await bridge.tick();
+    expect(world.sent).toHaveLength(1);
+    expect(outcome.delivered).toEqual([]);
+    advance(11_000);
+    await bridge.tick();
+    expect(world.sent).toHaveLength(2);
+    expect(outcome.delivered).toEqual([T0 + 11_000]);
+  });
+
+  it.each([1, 2])('follows reported compression during readiness lookup %s without a target resolver', async (lookup) => {
+    const world = makeWorld();
+    const sources = fakeSources(world);
+    const old = world.chats.find((c) => c.id === 'h-app')!;
+    const continuation = chat('hermes', 'demo-continuation', APP, {
+      aliases: [{ source: 'hermes', id: old.id }], status: 'needs_approval', pendingApprovals: 1,
+    });
+    let current = old.id;
+    sources.hermes.resolveChat = () => current;
+    sources.hermes.summaryOf = () => world.chats.find((c) => c.id === current);
+    let listings = 0;
+    world.onList = () => {
+      if (++listings === lookup) { current = continuation.id; world.chats.splice(world.chats.indexOf(old), 1, continuation); }
+    };
+    const bridge = new Bridge({ sources, hub: new EventHub(), log: recordingLog().log, now: () => T0, pollMs: 0 });
+    const { message, outcome } = system('task:demo:compressed#1', old, { stillWanted: async () => true });
+    bridge.deliverSystem(message);
+    await bridge.tick();
+    expect(message.target).toEqual({ source: 'hermes', id: continuation.id });
+    await bridge.tick();
+    expect(world.sent).toEqual([]);
+    expect(outcome).toEqual({ delivered: [], dropped: [] });
+    continuation.status = 'idle';
+    continuation.pendingApprovals = 0;
+    await bridge.tick();
+    await bridge.tick();
+    expect(world.sent.map((m) => m.chat)).toEqual(['hermes:demo-continuation']);
+    expect(outcome).toEqual({ delivered: [T0], dropped: [] });
+    bridge.stop();
+  });
+
+  it('checks destination settling after compression during the final readiness lookup', async () => {
+    const { bridge, world, sources, caller, advance } = setup();
+    const old = world.chats.find((c) => c.id === 'h-app')!;
+    sources.hermes.summaryOf = () => old;
+    const continuation = chat('hermes', 'demo-continuation', APP);
+    world.chats.push(continuation);
+    await caller.call('send_message', { chat: 'hermes:demo-continuation', text: 'Demo activity' });
+    let target: SystemMessage['target'] = { source: 'hermes', id: 'h-app' };
+    let listings = 0;
+    world.onList = () => {
+      if (++listings !== 2) return;
+      continuation.aliases = [target];
+      world.chats.splice(world.chats.findIndex((c) => c.id === target.id), 1);
+      target = { source: 'hermes', id: continuation.id };
+    };
+    const { message, outcome } = system('task:demo:compressed#1', target, {
+      resolveTarget: async () => target, stillWanted: async () => true,
+    });
+    bridge.deliverSystem(message);
+    await bridge.tick();
+    await bridge.tick();
+    expect(world.sent).toHaveLength(1);
+    expect(outcome).toEqual({ delivered: [], dropped: [] });
+    advance(11_000);
+    await bridge.tick();
+    expect(world.sent.map((m) => m.chat)).toEqual(['hermes:demo-continuation', 'hermes:demo-continuation']);
+    expect(outcome).toEqual({ delivered: [T0 + 11_000], dropped: [] });
+  });
+
+  it('records the delivery time after a slow evidence lookup and send', async () => {
+    const { bridge, advance } = setup();
+    const { message, outcome } = system('task:demo:finished#1', { source: 'hermes', id: 'h-app' }, {
+      stillWanted: async () => {
+        advance(MIN);
+        return true;
+      },
+    });
+    bridge.deliverSystem(message);
+    await bridge.tick();
+    expect(outcome.delivered).toEqual([T0 + 2 * MIN]);
+  });
+
+  it('does not acknowledge a launch when its provenance could not be saved', async () => {
+    const { bridge, from, world } = setup();
+    bridge.watch({ started: () => { throw new Error('Task ledger write failed'); } });
+    await expect(from({ hermesSession: 'h-app' }).call('start_chat', {
+      backend: 'paseo', agent: 'claude', text: 'Profile the build',
+    })).rejects.toThrow('Task ledger write failed');
+    expect(world.created).toHaveLength(1);
+  });
+
+  it('is never handed to a wait_for_reply, and rate limits and the loop breaker leave it alone', async () => {
+    const { bridge, world, from, set, advance } = setup();
+    // The caller is busy in its wait; the update for it waits too.
+    set('caller', { status: 'running' });
+    const { message, outcome } = system('task:w1:finished#1', { source: 'paseo', id: 'caller' });
+    bridge.deliverSystem(message);
+    const wait = from({ paseoAgent: 'caller', cwd: APP }).call('wait_for_reply', { chat: 'paseo:idle', timeout_seconds: 120 });
+    await vi.waitFor(() => expect(bridge.activeWaits).toBe(1));
+    await bridge.tick();
+    expect(bridge.activeWaits).toBe(1); // still waiting: the update wasn't taken as an answer
+    bridge.setPaused(true); // ends the wait
+    await refused(wait, 503, PAUSED_MESSAGE);
+    bridge.setPaused(false);
+    set('caller', { status: 'idle' });
+    await bridge.tick();
+    expect(world.sent.map((s) => s.chat)).toEqual(['paseo:caller']);
+    expect(outcome.delivered).toHaveLength(1);
+    // Many more for the same chat: agents' per-target limit (6 / 10 min) doesn't count them.
+    for (let i = 2; i <= 8; i++) bridge.deliverSystem(system(`task:w${i}:finished#1`, { source: 'paseo', id: 'idle' }).message);
+    for (let i = 2; i <= 8; i++) {
+      await bridge.tick();
+      advance(11_000); // one at a time: each settles before the next
+    }
+    expect(world.sent.filter((s) => s.chat === 'paseo:idle')).toHaveLength(7);
+  });
+
+  it('reaches an older chat the recent list leaves out, through summaryOf', async () => {
+    const world = makeWorld();
+    const sources = fakeSources(world);
+    sources.hermes.summaryOf = (id) => (id === 'h-old' ? chat('hermes', 'h-old', APP) : undefined);
+    const bridge = new Bridge({ sources, hub: new EventHub(), log: recordingLog().log, now: () => T0, pollMs: 0 });
+    const { message, outcome } = system('task:w1:finished#1', { source: 'hermes', id: 'h-old' });
+    bridge.deliverSystem(message);
+    await bridge.tick();
+    expect(world.sent.map((s) => s.chat)).toEqual(['hermes:h-old']);
+    expect(outcome.delivered).toEqual([T0]);
+  });
+
+  it('reports permanent drops and keeps system news beyond the ordinary queue expiry', async () => {
+    const { bridge, world, advance, set } = setup();
+    const withdrawn = system('task:a:needs-approval#1', { source: 'hermes', id: 'h-app' });
+    set('h-app', { status: 'running' });
+    bridge.deliverSystem(withdrawn.message);
+    expect(bridge.withdrawSystem('task:a:needs-approval#1')).toBe(true);
+    expect(bridge.withdrawSystem('task:a:needs-approval#1')).toBe(false);
+    expect(withdrawn.outcome.dropped).toEqual(['withdrawn']);
+
+    const unwanted = system('task:b:finished#1', { source: 'paseo', id: 'idle' }, { stillWanted: async () => false });
+    bridge.deliverSystem(unwanted.message);
+    await bridge.tick();
+    expect(unwanted.outcome).toEqual({ delivered: [], dropped: ['unwanted'] });
+
+    const gone = system('task:c:finished#1', { source: 'paseo', id: 'idle' });
+    world.sendError = new UserFacingError('That chat no longer exists.', 404);
+    bridge.deliverSystem(gone.message);
+    advance(11_000);
+    await bridge.tick();
+    expect(gone.outcome.dropped).toEqual(['gone']);
+    world.sendError = null;
+
+    const late = system('task:d:finished#1', { source: 'hermes', id: 'h-app' });
+    bridge.deliverSystem(late.message);
+    advance(HOUR + 1);
+    await bridge.tick();
+    expect(late.outcome.dropped).toEqual([]);
+    set('h-app', { status: 'idle' });
+    await bridge.tick();
+    expect(late.outcome.delivered).toEqual([T0 + 11_000 + HOUR + 1]);
+    expect(world.sent).toHaveLength(1);
+  });
+
+  it('tells its watchers what a chat started and which waits came back', async () => {
+    const { bridge, from, set } = setup();
+    const started: Array<{ agent: string; by: string }> = [];
+    const waited: Array<{ caller: string; target: string; kind: string }> = [];
+    bridge.watch({
+      started: (agent, by) => started.push({ agent: `${agent.source}:${agent.id}`, by: `${by.source}:${by.id}` }),
+      waited: (caller, target, kind) => waited.push({ caller, target, kind }),
+    });
+    const hermes = from({ hermesSession: 'h-app' });
+    await hermes.call('start_chat', { backend: 'paseo', agent: 'claude', text: 'Profile the build' });
+    expect(started).toEqual([{ agent: 'paseo:new-1', by: 'hermes:h-app' }]);
+
+    const wait = hermes.call('wait_for_reply', { chat: 'paseo:new-1', timeout_seconds: 120 });
+    await vi.waitFor(() => expect(bridge.activeWaits).toBe(1));
+    await bridge.tick();
+    set('new-1', { status: 'idle', updatedAt: T0 + MIN });
+    await bridge.tick();
+    expect(((await wait) as { kind: string }).kind).toBe('finished');
+    expect(waited).toEqual([{ caller: 'hermes:h-app', target: 'paseo:new-1', kind: 'finished' }]);
   });
 });

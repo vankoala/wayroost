@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { shadowBackground, type BackgroundGate } from '../background.js';
 
 // The bridge's bearer token lives in the service's private state directory.
 // deploy/setup-bridge.sh (as root) copies it to the agent user's
@@ -10,7 +11,8 @@ export const BRIDGE_TOKEN_FILE = 'bridge-token';
 const TOKEN = /^[A-Za-z0-9_-]{32,512}$/;
 
 /** Read the token, creating 32 random bytes (base64url, mode 0600) on first start. */
-export function readOrCreateBridgeToken(stateDir: string): string {
+export function readOrCreateBridgeToken(stateDir: string, background: BackgroundGate = shadowBackground): string {
+  background.require();
   const path = join(stateDir, BRIDGE_TOKEN_FILE);
   let existing: string | undefined;
   try {
@@ -29,7 +31,7 @@ export function readOrCreateBridgeToken(stateDir: string): string {
     // No trailing newline: the file is used as a header value as-is.
     writeFileSync(path, token, { mode: 0o600, flag: 'wx' });
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return readOrCreateBridgeToken(stateDir);
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return readOrCreateBridgeToken(stateDir, background);
     throw err;
   }
   return token;

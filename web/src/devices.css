@@ -1,0 +1,201 @@
+/* Pairing (components/PairPage.tsx) and Settings → Devices (components/DevicesPage.tsx). Uses the tokens in styles.css. */
+
+.pair-page {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: calc(var(--safe-top) + 24px) 20px calc(var(--safe-bottom) + 24px);
+  background: var(--bg);
+}
+
+.pair-card {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 28px 24px;
+  border-radius: 20px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+.pair-card h1 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.pair-card p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.pair-card code,
+.offer-code code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  padding: 1px 5px;
+  border-radius: 6px;
+  background: var(--code-bg);
+}
+
+/* The Devices page sits in the shell's Page; only its own pieces are styled here. */
+.devices-page .page-intro {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.pair-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.offer-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 14px 18px;
+}
+
+.offer-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  align-self: stretch;
+}
+
+.offer-title {
+  font-weight: 600;
+}
+
+/* Always dark on white, whatever the theme: that's what cameras read best. */
+.qr {
+  width: min(240px, 70vw);
+  height: auto;
+  border-radius: 12px;
+}
+
+.qr-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  text-align: center;
+  font-size: 13.5px;
+}
+
+.qr-fallback p {
+  margin: 0;
+}
+
+.qr-fallback code {
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+
+.qr-light {
+  fill: #ffffff;
+}
+
+.qr-dark {
+  fill: #000000;
+}
+
+.offer-code {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: 13.5px;
+}
+
+.offer-code code {
+  font-size: 15px;
+  letter-spacing: 0.02em;
+  user-select: all;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+.offer-expiry {
+  font-size: 13px;
+}
+
+.offer-expired {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 0;
+}
+
+.offer-expired p {
+  margin: 0;
+}
+
+.locked-card {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+}
+
+.locked-card svg {
+  color: var(--warn);
+}
+
+.device-row > svg {
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.device-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.device-name > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-current {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+
+.device-actions {
+  display: flex;
+  gap: 2px;
+}
+
+.icon-btn.danger:hover {
+  color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.device-rename {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.device-rename input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--bg-elev);
+  padding: 8px 10px;
+  font-size: 16px;
+  outline: none;
+}
+
+.device-rename input:focus {
+  border-color: var(--accent);
+}

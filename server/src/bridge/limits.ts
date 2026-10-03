@@ -60,7 +60,7 @@ interface Rule {
 const LOOP_WINDOW_MS = 10 * MINUTE;
 const LOOP_THRESHOLD = 3;
 export const LOOP_PAUSE_MS = 30 * MINUTE;
-export const LOOP_NOTICE = 'Signalbox paused messages between these chats for 30 minutes to stop a loop.';
+export const LOOP_NOTICE = 'Wayroost paused messages between these chats for 30 minutes to stop a loop.';
 
 function minutes(ms: number): string {
   const n = Math.max(1, Math.ceil(ms / MINUTE));
@@ -112,7 +112,7 @@ export class SendLimits {
     const until = this.paused.get(pair);
     if (until !== undefined && until > now) {
       return {
-        message: `Signalbox paused messages between these chats to stop a loop. Try again in ${minutes(until - now)}, or ask the user.`,
+        message: `Wayroost paused messages between these chats to stop a loop. Try again in ${minutes(until - now)}, or ask the user.`,
       };
     }
     if (until !== undefined) this.paused.delete(pair);

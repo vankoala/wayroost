@@ -3,8 +3,12 @@
     "target": "ES2023",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2023"],
-    "types": ["node"],
+    "lib": [
+      "ES2023"
+    ],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -16,5 +20,14 @@
     "verbatimModuleSyntax": true,
     "noEmit": true
   },
-  "include": ["server/src", "server/test", "shared", "scripts/**/*.ts"]
+  "include": [
+    "server/src",
+    "speech/**/*.ts",
+    "server/test",
+    "shared",
+    "scripts/**/*.ts",
+    "supervisor/src",
+    "supervisor/test",
+    "tests/development-ports.ts"
+  ]
 }

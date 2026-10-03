@@ -1,0 +1,357 @@
+[
+  {
+    "id": "main-model",
+    "name": "Main model",
+    "health": {
+      "kind": "none"
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": [
+      0
+    ],
+    "profiles": [
+      {
+        "id": "main-model",
+        "name": "Main model",
+        "gpus": [
+          0
+        ],
+        "health": {
+          "kind": "http",
+          "url": "http://127.0.0.1:19001/health",
+          "timeoutMs": 2000
+        }
+      },
+      {
+        "id": "fast",
+        "name": "Fast model",
+        "gpus": [
+          0
+        ],
+        "health": {
+          "kind": "http",
+          "url": "http://127.0.0.1:19002/health",
+          "timeoutMs": 2000
+        }
+      },
+      {
+        "id": "balanced",
+        "name": "Balanced model",
+        "gpus": [
+          0
+        ],
+        "health": {
+          "kind": "http",
+          "url": "http://127.0.0.1:19003/health",
+          "timeoutMs": 2000
+        }
+      },
+      {
+        "id": "large",
+        "name": "Large model",
+        "gpus": [
+          0
+        ],
+        "health": {
+          "kind": "http",
+          "url": "http://127.0.0.1:19004/health",
+          "timeoutMs": 2000
+        }
+      }
+    ]
+  },
+  {
+    "id": "coder",
+    "name": "Coder",
+    "health": {
+      "kind": "http",
+      "url": "http://127.0.0.1:19005/health",
+      "timeoutMs": 2000
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": [
+      1
+    ]
+  },
+  {
+    "id": "paseo",
+    "name": "Agent workspace",
+    "health": {
+      "kind": "http",
+      "url": "http://127.0.0.1:19007/api/health",
+      "timeoutMs": 2000
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": []
+  },
+  {
+    "id": "hermes-dashboard",
+    "name": "Agent dashboard",
+    "unit": {
+      "name": "demo-dashboard.service",
+      "scope": "user"
+    },
+    "health": {
+      "kind": "http",
+      "url": "http://127.0.0.1:19006/api/status",
+      "timeoutMs": 2000
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": []
+  },
+  {
+    "id": "hermes-gateway",
+    "name": "Agent gateway",
+    "unit": {
+      "name": "demo-gateway.service",
+      "scope": "user"
+    },
+    "health": {
+      "kind": "none"
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": []
+  },
+  {
+    "id": "signalbox",
+    "name": "Chat relay",
+    "unit": {
+      "name": "signalbox.service",
+      "scope": "system"
+    },
+    "health": {
+      "kind": "unit",
+      "command": [
+        "systemctl",
+        "is-active",
+        "--quiet",
+        "signalbox.service"
+      ]
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": [],
+    "start": [
+      "systemctl",
+      "start",
+      "signalbox.service"
+    ],
+    "stop": [
+      "systemctl",
+      "stop",
+      "signalbox.service"
+    ],
+    "restart": [
+      "systemctl",
+      "restart",
+      "signalbox.service"
+    ]
+  },
+  {
+    "id": "signalbox-tunnel",
+    "name": "Remote access",
+    "unit": {
+      "name": "signalbox-tunnel.service",
+      "scope": "system"
+    },
+    "health": {
+      "kind": "unit",
+      "command": [
+        "systemctl",
+        "is-active",
+        "--quiet",
+        "signalbox-tunnel.service"
+      ]
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": [],
+    "start": [
+      "systemctl",
+      "start",
+      "signalbox-tunnel.service"
+    ],
+    "stop": [
+      "systemctl",
+      "stop",
+      "signalbox-tunnel.service"
+    ],
+    "restart": [
+      "systemctl",
+      "restart",
+      "signalbox-tunnel.service"
+    ]
+  },
+  {
+    "id": "wayroost-server",
+    "name": "Wayroost",
+    "unit": {
+      "name": "wayroost-server.service",
+      "scope": "system"
+    },
+    "health": {
+      "kind": "unit",
+      "command": [
+        "systemctl",
+        "is-active",
+        "--quiet",
+        "wayroost-server.service"
+      ]
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": [],
+    "start": [
+      "systemctl",
+      "start",
+      "wayroost-server.service"
+    ],
+    "stop": [
+      "systemctl",
+      "stop",
+      "wayroost-server.service"
+    ],
+    "restart": [
+      "systemctl",
+      "restart",
+      "wayroost-server.service"
+    ]
+  },
+  {
+    "id": "helper",
+    "name": "Helper",
+    "unit": {
+      "name": "signalbox-helper.service",
+      "scope": "system"
+    },
+    "health": {
+      "kind": "unit",
+      "command": [
+        "systemctl",
+        "is-active",
+        "--quiet",
+        "signalbox-helper.service"
+      ]
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": [],
+    "start": [
+      "systemctl",
+      "start",
+      "signalbox-helper.service"
+    ],
+    "stop": [
+      "systemctl",
+      "stop",
+      "signalbox-helper.service"
+    ],
+    "restart": [
+      "systemctl",
+      "restart",
+      "signalbox-helper.service"
+    ]
+  },
+  {
+    "id": "speech",
+    "name": "Speech",
+    "unit": {
+      "name": "signalbox-speech.service",
+      "scope": "system"
+    },
+    "health": {
+      "kind": "unit",
+      "command": [
+        "systemctl",
+        "is-active",
+        "--quiet",
+        "signalbox-speech.service"
+      ]
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": [],
+    "start": [
+      "systemctl",
+      "start",
+      "signalbox-speech.service"
+    ],
+    "stop": [
+      "systemctl",
+      "stop",
+      "signalbox-speech.service"
+    ],
+    "restart": [
+      "systemctl",
+      "restart",
+      "signalbox-speech.service"
+    ]
+  },
+  {
+    "id": "phone",
+    "name": "Phone line",
+    "unit": {
+      "name": "demo-phone.service",
+      "scope": "user"
+    },
+    "health": {
+      "kind": "none"
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": [],
+    "optional": true
+  },
+  {
+    "id": "keepalive",
+    "name": "Keep awake",
+    "unit": {
+      "name": "wayroost-keepalive.service",
+      "scope": "system"
+    },
+    "health": {
+      "kind": "unit",
+      "command": [
+        "systemctl",
+        "is-active",
+        "--quiet",
+        "wayroost-keepalive.service"
+      ]
+    },
+    "busy": {
+      "kind": "none"
+    },
+    "gpus": [],
+    "start": [
+      "systemctl",
+      "start",
+      "wayroost-keepalive.service"
+    ],
+    "stop": [
+      "systemctl",
+      "stop",
+      "wayroost-keepalive.service"
+    ],
+    "restart": [
+      "systemctl",
+      "restart",
+      "wayroost-keepalive.service"
+    ]
+  }
+]

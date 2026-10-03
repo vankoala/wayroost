@@ -1,6 +1,9 @@
+import { BackgroundGate } from '../../server/src/background.js';
 // End-to-end compatibility check: runs Signalbox's Paseo connector against a
-// real Paseo daemon (in-process, isolated home, random port) whose only agent
-// is scripts/paseo-compat/fake-acp-agent.mjs. Nothing touches your own daemon.
+// real Paseo daemon (in-process, isolated home, development port) whose only agent
+// is scripts/paseo-compat/fake-acp-agent.mjs. Nothing touches your own daemon,
+// and HOME points at a temp home under the temp root, so nothing touches your home
+// either: the check fails if your real skill folders change while it runs.
 //
 //   npm install --prefix /tmp/paseo-X @getpaseo/server@X
 //   npx tsx scripts/paseo-compat/run.ts /tmp/paseo-X/node_modules/@getpaseo/server
@@ -16,18 +19,28 @@ import { MAX_MEDIA_BYTES, localImagePath } from '../../server/src/media.js';
 import { PaseoAdapter } from '../../server/src/paseo/adapter.js';
 import { HERMES_PARENT_LABEL } from '../../server/src/paseo/normalize.js';
 import { UserFacingError } from '../../server/src/sources.js';
+import { isolateHome } from './isolated-home.js';
+import { compatProviders, startCompatDaemon } from './isolation.js';
 
 const serverDir = resolve(process.argv[2] ?? '');
 const version = JSON.parse(readFileSync(join(serverDir, 'package.json'), 'utf8')).version as string;
 const fakeAgent = join(dirname(fileURLToPath(import.meta.url)), 'fake-acp-agent.mjs');
-const { createPaseoDaemon } = await import(pathToFileURL(join(serverDir, 'dist/server/server/bootstrap.js')).href);
-const pino = createRequire(join(serverDir, 'package.json'))('pino');
 
 const root = mkdtempSync(join(tmpdir(), 'sb-paseo-'));
 const paseoHome = join(root, '.paseo');
 const project = join(root, 'project');
 const staticDir = join(root, 'static');
 for (const dir of [paseoHome, project, staticDir]) mkdirSync(dir, { recursive: true });
+// Isolate paths before importing the daemon: even module initialization can
+// write provider configuration or orchestration skills. Your real home's skill
+// folders are snapshotted first, and checked again at the end.
+const realHomeUntouched = isolateHome(root);
+
+const serverRequire = createRequire(join(serverDir, 'package.json'));
+const { BUILTIN_PROVIDER_IDS } = await import(pathToFileURL(serverRequire.resolve('@getpaseo/protocol/provider-manifest')).href);
+
+const { createPaseoDaemon } = await import(pathToFileURL(join(serverDir, 'dist/server/server/bootstrap.js')).href);
+const pino = createRequire(join(serverDir, 'package.json'))('pino');
 
 async function startDaemon(listen: string) {
   const started = await createPaseoDaemon(
@@ -44,20 +57,20 @@ async function startDaemon(listen: string) {
       relayEnabled: false,
       relayEndpoint: 'relay.paseo.sh:443',
       appBaseUrl: 'https://app.paseo.sh',
-      providerOverrides: {
-        fakeacp: { extends: 'acp', label: 'Fake ACP', command: [process.execPath, fakeAgent] },
-        fakemodes: { extends: 'acp', label: 'Fake ACP with modes', command: [process.execPath, fakeAgent, '--modes'] },
-        // Stands in for Hermes in Paseo, which is an ACP provider named "hermes".
-        hermes: { extends: 'acp', label: 'Hermes', command: [process.execPath, fakeAgent] },
-      },
+      providerOverrides: compatProviders(BUILTIN_PROVIDER_IDS, process.execPath, fakeAgent),
     },
     pino({ level: process.env.PASEO_LOG ?? 'silent' }),
   );
-  await started.start();
-  return started;
+  try {
+    await started.start();
+    return started;
+  } catch (err) {
+    await started.stop().catch(() => {});
+    throw err;
+  }
 }
 
-let daemon = await startDaemon('127.0.0.1:0');
+let daemon = await startCompatDaemon(startDaemon);
 const target = daemon.getListenTarget();
 const port = target.type === 'tcp' ? target.port : 0;
 
@@ -91,8 +104,9 @@ const socket = {
   },
 };
 const client = hub.add(socket as never, 'compat');
-const log = { info() {}, warn: (o: object, m?: string) => console.warn('  warn:', m, JSON.stringify(o)), error: (o: object, m?: string) => console.error('  error:', m, JSON.stringify(o)) };
-const adapter = new PaseoAdapter(`ws://127.0.0.1:${port}`, hub, log, 'cid_signalbox_compat');
+const log = { info: (o: object, m?: string) => { if (process.env.PASEO_DEBUG) console.log('  log:', m, JSON.stringify(o)); }, warn: (o: object, m?: string) => console.warn('  warn:', m, JSON.stringify(o)), error: (o: object, m?: string) => console.error('  error:', m, JSON.stringify(o)) };
+// The compat check plays the primary: catch-ups and reloads run as they do live.
+const adapter = new PaseoAdapter(`ws://127.0.0.1:${port}`, hub, log, 'cid_signalbox_compat', undefined, new BackgroundGate('primary'));
 
 async function waitFor(what: string, check: () => boolean | Promise<boolean>, timeoutMs = 30_000) {
   const start = Date.now();
@@ -111,7 +125,14 @@ async function open(id: string) {
   for (const item of detail.items) itemsOf(id).set(item.id, item);
 }
 const waitForStatus = (id: string, status: string) =>
-  waitFor(`agent ${status}`, async () => (await adapter.listConversations()).some((c) => c.id === id && c.status === status));
+  waitFor(
+    `agent ${status}`,
+    async () => {
+      const rows = (await adapter.listConversations()).filter((c) => c.id === id);
+      if (process.env.PASEO_DEBUG) console.log('  …', id.slice(0, 8), rows.map((r) => r.status).join(',') || '(missing)');
+      return rows.some((c) => c.status === status);
+    },
+  );
 
 // What the phone would send: a real 1×1 PNG, a text file and a PDF, checked like any upload.
 const files = decodeAttachments([
@@ -131,6 +152,10 @@ try {
   await waitFor('connected', () => adapter.status().state === 'connected');
 
   const options = await adapter.options();
+  if (options.providers.some((p) => !['fakeacp', 'fakemodes', 'hermes'].includes(p.id))) {
+    throw new Error('a built-in provider was not disabled');
+  }
+  console.log('  ✓ only fake ACP providers enabled');
   const fake = options.providers.find((p) => p.id === 'fakeacp');
   if (!fake) throw new Error(`fake provider not offered: ${JSON.stringify(options.providers.map((p) => p.id))}`);
   if (!fake.autoApproves) throw new Error('a provider without modes must require consent');
@@ -162,6 +187,20 @@ try {
   await waitFor('reply streamed around the tool call', () => /Hello.*\|.*world/.test(text(id)));
   await waitFor('tool call completed', () => list(id).some((i) => i.kind === 'tool' && i.status === 'done'));
   await waitForStatus(id, 'idle');
+
+  // A response outside Signalbox must clear its cached approval through the
+  // owned event subscription, without a local respondToApproval call.
+  const external = await adapter.createConversation({
+    providerId: 'fakeacp', cwd: project, text: 'Ask permission', acknowledgeAutoApprove: true,
+  });
+  await open(external);
+  await waitFor('external approval surfaced', () => adapter.listApprovals().some((a) => a.conversationId === external));
+  const externalApproval = adapter.listApprovals().find((a) => a.conversationId === external)!;
+  await daemon.agentManager.respondToPermission(external, externalApproval.id, {
+    behavior: 'allow', selectedActionId: externalApproval.options.find((o) => o.kind === 'allow')!.id,
+  });
+  await waitFor('approval resolved elsewhere cleared through events', () => !adapter.listApprovals().some((a) => a.conversationId === external));
+  await waitForStatus(external, 'idle');
 
   await adapter.sendMessage(id, 'Again');
   await waitFor('follow-up answered in one streamed bubble', () => /Hello\s*world/.test(text(id)));
@@ -214,6 +253,8 @@ try {
 
   // Model, reasoning and mode pickers on an agent that offers them.
   const tuned = await adapter.createConversation({ providerId: 'fakemodes', cwd: project, text: 'Again' });
+  // Since 0.9.2 the agent's process starts when its timeline is loaded.
+  await open(tuned);
   await waitForStatus(tuned, 'idle');
   const describe = (controls: ConversationControl[]) =>
     controls.map((c) => `${c.id}=${c.value}:${c.options.map((o) => `${o.id}${o.autoApproves ? '!' : ''}`).join('/')}`).join(' ');
@@ -293,7 +334,6 @@ try {
   console.log('  ✓ parent label and ACP session id kept through the restart');
   await open(unopened);
   await waitFor('its commands listed once the conversation is open', async () => (await adapter.listCommands(unopened)).length === 2);
-  console.log(`PASS  Paseo ${version}`);
 } catch (err) {
   failed = true;
   console.error(`FAIL  Paseo ${version}: ${(err as Error).message}`);
@@ -304,6 +344,13 @@ try {
 } finally {
   adapter.stop();
   await daemon.stop().catch(() => {});
-  rmSync(root, { recursive: true, force: true });
+  if (!realHomeUntouched()) failed = true;
+  // A just-killed agent process may still be writing into the tree; retry.
+  try {
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch (err) {
+    console.warn(`  warn: could not remove ${root}: ${(err as Error).message}`);
+  }
 }
+if (!failed) console.log(`PASS  Paseo ${version}`);
 process.exit(failed ? 1 : 0);

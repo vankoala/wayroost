@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../server/src/background.js';
 // Demo data for Settings → Skills (scripts/ui-check.ts, npm run demo): a helper with a
 // few skills in several apps, one changed inside Claude Code, and a stand-in skills hub.
 import type { SkillApp, SkillInfo, SkillList, SkillPlace, SkillScan } from '../shared/skills.js';
@@ -200,7 +201,7 @@ const demoHub: Dashboard = {
   },
 };
 
-export const demoSkills = new Skills({
+export const demoSkills = new Skills({ background: new BackgroundGate('primary'),
   helper: new DemoSkillsHelper(),
   dashboard: () => demoHub,
   changed: () => {},

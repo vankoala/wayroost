@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { SkillInfo, SkillList, SkillScan } from '../../shared/skills.js';
 import type { Dashboard } from '../src/connectors/service.js';
@@ -103,7 +104,7 @@ function make() {
   const helper = new FakeHelper();
   const hub = new FakeHub(helper);
   let changes = 0;
-  const skills = new Skills({ helper, dashboard: () => hub, changed: () => changes++, log: quietLog, sleep: async () => {} });
+  const skills = new Skills({ background: new BackgroundGate('primary'), helper, dashboard: () => hub, changed: () => changes++, log: quietLog, sleep: async () => {} });
   return { helper, hub, skills, changes: () => changes };
 }
 
@@ -162,7 +163,7 @@ describe('Skills', () => {
 
   it('needs Hermes for the marketplace', async () => {
     const helper = new FakeHelper();
-    const skills = new Skills({ helper, dashboard: () => undefined, changed: () => {}, log: quietLog });
+    const skills = new Skills({ background: new BackgroundGate('primary'), helper, dashboard: () => undefined, changed: () => {}, log: quietLog });
     await expect(skills.search('x')).rejects.toThrow(/Sign in to Hermes/);
     expect((await skills.list()).skills).toHaveLength(1);
   });

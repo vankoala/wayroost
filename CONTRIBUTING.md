@@ -1,6 +1,6 @@
-# Contributing to Signalbox
+# Contributing to Wayroost
 
-Thanks for helping! Signalbox controls coding agents that can run commands on
+Thanks for helping! Wayroost controls coding agents that can run commands on
 someone's machine, so correctness and safety come first.
 
 ## Before you start
@@ -17,7 +17,7 @@ git clone https://github.com/vankoala/wayroost
 cd wayroost
 npm ci --ignore-scripts
 npm test
-npm run build:web && npm run demo    # http://127.0.0.1:8795 with demo data
+npm run build:web && npm run demo    # http://127.0.0.1:8890 with demo data
 ```
 
 See [docs/development.md](docs/development.md) for the layout, the test suites

@@ -9,7 +9,7 @@ import { VOICE_MAX_SECONDS, VOICE_SAMPLE_RATE, type ServerEvent, type VoiceEvent
 import { SpeechClient, VoiceSession, type SpeechService } from '../src/speech.js';
 import { UserFacingError } from '../src/sources.js';
 import { VoiceSetting } from '../src/voice-setting.js';
-import { ORIGIN, apiHeaders, makeApp, makeKeys, makeToken, postHeaders, type Keys } from './helpers.js';
+import { DESKTOP_COOKIE, ORIGIN, apiHeaders, makeApp, makeKeys, makeToken, postHeaders, type Keys } from './helpers.js';
 
 const WAV = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(60, 1)]);
 
@@ -165,6 +165,31 @@ describe('VoiceSession', () => {
     await expect.poll(() => events.at(-1)).toMatchObject({ run: 4, stage: 'stt-end' });
   });
 
+  it("doesn't write down a recording still waiting when closed", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const speech = new FakeSpeech();
+    const transcribe = speech.transcribe.bind(speech);
+    let asked = 0;
+    speech.transcribe = async (pcm: Buffer) => {
+      asked += 1;
+      await gate;
+      return transcribe(pcm);
+    };
+    const { voice } = session(speech);
+    for (const run of [1, 2]) {
+      voice.start(run);
+      voice.frame(frame(run, audio(QUARTER_SECOND)));
+      voice.frame(frame(run));
+    }
+    await expect.poll(() => asked).toBe(1);
+    voice.close();
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    // The first was already with the speech service; the second never goes.
+    expect(speech.transcribed).toHaveLength(1);
+  });
+
   it('sends nothing once closed', async () => {
     const speech = new FakeSpeech();
     const { voice, events } = session(speech);
@@ -276,12 +301,12 @@ describe('voice mode in the app', () => {
   it('reports whether voice is on and the speech service answers', async () => {
     const get = async (app: Awaited<ReturnType<typeof setup>>['app']) =>
       (await app.inject({ url: '/api/voice', headers: apiHeaders(token) })).json();
-    expect(await get((await setup()).app)).toEqual({ enabled: false, available: false, voices: [], defaultVoice: '' });
+    expect(await get((await setup()).app)).toMatchObject({ enabled: false, available: false, voices: [], defaultVoice: '' });
     const speech = new FakeSpeech();
     const { app } = await setup(speech);
-    expect(await get(app)).toEqual({ enabled: true, available: true, voices: ['af_heart', 'bm_george'], defaultVoice: 'af_heart' });
+    expect(await get(app)).toMatchObject({ enabled: true, available: true, voices: ['af_heart', 'bm_george'], defaultVoice: 'af_heart' });
     speech.down = true;
-    expect(await get(app)).toEqual({ enabled: true, available: false, voices: [], defaultVoice: '' });
+    expect(await get(app)).toMatchObject({ enabled: true, available: false, voices: [], defaultVoice: '' });
   });
 
   it('reads text aloud with a known voice, under the usual API rules', async () => {
@@ -305,11 +330,11 @@ describe('voice mode in the app', () => {
     for (const bad of [{ text: '' }, { text: 'x'.repeat(1001) }, { text: 'Hi.', voice: '../x' }, { text: 'Hi.', speed: 9 }, { text: 'Hi.', extra: 1 }]) {
       expect((await speak(bad)).statusCode).toBe(400);
     }
-    expect((await speak({ text: 'Hi.' }, { ...postHeaders(token), 'x-signalbox-request': '' })).statusCode).toBe(403);
+    expect((await speak({ text: 'Hi.' }, { ...postHeaders(token), 'x-wayroost-request': '' })).statusCode).toBe(403);
     expect(speech.spoken).toHaveLength(2);
   });
 
-  it('keeps one voice for every device and hands it to the phone line', async () => {
+  it('keeps the shared local voice across devices and updates the phone and car lines', async () => {
     const speech = new FakeSpeech();
     const phoneVoices: string[] = [];
     let phoneDown = false;
@@ -343,14 +368,14 @@ describe('voice mode in the app', () => {
     expect(speech.spoken.at(-1)?.voice).toBe('af_heart');
     expect((await get()).defaultVoice).toBe('bm_george');
 
-    // The phone line down: saved for Signalbox anyway, and the page is told calls didn't change.
+    // The app pick remains saved when the phone line cannot synchronize.
     phoneDown = true;
-    expect((await put({ voice: 'af_heart' })).json()).toMatchObject({ defaultVoice: 'af_heart', calls: 'failed', callsMessage: "Hermes Phone isn't running." });
+    expect((await put({ voice: 'af_heart' })).json()).toMatchObject({ defaultVoice: 'af_heart', calls: 'failed', callsMessage: expect.any(String) });
 
     for (const bad of [{ voice: 'zz_nope' }, { voice: '../x' }, {}, { voice: 'af_heart', extra: 1 }]) {
       expect((await put(bad)).statusCode).toBe(400);
     }
-    expect((await put({ voice: 'bm_george' }, { ...postHeaders(token), 'x-signalbox-request': '' })).statusCode).toBe(403);
+    expect((await put({ voice: 'bm_george' }, { ...postHeaders(token), 'x-wayroost-request': '' })).statusCode).toBe(403);
     expect((await get()).defaultVoice).toBe('af_heart');
   });
 
@@ -376,7 +401,7 @@ describe('voice mode in the app', () => {
   });
 
   async function open(url: string) {
-    const ws = new WebSocket(url, { headers: { origin: ORIGIN, 'cf-access-jwt-assertion': token } });
+    const ws = new WebSocket(url, { headers: { origin: ORIGIN, 'cf-access-jwt-assertion': token, cookie: DESKTOP_COOKIE } });
     ws.on('error', () => {});
     cleanups.push(async () => ws.terminate());
     const received: ServerEvent[] = [];

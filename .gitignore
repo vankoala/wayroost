@@ -1,5 +1,5 @@
 # Dependencies and build output
-node_modules/
+node_modules
 dist/
 coverage/
 *.tgz
@@ -10,12 +10,14 @@ coverage/
 ui-shots/
 e2e-shots/
 test-results/
+.tmp/
 
 # Local config and secrets. Only the templates in deploy/ belong in git.
 .env
 .env.*
 config.json
 config.local.json
+components.local.json
 deploy/config.json
 tunnel-credentials.json
 *.pem
@@ -32,3 +34,6 @@ paseo-client-id
 # Python caches
 __pycache__/
 *.pyc
+
+.npm-cache/
+desktop/release/

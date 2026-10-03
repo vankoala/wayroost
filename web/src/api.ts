@@ -8,6 +8,9 @@ import {
   type CloudAgentId,
   type CloudAgentsStatus,
   type SafetyCommandsStatus,
+  type WorkerUpdatesStatus,
+  type TaskList,
+  type Capabilities,
   type WhatsAppRouting,
   type PhoneStatus,
   type ScheduleDraft,
@@ -32,6 +35,11 @@ import {
   type ConversationControls,
   type ConversationDetail,
   type CreateResponse,
+  type DeviceInfo,
+  type DeviceKind,
+  type DeviceList,
+  type PairOffer,
+  type PairResult,
   type HermesOptions,
   type FolderScope,
   type FolderStatus,
@@ -47,7 +55,12 @@ import {
   type VoiceSaveResult,
   type VoiceStatus,
 } from '../../shared/protocol';
-import { approvalKey, convKey, setState, toast, withEarlyItems } from './store';
+import type { WorkerApprovalsStatus } from '../../shared/safety';
+import { isApprovalDetail, isApprovalSnapshot } from '../../shared/approval-validation';
+import { approvalKey, convKey, getAuthenticationGeneration, markUnpaired, setState, toast, withEarlyItems } from './store';
+import { ApiError, beginAuthenticatedRequest, checkAuthentication, checkAuthenticationGeneration, reportAuthenticationAnomaly } from './authentication';
+import { authenticationEndpoint } from '../../shared/authentication';
+import { speechRequest } from './voice/request';
 
 export interface Upload {
   name: string;
@@ -55,21 +68,10 @@ export interface Upload {
   data: string;
 }
 
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    readonly kind: 'network' | 'auth' | 'http',
-    readonly status?: number,
-  ) {
-    super(message);
-  }
-}
+export { ApiError, markUnpaired };
 
-function markSessionExpired() {
-  setState((s) => (s.sessionExpired ? s : { ...s, sessionExpired: true }));
-}
-
-export async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+export async function request<T>(method: string, path: string, body?: unknown, validate?: (value: unknown) => value is T): Promise<T> {
+  const generation = beginAuthenticatedRequest(method === 'POST' && path === '/api/pair');
   let res: Response;
   try {
     res = await fetch(path, {
@@ -86,17 +88,40 @@ export async function request<T>(method: string, path: string, body?: unknown): 
       redirect: 'manual',
     });
   } catch {
-    throw new ApiError("Can't reach Signalbox. Check your connection.", 'network');
+    if (path === '/api/me') reportAuthenticationAnomaly(generation);
+    throw new ApiError("Can't reach Wayroost. Check your connection.", 'network');
   }
-  if (res.type === 'opaqueredirect' || res.status === 401) {
-    markSessionExpired();
-    throw new ApiError('Your sign-in expired.', 'auth');
-  }
-  const data = (await res.json().catch(() => ({}))) as { error?: string };
+  await checkAuthentication(res, generation, authenticationEndpoint(path));
+  // A success whose body can't be read (a cut connection, or a navigation
+  // that aborts the read) is a failed request, not an empty answer: callers
+  // destructure what they asked for.
+  let parsed = true;
+  const raw: unknown = await res.json().catch(() => {
+    parsed = false;
+    return undefined;
+  });
+  const data = (raw ?? {}) as { error?: string };
+  checkAuthenticationGeneration(generation);
   if (!res.ok) {
-    throw new ApiError(data.error ?? `Request failed (${res.status})`, res.status === 403 ? 'auth' : 'http', res.status);
+    throw new ApiError(data.error ?? `Request failed (${res.status})`, 'http', res.status);
   }
-  return data as T;
+  if (!parsed && authenticationEndpoint(path)) reportAuthenticationAnomaly(generation);
+  if (!parsed) throw new ApiError("Can't reach Wayroost. Check your connection.", 'network');
+  return processResponse(generation, () => {
+    if (validate && !validate(raw)) throw new ApiError('Invalid approval response.', 'network');
+    return raw as T;
+  });
+}
+
+/** Validation and presentation failures signal only the generation that received the response. */
+function processResponse<T>(generation: number, process: () => T): T {
+  try {
+    checkAuthenticationGeneration(generation);
+    return process();
+  } catch (error) {
+    reportAuthenticationAnomaly(generation);
+    throw error;
+  }
 }
 
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
@@ -104,12 +129,13 @@ const MEDIA_ERRORS: Record<number, string> = {
   403: "This image can't be shown.",
   404: 'Image unavailable — reopen this chat.',
   413: 'This image is too large to show.',
-  415: "That file isn't an image Signalbox can show.",
+  415: "That file isn't an image Wayroost can show.",
   502: "The agent couldn't read this image.",
 };
 
 /** An image an agent showed, from a link the server signed. Only real image types come back. */
 export async function fetchMedia(url: string): Promise<Blob> {
+  const generation = beginAuthenticatedRequest();
   let res: Response;
   try {
     res = await fetch(url, {
@@ -118,12 +144,9 @@ export async function fetchMedia(url: string): Promise<Blob> {
       redirect: 'manual',
     });
   } catch {
-    throw new ApiError("Can't reach Signalbox. Check your connection.", 'network');
+    throw new ApiError("Can't reach Wayroost. Check your connection.", 'network');
   }
-  if (res.type === 'opaqueredirect' || res.status === 401) {
-    markSessionExpired();
-    throw new ApiError('Your sign-in expired.', 'auth', 401);
-  }
+  await checkAuthentication(res, generation);
   if (!res.ok) {
     const data = (await res.json().catch(() => ({}))) as { error?: string };
     throw new ApiError(data.error ?? MEDIA_ERRORS[res.status] ?? `Couldn't load the image (${res.status}).`, 'http', res.status);
@@ -131,11 +154,14 @@ export async function fetchMedia(url: string): Promise<Blob> {
   const type = (res.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
   if (!IMAGE_TYPES.has(type)) throw new ApiError(MEDIA_ERRORS[415]!, 'http', 415);
   // Typed from the checked header, so opening it in a tab can only ever show an image.
-  return new Blob([await res.arrayBuffer()], { type });
+  const bytes = await res.arrayBuffer();
+  checkAuthenticationGeneration(generation);
+  return new Blob([bytes], { type });
 }
 
 /** A reply read aloud: WAV audio from the speech service on your PC. */
 export async function speakAudio(text: string, voice?: string, speed?: number): Promise<ArrayBuffer> {
+  const generation = beginAuthenticatedRequest();
   let res: Response;
   try {
     res = await fetch('/api/voice/speak', {
@@ -147,26 +173,117 @@ export async function speakAudio(text: string, voice?: string, speed?: number): 
       redirect: 'manual',
     });
   } catch {
-    throw new ApiError("Can't reach Signalbox. Check your connection.", 'network');
+    throw new ApiError("Can't reach Wayroost. Check your connection.", 'network');
   }
-  if (res.type === 'opaqueredirect' || res.status === 401) {
-    markSessionExpired();
-    throw new ApiError('Your sign-in expired.', 'auth', 401);
-  }
+  await checkAuthentication(res, generation);
   if (!res.ok) {
     const data = (await res.json().catch(() => ({}))) as { error?: string };
     throw new ApiError(data.error ?? `Couldn't read that aloud (${res.status}).`, 'http', res.status);
   }
-  return res.arrayBuffer();
+  const bytes = await res.arrayBuffer();
+  checkAuthenticationGeneration(generation);
+  return bytes;
+}
+
+/** PCM frames can play as they arrive; a fallback discards the partial cloud rendering. */
+export async function* streamSpeech(text: string, speed: number, signal: AbortSignal, fallback = () => toast('ElevenLabs is unavailable. Reading in the local voice.')): AsyncGenerator<ArrayBuffer | 'reset'> {
+  const generation = beginAuthenticatedRequest();
+  const owned = await speechRequest(signal);
+  try {
+    signal.throwIfAborted();
+    let res: Response;
+    try {
+      res = await fetch(owned.url, {
+        method: 'POST', headers: { [REQUEST_MARKER_HEADER]: '1', 'content-type': 'application/json' },
+        body: JSON.stringify({ text, speed, stream: true }), credentials: 'same-origin', cache: 'no-store', redirect: 'manual', signal: owned.signal,
+      });
+    } catch (error) {
+      // Stopping playback aborts the request; that is no sign-in trouble.
+      if (signal.aborted) throw error;
+      throw new ApiError("Can't reach Wayroost. Check your connection.", 'network');
+    }
+    // The same sign-in classifier as every other request (on the desktop, main decides).
+    await checkAuthentication(res, generation);
+    if (!res.ok || !res.body) throw new ApiError("Couldn't read that aloud.", 'http', res.status);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let line = '';
+    let pending = new Uint8Array(0);
+    let format = '';
+    let ended = false;
+    let bytes = 0;
+    try {
+      while (true) {
+        const part = await reader.read();
+        // A suspended sign-in stops playback at once.
+        checkAuthenticationGeneration(generation);
+        if (part.done) break;
+        bytes += part.value.length;
+        if (bytes > 16 * 1024 * 1024) throw new Error('Voice response is too large.');
+        line += decoder.decode(part.value, { stream: true });
+        let end: number;
+        while ((end = line.indexOf('\n')) >= 0) {
+          const frame = JSON.parse(line.slice(0, end)) as import('../../shared/voice').SpeechFrame;
+          line = line.slice(end + 1);
+          if (frame.type === 'error') throw new Error(frame.message);
+          if (frame.type === 'start' || frame.type === 'reset') {
+            format = frame.format; pending = new Uint8Array(0);
+            if (frame.type === 'reset') yield 'reset';
+            if (frame.reason) fallback();
+          }
+          if (frame.type === 'audio') {
+            const audio = Uint8Array.from(atob(frame.data), c => c.charCodeAt(0));
+            if (format === 'wav') { yield audio.buffer; continue; }
+            const merged = new Uint8Array(pending.length + audio.length);
+            merged.set(pending); merged.set(audio, pending.length); pending = merged;
+            // About 125 ms per clip, independent of network chunk boundaries.
+            while (pending.length >= 6000) { yield pcmClip(pending.slice(0, 6000), speed); pending = pending.slice(6000); }
+          }
+          if (frame.type === 'end') {
+            if (pending.length % 2) throw new Error('Voice stream ended mid-sample.');
+            if (pending.length) yield pcmClip(pending, speed);
+            pending = new Uint8Array(0); ended = true;
+          }
+        }
+      }
+      if (!ended || line.trim()) throw new Error('Voice stream stopped before it finished.');
+    } finally { await owned.cancel(); await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  } finally { await owned.dispose(); }
+}
+
+function pcmClip(pcm: Uint8Array, speed: number): ArrayBuffer {
+  const wav = new ArrayBuffer(44 + pcm.length);
+  const bytes = new Uint8Array(wav);
+  const view = new DataView(wav);
+  const word = (at: number, text: string) => bytes.set(new TextEncoder().encode(text), at);
+  word(0, 'RIFF'); view.setUint32(4, 36 + pcm.length, true); word(8, 'WAVEfmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  // Local WAVs already include their speed; adjust only cloud PCM playback.
+  const rate = Math.round(24000 * (Number.isFinite(speed) && speed >= 0.5 && speed <= 2 ? speed : 1));
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  word(36, 'data'); view.setUint32(40, pcm.length, true); bytes.set(pcm, 44);
+  return wav;
 }
 
 export const api = {
   me: () => request<MeResponse>('GET', '/api/me'),
+  /** Pairs this browser with a code; the server sets its device cookie. */
+  pair: (code: string, name: string) => request<PairResult>('POST', '/api/pair', { code, name }),
+  pairOffer: (kind: DeviceKind) => request<PairOffer>('POST', '/api/pair/offer', { kind }),
+  unlockPairing: () => request<{ pairingLocked: false }>('DELETE', '/api/pair/lock'),
+  devices: () => request<DeviceList>('GET', '/api/devices'),
+  renameDevice: (id: string, name: string) =>
+    request<DeviceInfo>('PATCH', `/api/devices/${encodeURIComponent(id)}`, { name }),
+  revokeDevice: (id: string) => request<{ ok: true }>('DELETE', `/api/devices/${encodeURIComponent(id)}`),
   voice: () => request<VoiceStatus>('GET', '/api/voice'),
+  voiceCatalog: () => request<NonNullable<VoiceStatus['cloud']>>('GET', '/api/voice/catalog'),
+  setAppVoice: (appReadAloud: import('../../shared/voice').AppVoice) => request<VoiceSaveResult>('PUT', '/api/voice', { appReadAloud }),
   setVoice: (voice: string) => request<VoiceSaveResult>('PUT', '/api/voice', { voice }),
-  list: () => request<ListResponse>('GET', '/api/conversations'),
+  list: () => request<ListResponse>('GET', '/api/conversations', undefined, isApprovalSnapshot),
+  openConversation: (source: Source, id: string) =>
+    request<ConversationDetail>('POST', `/api/conversations/${source}/${encodeURIComponent(id)}/open`, undefined, isApprovalDetail),
   conversation: (source: Source, id: string) =>
-    request<ConversationDetail>('GET', `/api/conversations/${source}/${encodeURIComponent(id)}`),
+    request<ConversationDetail>('GET', `/api/conversations/${source}/${encodeURIComponent(id)}`, undefined, isApprovalDetail),
   send: (source: Source, id: string, text: string, attachments: Upload[] = []) =>
     request<SendResponse>('POST', `/api/conversations/${source}/${encodeURIComponent(id)}/messages`, {
       text,
@@ -212,6 +329,11 @@ export const api = {
     request<CreateResponse>('POST', '/api/paseo/conversations', input),
   bridge: () => request<BridgeStatus>('GET', '/api/bridge'),
   setBridgePaused: (paused: boolean) => request<BridgeStatus>('PUT', '/api/bridge', { paused }),
+  workerUpdates: () => request<WorkerUpdatesStatus>('GET', '/api/worker-updates'),
+  tasks: () => request<TaskList>('GET', '/api/tasks'),
+  capabilities: () => request<Capabilities>('GET', '/api/capabilities'),
+  setWorkerUpdates: (patch: { enabled?: boolean; defaultMinutes?: number }) =>
+    request<WorkerUpdatesStatus>('PUT', '/api/worker-updates', patch),
   cloudAgents: () => request<CloudAgentsStatus>('GET', '/api/cloud-agents'),
   archiveThreads: (threads: ThreadRef[], folder?: FolderScope) =>
     request<ThreadActionResult>('POST', '/api/threads/archive', { threads, ...(folder ? { folder } : {}) }),
@@ -225,6 +347,10 @@ export const api = {
   safetyCommands: () => request<SafetyCommandsStatus>('GET', '/api/safety-commands'),
   setSafetyCommands: (enabled: boolean) =>
     request<SafetyCommandsStatus>('PUT', '/api/safety-commands', { enabled }),
+  workerApprovals: () => request<WorkerApprovalsStatus>('GET', '/api/worker-approvals'),
+  /** A paired desktop only; the server refuses a phone. */
+  setWorkerApprovals: (enabled: boolean) =>
+    request<WorkerApprovalsStatus>('PUT', '/api/worker-approvals', { enabled }),
   whatsappRouting: () => request<WhatsAppRouting>('GET', '/api/whatsapp-routing'),
   feed: () => request<FeedList>('GET', '/api/feed'),
   feedSeen: () => request<{ ok: true }>('POST', '/api/feed/seen', {}),
@@ -336,38 +462,43 @@ export async function loadFeed(): Promise<FeedSettings | null> {
 }
 
 export async function refreshList(): Promise<void> {
+  const generation = getAuthenticationGeneration();
   const data = await api.list();
-  setState((s) => ({
+  processResponse(generation, () => setState((s) => ({
     ...s,
     listLoaded: true,
     statuses: Object.fromEntries(data.statuses.map((st) => [st.source, st])) as typeof s.statuses,
     conversations: Object.fromEntries(data.conversations.map((c) => [convKey(c.source, c.id), c])),
     approvals: Object.fromEntries(data.approvals.map((a) => [approvalKey(a), a])),
-  }));
+  })));
 }
 
 /** Load (or reload) one conversation's timeline. */
-export async function loadConversation(source: Source, id: string): Promise<void> {
+export async function loadConversation(source: Source, id: string, deliberateOpen = false): Promise<void> {
+  const generation = getAuthenticationGeneration();
   const key = convKey(source, id);
   setState((s) => ({
     ...s,
     details: { ...s.details, [key]: { status: 'loading', items: s.details[key]?.items ?? [] } },
   }));
   try {
-    const detail = await api.conversation(source, id);
-    const items = withEarlyItems(key, detail.items);
-    setState((s) => ({
-      ...s,
-      conversations: { ...s.conversations, [key]: detail.conversation },
-      approvals: {
-        ...Object.fromEntries(
-          Object.entries(s.approvals).filter(([, a]) => !(a.source === source && a.conversationId === id)),
-        ),
-        ...Object.fromEntries(detail.approvals.map((a) => [approvalKey(a), a])),
-      },
-      details: { ...s.details, [key]: { status: 'ready', items } },
-    }));
+    const detail = await (deliberateOpen ? api.openConversation(source, id) : api.conversation(source, id));
+    processResponse(generation, () => {
+      const items = withEarlyItems(key, detail.items);
+      setState((s) => ({
+        ...s,
+        conversations: { ...s.conversations, [key]: detail.conversation },
+        approvals: {
+          ...Object.fromEntries(
+            Object.entries(s.approvals).filter(([, a]) => !(a.source === source && a.conversationId === id)),
+          ),
+          ...Object.fromEntries(detail.approvals.map((a) => [approvalKey(a), a])),
+        },
+        details: { ...s.details, [key]: { status: 'ready', items, ...(detail.needsOpen !== undefined ? { needsOpen: detail.needsOpen } : {}) } },
+      }));
+    });
   } catch (err) {
+    if (generation !== getAuthenticationGeneration()) return;
     setState((s) => ({
       ...s,
       details: {

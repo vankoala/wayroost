@@ -1,6 +1,8 @@
-# Setting up Signalbox
+# Setting up Wayroost
 
-This guide takes you from nothing to Signalbox on your phone. Plan on about
+Legacy `signalbox` and `SIGNALBOX_*` names in this document stay unchanged for compatibility with existing deployments.
+
+This guide takes you from nothing to Wayroost on your phone. Plan on about
 30 minutes. Every step is safe to repeat.
 
 - [What you need](#what-you-need)
@@ -22,11 +24,11 @@ This guide takes you from nothing to Signalbox on your phone. Plan on about
 | --- | --- |
 | A Linux machine with systemd | Tested on Ubuntu 22.04, including WSL2 with `systemd=true`. This is the machine your agents run on. |
 | Node.js 22 or newer, installed system-wide | `node --version`. The installer refuses a `node` or `npm` that anyone but root could modify, such as one from nvm in your home directory. |
-| Hermes Agent and/or Paseo | Either or both. Hermes needs its dashboard running (default `:9119`) with password sign-in. Paseo needs its daemon (default `:6777`). |
+| Hermes Agent and/or Paseo | Either or both. Hermes needs its dashboard running (default `:19006`) with password sign-in. Paseo needs its daemon (default `:19007`). |
 | A Cloudflare account and a domain on Cloudflare | The free plan works. Cloudflare Access (Zero Trust) is free for up to 50 users. |
 | `cloudflared`, `git`, `rsync`, `curl`, `python3` | `cloudflared` comes from [Cloudflare's downloads](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/). |
 
-Tested versions: Hermes Agent 0.21 (dashboard API), Paseo 0.5.1 and 0.9.2.
+Tested versions: Hermes Agent 0.21 (dashboard API), Paseo 0.9.2.
 
 ## 1. Get the code
 
@@ -50,9 +52,9 @@ hostname is protected from the first moment it resolves.
 1. Open the Cloudflare dashboard and go to **Zero Trust → Access → Applications
    → Add an application → Self-hosted**. If this is your first time in Zero
    Trust, you'll pick a team name and the free plan.
-2. **Application name:** `Signalbox`. **Session duration:** `24 hours`.
+2. **Application name:** `Wayroost`. **Session duration:** `24 hours`.
 3. **Public hostname:** pick a subdomain on your domain, for example
-   `signalbox.example.com`. Leave the path empty.
+   `wayroost.example.com`. Leave the path empty.
 4. **Policy:** create a new policy named `Only me`, **Action: Allow**, and add an
    include rule **Emails** → your email address. Attach it to the application.
 5. **Login methods:** the default *One-time PIN* works: Cloudflare emails you a
@@ -76,7 +78,7 @@ sudoedit /etc/signalbox/config.json
 Set these fields:
 
 - `access.allowedEmails`: the same email as in the Access policy. This is a
-  second check inside Signalbox.
+  second check inside Wayroost.
 - `hermes.enabled` / `paseo.enabled`: turn off whichever you don't run.
 
 Leave `publicOrigin`, `access.teamDomain` and `access.aud` as they are; step 5
@@ -101,10 +103,10 @@ While the config is missing or still has its `YOUR-` placeholders, the service
 isn't started, and the installer tells you what's next:
 
 ```
-Next: sudo deploy/setup-tunnel.sh <hostname> — it fills in the Access values and starts Signalbox.
+Next: sudo deploy/setup-tunnel.sh <hostname> — it fills in the Access values and starts Wayroost.
 ```
 
-The app listens on `127.0.0.1:8790` only. Until the tunnel exists, nothing
+The app listens on `127.0.0.1:19010` only. Until the tunnel exists, nothing
 outside your machine can reach it.
 
 ## 5. Create the tunnel
@@ -121,14 +123,14 @@ Then let the setup script do the rest. Pass the bare hostname, without
 `https://` or a path (it's lowercased for you):
 
 ```bash
-sudo /opt/src/signalbox/deploy/setup-tunnel.sh signalbox.example.com
+sudo /opt/src/signalbox/deploy/setup-tunnel.sh wayroost.example.com
 ```
 
 It:
 
 1. checks that only root can change the code and `cloudflared`, that
    `cloudflared tunnel login` has been run, that the config exists and
-   Signalbox is installed, and that the hostname and tunnel name are valid;
+   Wayroost is installed, and that the hostname and tunnel name are valid;
 2. creates a dedicated tunnel named `signalbox`, or reuses the live tunnel with
    that name. Your other tunnels are untouched. Set `TUNNEL_NAME` for another
    name. If the tunnel was deleted and recreated, its new credential replaces
@@ -139,7 +141,7 @@ It:
    login redirect, and writes them, with `publicOrigin`, into
    `/etc/signalbox/config.json`;
 5. writes `/etc/signalbox/cloudflared.yml`, pointing at the port in
-   `listen.port`. Only Signalbox is routed, over HTTP/2, and cloudflared itself
+   `listen.port`. Only Wayroost is routed, over HTTP/2, and cloudflared itself
    also requires a valid Access token;
 6. installs `signalbox-tunnel.service`, then restarts both services.
 
@@ -148,12 +150,12 @@ it again.
 
 ## 6. Open it on your phone
 
-1. Open `https://signalbox.example.com`, enter your email, and type the code
+1. Open `https://wayroost.example.com`, enter your email, and type the code
    Cloudflare sends you.
 2. If you run Hermes, open **Settings (⚙) → Hermes sign-in** and enter your
-   Hermes dashboard username and password. Signalbox checks them with Hermes and
+   Hermes dashboard username and password. Wayroost checks them with Hermes and
    keeps them only on your machine.
-3. Add Signalbox to your home screen:
+3. Add Wayroost to your home screen:
    - iPhone (Safari): **Share → Add to Home Screen**.
    - Android (Chrome): **⋮ → Add to Home screen** (or **Install app**).
 
@@ -165,7 +167,7 @@ Hermes and Paseo. Approvals stay with you. It's off by default, and it listens
 on `127.0.0.1` only.
 
 1. Add `"bridge": { "enabled": true }` to `/etc/signalbox/config.json`, then
-   restart Signalbox. It creates the bridge token on this start:
+   restart Wayroost. It creates the bridge token on this start:
 
    ```bash
    sudoedit /etc/signalbox/config.json
@@ -198,15 +200,15 @@ on `127.0.0.1` only.
 From any machine:
 
 ```bash
-curl -sI https://signalbox.example.com | grep -i location
+curl -sI https://wayroost.example.com | grep -i location
 # location: https://<team>.cloudflareaccess.com/cdn-cgi/access/login/... ← Cloudflare's login
 ```
 
 On the host:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8790/api/me   # 401: needs an Access token
-curl -s http://127.0.0.1:8791/ready                                      # {"status":200,"readyConnections":4,...}
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:19010/api/me   # 401: needs an Access token
+curl -s http://127.0.0.1:19011/ready                                      # {"status":200,"readyConnections":4,...}
 systemctl status signalbox signalbox-tunnel
 journalctl -u signalbox -f
 ```
@@ -219,13 +221,13 @@ sudo git pull
 sudo deploy/install.sh
 ```
 
-`install.sh` rebuilds Signalbox and restarts it. If the pull changed anything in
+`install.sh` rebuilds Wayroost and restarts it. If the pull changed anything in
 `deploy/`, also re-run `setup-tunnel.sh`, which refreshes the tunnel's unit and
 config from the templates:
 
 ```bash
 sudo git diff --stat HEAD@{1} HEAD -- deploy/    # what the pull changed in deploy/
-sudo deploy/setup-tunnel.sh signalbox.example.com
+sudo deploy/setup-tunnel.sh wayroost.example.com
 ```
 
 If you use the project bridge, run `setup-bridge.sh` again after `install.sh`,
@@ -264,12 +266,12 @@ and the Access application in the Cloudflare dashboard, and the source,
 
 ## Running on WSL2
 
-Signalbox runs well on WSL2 with a few adjustments:
+Wayroost runs well on WSL2 with a few adjustments:
 
 - **Enable systemd:** `/etc/wsl.conf` needs `[boot]` `systemd=true`, then
   `wsl --shutdown` from Windows.
 - **Keep WSL running:** WSL stops a distro soon after its last Windows-side
-  process exits, and systemd services don't count. To have Signalbox, and
+  process exits, and systemd services don't count. To have Wayroost, and
   anything else you run as systemd services, come back after a reboot, start
   WSL at sign-in with a hidden script in your Windows Startup folder
   (`shell:startup`), for example `Start WSL.vbs`:
@@ -283,12 +285,12 @@ Signalbox runs well on WSL2 with a few adjustments:
   through WSL's NAT, which makes pages very slow. The tunnel template therefore
   uses `protocol: http2`.
 - **First request after boot:** the first DNS lookup from WSL can take several
-  seconds. Signalbox fetches Cloudflare's signing keys at startup and every 30
+  seconds. Wayroost fetches Cloudflare's signing keys at startup and every 30
   minutes, so a sign-in never waits on it.
 
 ## Troubleshooting
 
-Signalbox logs every refused request with a reason:
+Wayroost logs every refused request with a reason:
 
 ```bash
 journalctl -u signalbox | grep 'request denied'
@@ -299,22 +301,22 @@ journalctl -u signalbox | grep 'request denied'
 | "Refusing to use …: … must be owned by root and not writable by others." | The code, or a directory above it, can be modified by someone other than root | Clone into a root-only directory such as `/opt/src/signalbox`. |
 | "Refusing to run …: … must be owned by root and not writable by others." | `node`, `npm` or `cloudflared`, or a directory or symlink on the way to it, can be modified by someone other than root | Install it system-wide, for example from your distribution's packages. |
 | `setup-tunnel.sh` says "Run `cloudflared tunnel login` first (as root)." | cloudflared isn't signed in to your Cloudflare account as root, or the login went to your own home | Run `sudo -H cloudflared tunnel login`, then the script again. |
-| `setup-tunnel.sh` says "Invalid hostname" | You passed a URL or a path | Pass just the hostname, like `signalbox.example.com`. |
-| `setup-tunnel.sh` says the config doesn't exist, or "Signalbox isn't installed yet." | Steps 3 or 4 were skipped | Write the config (step 3) and run `install.sh` (step 4) first. |
+| `setup-tunnel.sh` says "Invalid hostname" | You passed a URL or a path | Pass just the hostname, like `wayroost.example.com`. |
+| `setup-tunnel.sh` says the config doesn't exist, or "Wayroost isn't installed yet." | Steps 3 or 4 were skipped | Write the config (step 3) and run `install.sh` (step 4) first. |
 | `setup-tunnel.sh` says "Tunnel credentials not found at …" | The tunnel was created elsewhere, for example on another machine | Fetch them with the `cloudflared tunnel token --cred-file …` command the script prints, then run it again. |
 | Cloudflare shows *Access denied* | Your email isn't in the Access policy | Edit the policy in Zero Trust. |
-| Signalbox says "Your secure session ended" in a loop | `access.allowedEmails` doesn't match the email you signed in with | Fix the config and `sudo systemctl restart signalbox`. The log reason is `identity not allowed`. |
+| Wayroost says "Your secure session ended" in a loop | `access.allowedEmails` doesn't match the email you signed in with | Fix the config and `sudo systemctl restart signalbox`. The log reason is `identity not allowed`. |
 | Log reason `missing access token` | The request didn't come through Access, for example the tunnel points at the wrong service | Re-run `setup-tunnel.sh`. |
 | Log reason `invalid access token (ERR_JWT_CLAIM_VALIDATION_FAILED)` | Wrong `aud` or `teamDomain` | Re-run `setup-tunnel.sh`, which re-reads both. |
 | Log reason `invalid access token (ERR_JWKS_TIMEOUT)` | The host couldn't reach `<team>.cloudflareaccess.com` | Check DNS and outbound HTTPS from the host. |
-| `systemctl status signalbox` shows `start-limit-hit` | Signalbox failed to start 5 times within 60 s, so systemd stopped retrying. Usually the config is invalid. | Read the reason with `journalctl -u signalbox` and fix it. Re-running `install.sh` or `setup-tunnel.sh` clears the limit; by hand, run `sudo systemctl reset-failed signalbox` and `sudo systemctl restart signalbox`. |
+| `systemctl status signalbox` shows `start-limit-hit` | Wayroost failed to start 5 times within 60 s, so systemd stopped retrying. Usually the config is invalid. | Read the reason with `journalctl -u signalbox` and fix it. Re-running `install.sh` or `setup-tunnel.sh` clears the limit; by hand, run `sudo systemctl reset-failed signalbox` and `sudo systemctl restart signalbox`. |
 | Pages are very slow and the tunnel log shows QUIC errors | UDP issues, common on WSL2 and some NATs | Make sure `/etc/signalbox/cloudflared.yml` has `protocol: http2`. |
 | `cloudflared tunnel route dns` attached the hostname to a different tunnel | cloudflared prefers the tunnel in `~/.cloudflared/config.yml` | Use `setup-tunnel.sh`, which passes an explicit config and `--overwrite-dns`. |
 | The inbox shows **Connect Hermes** | No saved Hermes sign-in | Sign in under **Settings → Hermes sign-in**. |
 | Settings → Connections says "Hermes rejected the saved sign-in. Sign in again in Settings." | The dashboard password changed | Sign in again under Settings. |
 | Settings → Connections says "Reconnecting to Paseo…" or "Connecting…" for Paseo | The Paseo daemon isn't running, or it uses another port | Start the daemon, or set `paseo.url`. |
 | No home-screen icon after adding to the home screen | The browser fetched the icons without the Access cookie | Remove and re-add the shortcut while signed in. |
-| An agent says "The Signalbox bridge isn't set up on this machine" | Its user has no copy of the bridge token | Run `setup-bridge.sh` for that user (step 7). |
-| An agent says "Signalbox isn't answering at http://127.0.0.1:8792" | Signalbox is stopped, or the bridge is off in the config | Turn it on (step 7) and restart Signalbox. If it still fails, look for "the project bridge could not start" in `journalctl -u signalbox`. |
-| `setup-bridge.sh` says "Signalbox hasn't created the bridge token yet" | Signalbox hasn't restarted since the bridge was turned on | `sudo systemctl restart signalbox`, then run it again. |
+| An agent says "The Wayroost bridge isn't set up on this machine" | Its user has no copy of the bridge token | Run `setup-bridge.sh` for that user (step 7). |
+| An agent says "Wayroost isn't answering at http://127.0.0.1:19012" | Wayroost is stopped, or the bridge is off in the config | Turn it on (step 7) and restart Wayroost. If it still fails, look for "the project bridge could not start" in `journalctl -u signalbox`. |
+| `setup-bridge.sh` says "Wayroost hasn't created the bridge token yet" | Wayroost hasn't restarted since the bridge was turned on | `sudo systemctl restart signalbox`, then run it again. |
 | An agent under Hermes says `Invalid arguments. arguments: Unrecognized key: "_signalbox_caller"` | Hermes loaded the `signalbox-identity` plugin while it still ran an older bridge | Run `install.sh`, then restart the Hermes dashboard and gateway (see [Updating](#updating)). |

@@ -6,7 +6,7 @@ mail and the things you said you'd do. They message you on WhatsApp when
 something is worth it, and add **cards** here that you can act on with a tap:
 a reply to send, a meeting to prepare for, a promise coming due. You set how
 often Hermes speaks up, when it stays quiet, and which topics it should leave
-alone. Signalbox can also put a notification on your phone when an agent is
+alone. Wayroost can also put a notification on your phone when an agent is
 waiting on you.
 
 It's off unless you turn it on (see [Setting it up](#setting-it-up)).
@@ -64,7 +64,7 @@ ones are forgotten after 14, and at most 300 are kept.
     WhatsApp.
 
   **Send a test** checks the path end to end. On an iPhone or iPad, add
-  Signalbox to the Home Screen first (Share, then Add to Home Screen; iOS 16.4
+  Wayroost to the Home Screen first (Share, then Add to Home Screen; iOS 16.4
   or later) and turn notifications on from there; Safari tabs can't get them.
 - **Less like this**: the topics you turned down.
 
@@ -95,7 +95,7 @@ A card is `{ key, kind, title, detail?, action?, topic? }`:
 
 ### The pulse
 
-In the setup Signalbox was built for, Hermes cron jobs feed it:
+In the setup Wayroost was built for, Hermes cron jobs feed it:
 
 - **pulse-morning-brief** (7:00) and **pulse-scout** (the daytime checks).
   Their scripts read today's calendar, unread mail that Gmail marks important
@@ -109,16 +109,16 @@ In the setup Signalbox was built for, Hermes cron jobs feed it:
   posts the cards to `/pulse/v1/cards`, and hands the message to Hermes to send
   on WhatsApp. Nothing new means nothing is sent. It also ticks off the
   open loops you marked **Done**. Its own state (`~/.hermes/pulse-relay-state.json`,
-  mode 600) holds which runs it has handled, and cards Signalbox couldn't take
+  mode 600) holds which runs it has handled, and cards Wayroost couldn't take
   yet, for up to 12 hours; its log has counts only.
 
 The proactivity level finds the first two jobs by these names.
 
 ### Phone notifications
 
-Signalbox sends Web Push itself, using Node's own crypto and no third-party
+Wayroost sends Web Push itself, using Node's own crypto and no third-party
 library. The payload is encrypted for the browser (RFC 8291, `aes128gcm`), so
-the push service carries only ciphertext, and Signalbox signs each request
+the push service carries only ciphertext, and Wayroost signs each request
 with its own VAPID key (RFC 8292). It sends only to the push services of
 Chrome and Android (`fcm.googleapis.com`), Firefox (`*.push.services.mozilla.com`),
 Safari (`*.push.apple.com`) and Edge (`*.notify.windows.com`), over HTTPS. A
@@ -126,7 +126,7 @@ device the push service reports gone (404 or 410) is dropped. At most 10
 devices are kept.
 
 The service worker, `/sw.js`, does two things: it shows a notification and
-opens the Signalbox page it points to when you tap it. It has no fetch handler,
+opens the Wayroost page it points to when you tap it. It has no fetch handler,
 so it never caches pages or sees requests.
 
 ### Files
@@ -135,14 +135,14 @@ so it never caches pages or sees requests.
 | --- | --- | --- |
 | `feed.json` | the state folder (`/var/lib/signalbox`), mode 600 | The cards, your settings and turned-down topics, and which approvals have been notified. |
 | `push.json` | the state folder, mode 600 | The VAPID key pair and each device's push subscription. An unusable one is set aside as `push.json.bad` and a new key made (phones then turn notifications on again). |
-| `pulse-relay-state.json` | `~/.hermes`, mode 600 | The relay's side: which runs it has handled, and cards Signalbox couldn't take yet (for up to 12 hours). |
+| `pulse-relay-state.json` | `~/.hermes`, mode 600 | The relay's side: which runs it has handled, and cards Wayroost couldn't take yet (for up to 12 hours). |
 
 ## Setting it up
 
 1. Turn on the [project bridge](bridge.md) if it isn't already: the pulse posts
    cards through it.
 2. Add `"feed": { "enabled": true }` to `/etc/signalbox/config.json` and restart
-   Signalbox (`sudo systemctl restart signalbox`).
+   Wayroost (`sudo systemctl restart signalbox`).
 3. Phone notifications need `publicOrigin` to be `https://`, as it is behind
    Cloudflare.
 
@@ -168,14 +168,14 @@ posting cards it stays empty, but phone notifications for approvals still work.
   maker's push service encrypted, and can show on a locked screen if your phone
   allows it.
 - **Nothing leaves your PC otherwise.** Cards, settings and subscriptions stay
-  in Signalbox's state folder. The VAPID contact is your `publicOrigin`, not
+  in Wayroost's state folder. The VAPID contact is your `publicOrigin`, not
   your email.
 
 ## Limits
 
 - Notifications need a browser that supports Web Push. On iPhone and iPad that
   means the Home Screen app.
-- When your PC is asleep or Signalbox is down, no checks run and no
+- When your PC is asleep or Wayroost is down, no checks run and no
   notifications go out. The next check picks up whatever changed.
 - The level setting knows the pulse jobs only by name. Renaming them in Hermes
   greys it out.

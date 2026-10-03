@@ -1,0 +1,65 @@
+{
+  "name": "wayroost-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Wayroost desktop companion",
+  "license": "Apache-2.0",
+  "main": "dist/desktop/src/main.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.check.json",
+    "test": "vitest run",
+    "build": "tsc && node scripts/assets.cjs",
+    "start": "npm run build && electron . --wayroost-desktop-dev",
+    "dist": "npm run build && electron-builder --win nsis --publish never && npm run -s check:fuses",
+    "check:tls": "npm run build && electron dist/desktop/src/tls-check.js",
+    "check:config": "node scripts/check-config.cjs",
+    "check:app-header": "npm run build && electron dist/desktop/src/app-header-check.js",
+    "check:fuses": "node scripts/check-fuses.cjs"
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
+    "typescript": "7.0.2",
+    "vite": "8.3.1",
+    "vitest": "5.0.2"
+  },
+  "build": {
+    "appId": "org.wayroost.desktop",
+    "productName": "Wayroost",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/desktop/src/app-header-check.js",
+      "!dist/desktop/src/tls-check.js",
+      "package.json"
+    ],
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    },
+    "protocols": [
+      {
+        "name": "Wayroost approvals",
+        "schemes": [
+          "wayroost"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "perMachine": false,
+      "oneClick": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Wayroost"
+    }
+  },
+  "type": "module"
+}

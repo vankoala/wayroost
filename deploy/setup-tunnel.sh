@@ -7,7 +7,7 @@
 #   2. creating the Cloudflare Access application for the hostname, and
 #   3. writing /etc/signalbox/config.json and running deploy/install.sh.
 #
-#   sudo deploy/setup-tunnel.sh signalbox.example.com
+#   sudo deploy/setup-tunnel.sh wayroost.example.com
 #
 # TUNNEL_NAME picks another tunnel name (default: signalbox).
 set -euo pipefail
@@ -44,7 +44,7 @@ parse_access_redirect() {
 # The Python helpers below get values only through argv and the environment,
 # never by pasting them into their source.
 
-# Prints listen.port from the config (default 8790), or exits if the config is unusable.
+# Prints listen.port from the config (default 19010), or exits if the config is unusable.
 config_port() {
   python3 -I - "$1" <<'PY'
 import json, sys
@@ -56,7 +56,7 @@ except (OSError, ValueError) as e:
     sys.exit(f"Can't read {path}: {e}")
 if not isinstance(cfg, dict) or not all(isinstance(cfg.get(k, {}), dict) for k in ("listen", "access")):
     sys.exit(f"{path} must be a JSON object laid out like deploy/config.example.json.")
-port = cfg.get("listen", {}).get("port", 8790)
+port = cfg.get("listen", {}).get("port", 19010)
 if isinstance(port, float) and port.is_integer():
     port = int(port)
 if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
@@ -168,7 +168,7 @@ if [[ -z "$HOSTNAME_" ]]; then echo "Usage: $0 <hostname>" >&2; exit 1; fi
 HOSTNAME_="${HOSTNAME_,,}"
 if ! is_hostname "$HOSTNAME_"; then
   echo "Invalid hostname: $1" >&2
-  echo "Give just the hostname, like signalbox.example.com: letters, digits and hyphens in dot-separated labels, no https:// and no path." >&2
+  echo "Give just the hostname, like wayroost.example.com: letters, digits and hyphens in dot-separated labels, no https:// and no path." >&2
   exit 1
 fi
 if ! is_tunnel_name "$TUNNEL_NAME"; then
@@ -191,7 +191,7 @@ if [[ ! -f "$ETC/config.json" ]]; then
 fi
 PORT="$(config_port "$ETC/config.json")"
 if [[ ! -f "$UNITS/signalbox.service" ]]; then
-  echo "Signalbox isn't installed yet. Run sudo deploy/install.sh first." >&2
+  echo "Wayroost isn't installed yet. Run sudo deploy/install.sh first." >&2
   exit 1
 fi
 

@@ -23,6 +23,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 GOOGLE_API = HERMES_HOME / "skills" / "productivity" / "google-workspace" / "scripts" / "google_api.py"
 MAX_SEEN = 1000
@@ -50,7 +52,21 @@ def hermes_python() -> str:
 
 
 def main() -> None:
-    spec = json.loads(Path("spec.json").read_text())
+    try:
+        spec = json.loads(Path("spec.json").read_text())
+        if spec.get("role") != "primary":
+            print(json.dumps({"wakeAgent": False}))
+            return
+        if not Path(__file__).with_name("wayroost_runtime.py").is_file():
+            raise ImportError("Wayroost runtime is missing")
+        from wayroost_runtime import BackgroundGate
+        allowed = BackgroundGate(default_config=Path("spec.json")).run(lambda: True)
+    except Exception:
+        print("Wayroost: mail gate cannot resolve its role or spec; background work is off.", file=sys.stderr)
+        allowed = False
+    if not allowed:
+        print(json.dumps({"wakeAgent": False}))
+        return
     query = str(spec.get("query") or "").strip()
     if not query:
         sys.exit("This trigger has no Gmail search.")
@@ -64,7 +80,7 @@ def main() -> None:
         capture_output=True, text=True, timeout=120, env=env,
     )
     if out.returncode != 0:
-        sys.exit("The Gmail search failed. Is Google still connected in Signalbox → Connectors?")
+        sys.exit("The Gmail search failed. Is Google still connected in Wayroost → Connectors?")
     text = out.stdout.strip()
     messages = [] if not text or text.startswith("No messages") else json.loads(text)
 

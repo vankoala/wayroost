@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import threading
+from wayroost_runtime import BackgroundGate, env
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,7 +72,7 @@ class App:
 
 
 def _env_path(name: str) -> Path | None:
-    value = os.environ.get(name, "").strip()
+    value = env(name.removeprefix("SIGNALBOX_"), "").strip()
     return Path(value) if value else None
 
 
@@ -234,7 +235,8 @@ def platform_ok(platforms: list, windows: bool) -> bool:
 # ---- the service ------------------------------------------------------------------
 
 class SkillsService:
-    def __init__(self, places: list, state_dir: Path, hermes_home: Path, scan=None, clock=time.time):
+    def __init__(self, places: list, state_dir: Path, hermes_home: Path, scan=None, clock=time.time, background=None):
+        self.background = background or BackgroundGate()
         self.places = {p.id: p for p in places}
         self.state_dir = state_dir
         self.hermes_home = hermes_home
@@ -272,6 +274,10 @@ class SkillsService:
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=1))
         os.replace(tmp, self.state_path)
+
+    def _require_primary(self) -> None:
+        if self.background.role != "primary":
+            raise SkillsError(409, "Skills are read-only in a shadow helper; use the primary helper.")
 
     def _event(self, kind: str, name: str, place: str = "", detail: str = "") -> None:
         event = {"at": int(self.clock() * 1000), "kind": kind, "name": name}
@@ -501,8 +507,10 @@ class SkillsService:
                 elif old[place]["hash"] != new[place]["hash"]:
                     self._event("changed", name, place)
 
-    def refresh(self, force_windows: bool = False) -> bool:
+    def refresh(self, force_windows: bool = False, requested: bool = True, background=None) -> bool:
         """Look at every folder, spread shared changes, record what happened. True if anything moved."""
+        if requested:
+            self._require_primary()
         with self.lock:
             now = self.clock()
             include_windows = force_windows or now - self._last_windows >= WINDOWS_POLL_SECONDS \
@@ -513,6 +521,14 @@ class SkillsService:
             first_run = self.state.get("seen") is None
             fingerprint = {n: {p: c["hash"] for p, c in copies.items()} for n, copies in skills.items()}
             before = self.state.get("seen") or {}
+            if not requested and (self.background.role != "primary" or (background or self.background).role != "primary"):
+                windows = {p.id: {} for p in self.places.values() if p.windows}
+                for name, copies in skills.items():
+                    for pid, copy in copies.items():
+                        if pid in windows:
+                            windows[pid][name] = copy
+                self.inventory = {"skills": skills, "_windows": windows, "at": int(now * 1000)}
+                return False
             if not first_run:
                 self._changes({n: {p: {"hash": h} for p, h in v.items()} for n, v in before.items()},
                               {n: {p: {"hash": h} for p, h in v.items()} for n, v in fingerprint.items()})
@@ -537,10 +553,11 @@ class SkillsService:
 
     # -- what the page shows --
 
-    def listing(self) -> dict:
+    def listing(self, background=None) -> dict:
         with self.lock:
-            if not self.inventory:
-                self.refresh(force_windows=True)
+            if not self.inventory or self.background.role != "primary" or (background is not None and background.role != "primary"):
+                self.state = self._load_state()
+                self.refresh(force_windows=True, requested=False, background=background)
             bundled, hub = self._hermes_origins()
             skills = self.inventory["skills"]
             out = []
@@ -669,6 +686,7 @@ class SkillsService:
 
     def share(self, place_id: str, name: str, confirm_caution: bool = False) -> dict:
         """Make one app's copy the shared version (then it spreads to every app)."""
+        self._require_primary()
         with self.lock:
             place, path = self._locate(place_id, name)
             if place.mode == "source":
@@ -696,6 +714,7 @@ class SkillsService:
 
     def take_shared(self, place_id: str, name: str) -> dict:
         """Put the shared version back over an app's edited copy (the edited copy is backed up)."""
+        self._require_primary()
         with self.lock:
             place, path = self._locate(place_id, name)
             if place.mode == "source":
@@ -712,6 +731,7 @@ class SkillsService:
         return {"ok": True}
 
     def set_excluded(self, name: str, place_id: str, excluded: bool) -> dict:
+        self._require_primary()
         with self.lock:
             place = self.places.get(place_id)
             if not place or place.mode != "mirror":
@@ -730,6 +750,7 @@ class SkillsService:
 
     def remove_shared(self, name: str) -> dict:
         """Take a skill out of the shared folder (backed up); unchanged copies made from it go too."""
+        self._require_primary()
         with self.lock:
             shared = self.places["shared"]
             path = find_skills(shared).get(name) if SKILL_NAME.match(name or "") else None
@@ -739,7 +760,7 @@ class SkillsService:
                 raise SkillsError(409, f"The shared {name} is a link, so it was left alone.")
             self._backup(shared, name, path)
             shutil.rmtree(path)
-            self._event("removed", name, "shared", "Removed from the shared folder in Signalbox.")
+            self._event("removed", name, "shared", "Removed from the shared folder in Wayroost.")
             self._save_state()
         self.refresh(force_windows=True)
         return {"ok": True}
@@ -750,14 +771,14 @@ class SkillsService:
         def loop():
             while True:
                 try:
-                    self.refresh()
+                    self.refresh(requested=False)
                 except Exception as err:  # keep watching; report the type only
                     on_error(type(err).__name__)
                 time.sleep(POLL_SECONDS)
-        threading.Thread(target=loop, name="skills-watch", daemon=True).start()
+        self.background.run(lambda: threading.Thread(target=loop, name="skills-watch", daemon=True).start())
 
 
-def from_env(hermes_home: Path) -> SkillsService:
+def from_env(hermes_home: Path, background=None) -> SkillsService:
     home = _env_path("SIGNALBOX_SKILLS_HOME") or Path.home()
     win_home = _env_path("SIGNALBOX_SKILLS_WINDOWS_HOME")
     win_hermes = _env_path("SIGNALBOX_SKILLS_WINDOWS_HERMES") or (win_home / "AppData" / "Local" / "hermes" if win_home else None)
@@ -766,4 +787,4 @@ def from_env(hermes_home: Path) -> SkillsService:
     if win_hermes and not win_hermes.is_dir():
         win_hermes = None
     places = default_places(home, hermes_home, win_home, win_hermes)
-    return SkillsService(places, hermes_home / "signalbox-skills", hermes_home)
+    return SkillsService(places, hermes_home / "signalbox-skills", hermes_home, background=background)

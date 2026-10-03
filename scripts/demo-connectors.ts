@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../server/src/background.js';
 // Demo data for Settings → Connectors: an in-memory stand-in for the Hermes
 // dashboard routes Connectors calls, and for the helper. A sign-in "completes"
 // a moment after the page starts waiting for it.
@@ -20,7 +21,7 @@ class DemoDashboard implements Dashboard {
       id: '5c4b3a291827',
       created_at: new Date(Date.now() - 40 * 86400_000).toISOString(),
       name: 'Signalbox: Book club mail',
-      prompt: 'A Signalbox mail trigger found new mail…\nWhat to do:\nSummarize it in two lines and tell me if it needs a reply today.',
+      prompt: 'A Wayroost mail trigger found new mail…\nWhat to do:\nSummarize it in two lines and tell me if it needs a reply today.',
       script: GATE_SCRIPT,
       workdir: '/home/demo/.hermes/signalbox-triggers/5c4b3a2918273645',
       enabled_toolsets: ['todo', 'no_mcp'],
@@ -227,9 +228,13 @@ class DemoHelper implements HelperApi {
   async triggerQueries() {
     return { ...this.folders };
   }
+  async triggerRoles() {
+    return Object.fromEntries(Object.keys(await this.triggerQueries()).map((id) => [id, 'primary' as const]));
+  }
+
   async putTrigger(id: string, query: string) {
     this.folders[id] = query;
-    return { workdir: `/home/demo/.hermes/signalbox-triggers/${id}`, script: GATE_SCRIPT };
+    return { role: 'primary' as const, workdir: `/home/demo/.hermes/signalbox-triggers/${id}`, script: GATE_SCRIPT };
   }
   async deleteTrigger(id: string) {
     delete this.folders[id];
@@ -269,7 +274,7 @@ export const demoDashboard = new DemoDashboard();
 
 export function demoConnectors(publicOrigin: string): Connectors {
   const dashboard = demoDashboard;
-  return new Connectors({
+  return new Connectors({ background: new BackgroundGate('primary'),
     dashboard: () => dashboard,
     dashboardUrl: 'http://127.0.0.1:9',
     publicOrigin,

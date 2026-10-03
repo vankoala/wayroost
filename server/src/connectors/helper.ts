@@ -1,5 +1,7 @@
+import { checkDeviceSignal, deviceSignal, actionSignal } from '../security/device-signal.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { ServerRole } from '../background.js';
 import type { PhoneStatus, WhatsAppRouting } from '../../../shared/protocol.js';
 import type { SkillList, SkillScan } from '../../../shared/skills.js';
 import type { SkillsHelperApi } from '../skills.js';
@@ -24,7 +26,8 @@ export interface HelperApi {
   googleDisconnect(): Promise<HelperStatus>;
   shops(): Promise<HelperStatus>;
   triggerQueries(): Promise<Record<string, string>>;
-  putTrigger(id: string, query: string): Promise<{ workdir: string; script: string }>;
+  triggerRoles?(): Promise<Record<string, ServerRole>>;
+  putTrigger(id: string, query: string, role?: ServerRole): Promise<{ workdir: string; script: string; role?: ServerRole }>;
   deleteTrigger(id: string): Promise<void>;
   whatsappRouting(): Promise<WhatsAppRouting>;
   setWhatsappRouting(settings: Omit<WhatsAppRouting, 'installed' | 'active'>): Promise<WhatsAppRouting>;
@@ -50,27 +53,39 @@ export class HelperClient implements HelperApi, SkillsHelperApi {
   constructor(
     private readonly port: number,
     private readonly token: string,
+    private readonly role: ServerRole,
   ) {}
 
-  private async call<T>(method: string, path: string, body?: unknown, timeoutMs = TIMEOUT_MS): Promise<T> {
+  private async call<T>(method: string, path: string, body?: unknown, timeoutMs = TIMEOUT_MS, signal = deviceSignal()): Promise<T> {
+    if (this.role !== 'primary' && path !== '/health') {
+      const data = await this.call<{ role?: string; roleAware?: boolean }>('GET', '/health', undefined, 3_000);
+      if (data.role !== 'shadow' || data.roleAware !== true) {
+        throw new UserFacingError('Shadow needs a role-aware Wayroost helper. Use the primary for this action.', 409);
+      }
+      // A legacy replacement after health must reject the operation before doing any work.
+      path = `/v1/shadow${path}`;
+    }
     let res: Response;
     try {
+      checkDeviceSignal(signal);
       res = await fetch(`http://127.0.0.1:${this.port}${path}`, {
         method,
         headers: {
           authorization: `Bearer ${this.token}`,
+          'x-wayroost-role': this.role === 'primary' ? 'primary' : 'shadow',
           ...(body === undefined ? {} : { 'content-type': 'application/json' }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: actionSignal(AbortSignal.timeout(timeoutMs), signal),
       });
     } catch {
-      throw new UserFacingError("The Signalbox helper isn't running on the PC.", 503);
+      checkDeviceSignal(signal);
+      throw new UserFacingError("The Wayroost helper isn't running on the PC.", 503);
     }
     const data = (await res.json().catch(() => ({}))) as { error?: unknown };
     if (!res.ok) {
       // The helper's errors are written for people and never carry secrets.
-      const message = typeof data.error === 'string' ? data.error : `The Signalbox helper failed (${res.status}).`;
+      const message = typeof data.error === 'string' ? data.error : `The Wayroost helper failed (${res.status}).`;
       throw new UserFacingError(message, res.status >= 500 ? 502 : res.status);
     }
     return data as T;
@@ -114,8 +129,15 @@ export class HelperClient implements HelperApi, SkillsHelperApi {
     return out;
   }
 
-  putTrigger(id: string, query: string) {
-    return this.call<{ workdir: string; script: string }>('PUT', `/triggers/${encodeURIComponent(id)}`, { query });
+  putTrigger(id: string, query: string, role?: ServerRole) {
+    const effective = this.role === 'primary' && role !== 'shadow' ? 'primary' : 'shadow';
+    return this.call<{ workdir: string; script: string; role?: ServerRole }>('PUT', `/triggers/${encodeURIComponent(id)}`, { query, role: effective });
+  }
+
+  async triggerRoles(): Promise<Record<string, ServerRole>> {
+    const data = await this.call<{ triggers?: Record<string, { role?: unknown }> }>('GET', '/triggers');
+    return Object.fromEntries(Object.entries(data.triggers ?? {}).map(([id, spec]) =>
+      [id, spec.role === 'primary' ? 'primary' : 'shadow']));
   }
 
   async deleteTrigger(id: string): Promise<void> {
@@ -148,8 +170,12 @@ export class HelperClient implements HelperApi, SkillsHelperApi {
 
   // ---- Settings → Skills ----
 
-  skills() {
-    return this.call<Omit<SkillList, 'installs'>>('GET', '/skills', undefined, 60_000);
+  async skills() {
+    const data = await this.call<Omit<SkillList, 'installs'> & { role?: ServerRole }>('GET', '/skills', undefined, 60_000);
+    if (this.role !== 'primary' && data.role !== 'shadow') {
+      throw new UserFacingError('The helper did not honour the shadow role for skills.', 409);
+    }
+    return data;
   }
 
   async skillsVersion(): Promise<number> {

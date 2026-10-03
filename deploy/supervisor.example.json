@@ -1,0 +1,14 @@
+{
+  "socket": "/run/wayroost/supervisor.sock",
+  "rescueHost": "127.0.0.1",
+  "rescuePort": 8880,
+  "keysFile": "/etc/wayroost/supervisor-keys.json",
+  "stateDir": "/var/lib/wayroost-supervisor",
+  "registryOverrides": "/etc/wayroost/components.local.json",
+  "statusOnly": true,
+  "adopt": {},
+  "tls": {
+    "certFile": "/etc/wayroost/supervisor-tls-cert.pem"
+  },
+  "development": false
+}

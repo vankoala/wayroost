@@ -1,7 +1,8 @@
+import { checkDeviceSignal, deviceSignal, deviceClient, withDeviceSignal } from '../security/device-signal.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createPaseoApi } from '@getpaseo/client';
+import { createPaseoApi, type OwnedSubscription, type PaseoApi } from '@getpaseo/client';
 import {
   DaemonClient,
   type ConnectionState,
@@ -35,6 +36,7 @@ import type {
   ConversationControls,
   ConversationDetail,
   ConversationSummary,
+  FolderScope,
   FolderStatus,
   PaseoOptions,
   SlashCommand,
@@ -43,6 +45,7 @@ import type {
   ThreadActionResult,
   TimelineItem,
 } from '../../../shared/protocol.js';
+import type { PaseoConfigWriter } from '../../../shared/safety.js';
 import type { Attachment } from '../attachments.js';
 import { splitFolder } from '../folders.js';
 import type { Logger } from '../hermes/adapter.js';
@@ -75,15 +78,23 @@ import {
   subagentStartedAt,
   subagentSummary,
   timelineItem,
+  workerSnapshotOf,
   type PaseoQuestion,
   type ProviderCatalog,
   type ProviderSubagent,
+  type WorkerSnapshot,
 } from './normalize.js';
+import type { BackgroundGate } from '../background.js';
+import { guardDaemonClient } from './device-client.js';
 
-// Talks to the local Paseo daemon with the same 0.5.1 client the Paseo CLI uses.
+// Talks to the local Paseo daemon with the 0.9.2 client the Paseo CLI uses.
 
-/** Must be >= 0.1.45 or the daemon hides custom providers such as hermes and pi. */
-const APP_VERSION = '0.5.1';
+/**
+ * The @getpaseo/client version Signalbox is built with, sent as the app version (a test
+ * checks it against the installed package). Must be >= 0.1.45 or the daemon hides custom
+ * providers such as hermes and pi.
+ */
+export const APP_VERSION = '0.9.2';
 const MAX_MIRRORS = 12;
 const COMMANDS_TTL_MS = 5 * 60_000;
 const MAX_COMMAND_LISTS = 50;
@@ -218,11 +229,20 @@ function runSummary(sessionId: string, run: RunRecord, status: RunRecord['status
 
 export class PaseoAdapter implements PaseoSource {
   private client: DaemonClient | undefined;
+  /** One SDK API per connection; its provider subscriptions are released with it. */
+  private api: PaseoApi | undefined;
+  /** The agent list stream; the daemon assigns its id and forgets it when the socket drops. */
+  private agentSubscription: OwnedSubscription<unknown> | undefined;
+  /** Permission and sub-agent delivery; recreated on each connection. */
+  private eventSubscription: OwnedSubscription<unknown> | undefined;
+  private eventUnsubscribe: (() => void) | undefined;
+  private connectionGeneration = 0;
   private statusValue: SourceStatus = { source: 'paseo', state: 'connecting' };
   private readonly agents = new Map<string, AgentSnapshotPayload>();
   private readonly placements = new Map<string, ProjectPlacementPayload | null>();
   private readonly permissions = new Map<string, PendingPermission>();
   private readonly mirrors = new Map<string, AgentTimelineMirror>();
+  private readonly mirrorReaders = new Map<AgentTimelineMirror, number>();
   private readonly watched = new Set<string>();
   private readonly lastPublished = new Map<string, string>();
   private readonly labels = new Map<string, string>();
@@ -257,9 +277,13 @@ export class PaseoAdapter implements PaseoSource {
     private readonly log: Logger,
     private readonly clientId: string,
     private readonly createClient: ClientFactory = createDaemonClient,
+    private readonly background: BackgroundGate,
   ) {}
 
   private lineage: Lineage | undefined;
+  private configWriter: PaseoConfigWriter | undefined;
+
+  useConfigWriter(writer: PaseoConfigWriter | undefined): void { this.configWriter = writer; }
 
   /**
    * Claude Code runs agents start from a shell (`claude -p`) show here as read-only rows
@@ -333,7 +357,9 @@ export class PaseoAdapter implements PaseoSource {
   start(): void {
     if (this.client) return;
     const client = this.createClient(daemonUrl(this.url), this.clientId, this.log);
+    guardDaemonClient(client);
     this.client = client;
+    this.api = createPaseoApi(deviceClient(client));
     const safely =
       <T>(handler: (value: T) => void) =>
       (value: T) => {
@@ -346,19 +372,24 @@ export class PaseoAdapter implements PaseoSource {
     this.unsubscribers.push(
       client.subscribeConnectionStatus(safely((state: ConnectionState) => this.onConnection(state))),
       client.on('agent_update', safely((m) => this.onAgentUpdate(m.payload))),
-      client.on('agent_stream', safely((m) => this.mirrors.get(m.payload.agentId)?.handleLive(m.payload))),
-      client.on('agent_permission_request', safely((m) => this.addPermission(m.payload.agentId, m.payload.request))),
-      client.on('agent_permission_resolved', safely((m) => this.removePermission(m.payload.requestId))),
-      client.on('agent.provider_subagents.update', safely((m) => this.onSubagentUpdate(m.payload))),
     );
     client.connect().catch((err) => this.log.warn({ err: message(err) }, 'paseo connect failed'));
   }
 
   stop(): void {
+    this.connectionGeneration += 1;
     for (const unsubscribe of this.unsubscribers) unsubscribe();
     this.unsubscribers = [];
+    for (const id of this.mirrors.keys()) this.dropMirror(id);
+    this.dropAgentSubscription();
+    this.dropEventSubscription();
+    void this.api?.dispose().catch(() => {});
     void this.client?.close().catch(() => {});
     this.client = undefined;
+    this.api = undefined;
+    this.eventSubscription = undefined;
+    this.previousState = null;
+    this.listLoaded = false;
   }
 
   status(): SourceStatus {
@@ -375,26 +406,76 @@ export class PaseoAdapter implements PaseoSource {
   private onConnection(state: ConnectionState): void {
     const previous = this.previousState;
     this.previousState = state.status;
+    if (state.status !== previous) this.connectionGeneration += 1;
     if (state.status === 'connected' && previous !== 'connected') {
       this.refusedReason = undefined;
       void this.bootstrap();
     } else if (state.status === 'connecting' && this.statusValue.state !== 'connected') {
       this.setStatus('connecting');
     } else if (state.status === 'disconnected') {
+      this.dropAgentSubscription();
+      this.dropEventSubscription();
       // The daemon closes with "Password required" / "Incorrect password" (paseo daemon set-password).
       const refused = state.reason && /password/i.test(state.reason) ? state.reason : undefined;
       if (refused && refused !== this.refusedReason) {
         this.log.warn({ reason: refused, credential: readPaseoPassword() ? 'set' : 'missing' }, 'Paseo refused the connection');
       }
       this.refusedReason = refused;
-      this.setStatus('disconnected', refused ? `Paseo refused Signalbox: ${refused.toLowerCase()} (credential paseo-password)` : 'Reconnecting to Paseo…');
+      this.setStatus('disconnected', refused ? `Paseo refused Wayroost: ${refused.toLowerCase()} (credential paseo-password)` : 'Reconnecting to Paseo…');
     }
+  }
+
+  private dropEventSubscription(expected?: OwnedSubscription<unknown>): void {
+    if (expected && this.eventSubscription !== expected) return;
+    this.eventUnsubscribe?.();
+    this.eventUnsubscribe = undefined;
+    void this.eventSubscription?.release().catch(() => {});
+    this.eventSubscription = undefined;
+  }
+
+  private dropAgentSubscription(expected?: OwnedSubscription<unknown>): void {
+    if (expected && this.agentSubscription !== expected) return;
+    void this.agentSubscription?.release().catch(() => {});
+    this.agentSubscription = undefined;
+  }
+
+  private subscribeEvents(api: PaseoApi): OwnedSubscription<unknown> {
+    this.dropEventSubscription();
+    const subscription = api.observeEvents([
+      'agent_permission_request', 'agent_permission_resolved', 'agent.provider_subagents.update',
+    ]);
+    this.eventSubscription = subscription;
+    this.eventUnsubscribe = subscription.subscribe({
+      snapshot() {},
+      update: (m: SessionOutboundMessage) => {
+        try {
+          if (m.type === 'agent_permission_request') this.addPermission(m.payload.agentId, m.payload.request);
+          else if (m.type === 'agent_permission_resolved') this.removePermission(m.payload.requestId);
+          else if (m.type === 'agent.provider_subagents.update') this.onSubagentUpdate(m.payload);
+        } catch (err) {
+          this.log.error({ err: message(err) }, 'paseo event handler failed');
+        }
+      },
+      error: (err) => {
+        if (this.eventSubscription !== subscription) return;
+        this.dropEventSubscription(subscription);
+        this.log.warn({ err: message(err) }, 'paseo event subscription failed');
+        this.setStatus('error', "Couldn't subscribe to Paseo approvals and sub-agents.");
+      },
+    });
+    return subscription;
   }
 
   /** Runs on every (re)connect: the daemon forgets our subscriptions when the socket drops. */
   private async bootstrap(): Promise<void> {
+    const generation = this.connectionGeneration;
     try {
-      const entries = await this.listAgentsAndSubscribe();
+      if (!this.api) return;
+      const subscription = this.subscribeEvents(this.api);
+      await subscription.ready;
+      if (generation !== this.connectionGeneration || this.eventSubscription !== subscription) return;
+      const entries = await this.listAgentsAndSubscribe(generation);
+      if (generation !== this.connectionGeneration || this.eventSubscription !== subscription) return;
       const ids = new Set(entries.map((e) => e.agent.id));
       for (const id of [...this.agents.keys()]) if (!ids.has(id)) this.forgetAgent(id);
       for (const { agent, project } of entries) {
@@ -423,32 +504,53 @@ export class PaseoAdapter implements PaseoSource {
       for (const { agent } of entries) this.seedSubagents(agent);
       void this.loadProviders().catch(() => {});
       for (const mirror of this.mirrors.values()) {
-        mirror.catchUp().catch((err) => this.log.warn({ err: message(err) }, 'paseo catch-up failed'));
+        mirror.catchUp().catch((err) => {
+          this.dropMirror(mirror.agentId, mirror);
+          this.log.warn({ err: message(err) }, 'paseo catch-up failed');
+        });
       }
     } catch (err) {
+      if (generation !== this.connectionGeneration) return;
       this.log.warn({ err: message(err) }, 'paseo bootstrap failed');
       this.setStatus('error', "Couldn't load Paseo agents.");
     }
   }
 
-  private async listAgentsAndSubscribe(): Promise<FetchAgentsEntry[]> {
+  private async listAgentsAndSubscribe(generation: number): Promise<FetchAgentsEntry[]> {
     const client = this.rawClient();
-    const entries: FetchAgentsEntry[] = [];
-    let cursor: string | undefined;
-    let first = true;
-    do {
-      const page = await client.fetchAgents({
-        scope: 'active',
-        filter: { includeArchived: false },
-        sort: [{ key: 'updated_at', direction: 'desc' }],
-        page: { limit: 200, ...(cursor ? { cursor } : {}) },
-        ...(first ? { subscribe: { subscriptionId: 'signalbox-agents' } } : {}),
-      });
-      entries.push(...page.entries);
-      cursor = page.pageInfo.hasMore ? (page.pageInfo.nextCursor ?? undefined) : undefined;
-      first = false;
-    } while (cursor);
-    return entries;
+    this.dropAgentSubscription();
+    // Own the handle before ready: the SDK can restore an unfinished subscription.
+    const subscription = client.observeAgents({
+      scope: 'active',
+      filter: { includeArchived: false },
+      sort: [{ key: 'updated_at', direction: 'desc' }],
+      page: { limit: 200 },
+    });
+    this.agentSubscription = subscription;
+    const current = () => generation === this.connectionGeneration && this.agentSubscription === subscription;
+    try {
+      const firstPage = await subscription.ready;
+      if (!current()) return [];
+      const entries = [...firstPage.entries];
+      let cursor = firstPage.pageInfo.hasMore ? (firstPage.pageInfo.nextCursor ?? undefined) : undefined;
+      while (cursor) {
+        const page = await client.fetchAgents({
+          scope: 'active',
+          filter: { includeArchived: false },
+          sort: [{ key: 'updated_at', direction: 'desc' }],
+          page: { limit: 200, cursor },
+        });
+        if (!current()) return [];
+        entries.push(...page.entries);
+        cursor = page.pageInfo.hasMore ? (page.pageInfo.nextCursor ?? undefined) : undefined;
+      }
+      return entries;
+    } catch (error) {
+      this.dropAgentSubscription(subscription);
+      throw error;
+    } finally {
+      if (!current()) void subscription.release().catch(() => {});
+    }
   }
 
   // ---- inbox ----------------------------------------------------------------
@@ -461,6 +563,44 @@ export class PaseoAdapter implements PaseoSource {
 
   listApprovals(): Approval[] {
     return [...this.permissions.values()].flatMap((p) => p.approvals);
+  }
+
+  // ---- for the task log (read-only) --------------------------------------------
+
+  /** Paseo's agent list has loaded since the last (re)connect: an agent missing from it is gone. */
+  get agentsLoaded(): boolean {
+    return this.listLoaded;
+  }
+
+  /** What Paseo last said about an agent; undefined for one it doesn't have (or a sub-agent or run row). */
+  workerSnapshot(agentId: string): WorkerSnapshot | undefined {
+    const agent = this.agents.get(agentId);
+    return agent && this.liveWorkerSnapshot(agent);
+  }
+
+  workerSnapshots(): WorkerSnapshot[] {
+    return this.listLoaded ? [...this.agents.values()].map((agent) => this.liveWorkerSnapshot(agent)) : [];
+  }
+
+  private liveWorkerSnapshot(agent: AgentSnapshotPayload): WorkerSnapshot {
+    const pendingPermissions = [...this.permissions.values()].filter((p) => p.agentId === agent.id).length;
+    return { ...workerSnapshotOf(agent), pendingPermissions };
+  }
+
+  /**
+   * Ask Paseo about an agent that isn't in the list (archived ones included).
+   * Null when Paseo no longer has it; throws when Paseo can't be asked.
+   */
+  async lookUpWorker(agentId: string): Promise<WorkerSnapshot | null> {
+    const client = this.requireClient(); // throws when Paseo can't be asked
+    try {
+      const found = await client.fetchAgent({ agentId });
+      return found ? workerSnapshotOf(found.agent) : null;
+    } catch (err) {
+      // The daemon answers an unknown id with "Agent not found: …", which the client throws.
+      if (/agent not found/i.test(message(err))) return null;
+      throw err;
+    }
   }
 
   private approvalsFor(agentId: string): Approval[] {
@@ -521,7 +661,7 @@ export class PaseoAdapter implements PaseoSource {
     this.lastActive.delete(agentId);
     this.placements.delete(agentId);
     this.lastPublished.delete(agentId);
-    this.mirrors.delete(agentId);
+    this.dropMirror(agentId);
     this.commandLists.delete(agentId);
     this.startedBy.delete(agentId);
     for (const [id, p] of [...this.permissions]) if (p.agentId === agentId) this.removePermission(id);
@@ -572,7 +712,7 @@ export class PaseoAdapter implements PaseoSource {
    */
   private seedSubagents(agent: AgentSnapshotPayload): void {
     const client = this.client;
-    if (!client || !SUBAGENT_PROVIDERS.has(agent.provider) || !agentLoaded(agent)) return;
+    if (this.background.role !== 'primary' || !client || !SUBAGENT_PROVIDERS.has(agent.provider) || !agentLoaded(agent)) return;
     if (client.getLastServerInfoMessage()?.features?.providerSubagents !== true) return;
     const agentId = agent.id;
     void (async () => {
@@ -656,43 +796,74 @@ export class PaseoAdapter implements PaseoSource {
 
   // ---- one agent ------------------------------------------------------------
 
-  async getConversation(agentId: string): Promise<ConversationDetail> {
+  async getConversation(agentId: string, deliberateOpen = false): Promise<ConversationDetail> {
     if (isRunRowId(agentId)) return this.runDetail(agentId);
     if (isSubagentRowId(agentId)) return this.subagentDetail(agentId);
-    const client = this.requireClient();
+    const signal = deviceSignal();
+    checkDeviceSignal(signal);
+    const client = this.requireClient(signal);
     if (!this.agents.has(agentId)) {
       const found = await client.fetchAgent({ agentId }).catch(() => null);
       if (!found) throw new UserFacingError('That Paseo agent no longer exists.', 404);
       this.keepAgent(found.agent);
       this.placements.set(found.agent.id, found.project ?? null);
     }
+    const activate = deliberateOpen || this.background.role === 'primary';
+    if (!activate) {
+      const cached = this.mirrors.get(agentId);
+      if (cached) cached.lastUsed = Date.now();
+      return {
+        conversation: this.summaryFor(agentId), items: this.toItems(cached?.rows ?? []),
+        approvals: this.approvalsFor(agentId), needsOpen: !cached?.loaded,
+      };
+    }
     let mirror = this.mirrors.get(agentId);
     if (!mirror) {
-      mirror = new AgentTimelineMirror(client, agentId, this.sinkFor(agentId));
+      checkDeviceSignal(signal);
+      // The shared subscription belongs to the server; each explicit load keeps its caller's client.
+      mirror = withDeviceSignal(undefined, () => new AgentTimelineMirror(this.rawClient(), agentId, this.sinkFor(agentId), this.background));
       this.mirrors.set(agentId, mirror);
+    }
+    this.mirrorReaders.set(mirror, (this.mirrorReaders.get(mirror) ?? 0) + 1);
+    this.evictMirrors();
+    mirror.lastUsed = Date.now();
+    try {
+      if (!mirror.loaded) {
+        let live: AgentSnapshotPayload | null;
+        try {
+          live = await mirror.loadTail(120, client);
+          checkDeviceSignal(signal);
+        } catch (err) {
+          // A revoked reader cannot retire a subscription another device is using.
+          checkDeviceSignal(signal);
+          this.dropMirror(agentId, mirror);
+          throw new UserFacingError(`Couldn't open this agent: ${message(err)}`);
+        }
+        // Opening the timeline made Paseo load the agent; replace a snapshot taken from storage.
+        const known = this.agents.get(agentId);
+        if (live && known && !agentLoaded(known)) {
+          this.keepAgent(live);
+          this.publishSummary(agentId);
+        }
+      }
+      if (deliberateOpen) {
+        await this.listCommands(agentId, true).catch(err => {
+          this.log.warn({ agentId, err: message(err) }, 'paseo command discovery failed after opening history');
+        });
+      }
+      checkDeviceSignal(signal);
+      return {
+        conversation: this.summaryFor(agentId),
+        ...(this.background.role === 'shadow' ? { needsOpen: !mirror.loaded } : {}),
+        items: this.toItems(mirror.rows),
+        approvals: this.approvalsFor(agentId),
+      };
+    } finally {
+      const readers = this.mirrorReaders.get(mirror)! - 1;
+      if (readers) this.mirrorReaders.set(mirror, readers);
+      else this.mirrorReaders.delete(mirror);
       this.evictMirrors();
     }
-    mirror.lastUsed = Date.now();
-    if (!mirror.loaded) {
-      let live: AgentSnapshotPayload | null;
-      try {
-        live = await mirror.loadTail();
-      } catch (err) {
-        this.mirrors.delete(agentId);
-        throw new UserFacingError(`Couldn't open this agent: ${message(err)}`);
-      }
-      // Opening the timeline made Paseo load the agent; replace a snapshot taken from storage.
-      const known = this.agents.get(agentId);
-      if (live && known && !agentLoaded(known)) {
-        this.keepAgent(live);
-        this.publishSummary(agentId);
-      }
-    }
-    return {
-      conversation: this.summaryFor(agentId),
-      items: this.toItems(mirror.rows),
-      approvals: this.approvalsFor(agentId),
-    };
   }
 
   setWatching(agentId: string, watching: boolean): void {
@@ -700,14 +871,22 @@ export class PaseoAdapter implements PaseoSource {
     else this.watched.delete(agentId);
     const mirror = this.mirrors.get(agentId);
     if (mirror) mirror.lastUsed = Date.now();
+    this.evictMirrors();
   }
 
   private evictMirrors(): void {
     if (this.mirrors.size <= MAX_MIRRORS) return;
     const idle = [...this.mirrors.values()]
-      .filter((m) => !this.watched.has(m.agentId))
+      .filter((m) => !this.watched.has(m.agentId) && !this.mirrorReaders.has(m))
       .sort((a, b) => a.lastUsed - b.lastUsed);
-    for (const mirror of idle.slice(0, this.mirrors.size - MAX_MIRRORS)) this.mirrors.delete(mirror.agentId);
+    for (const mirror of idle.slice(0, this.mirrors.size - MAX_MIRRORS)) this.dropMirror(mirror.agentId);
+  }
+
+  /** Remove a mirror, dropping its timeline subscription with it. */
+  private dropMirror(agentId: string, expected?: AgentTimelineMirror): void {
+    if (expected && this.mirrors.get(agentId) !== expected) return;
+    this.mirrors.get(agentId)?.close();
+    this.mirrors.delete(agentId);
   }
 
   private toItems(rows: readonly MirrorRow[]): TimelineItem[] {
@@ -755,7 +934,10 @@ export class PaseoAdapter implements PaseoSource {
           publish([{ kind: 'notice', id, level: 'info', text: 'Stopped' }]);
         }
       },
-      failure: (err) => this.log.warn({ err: message(err), agentId }, 'paseo timeline sync failed'),
+      failure: (err) => {
+        this.dropMirror(agentId);
+        this.log.warn({ err: message(err), agentId }, 'paseo timeline sync failed');
+      },
     };
   }
 
@@ -765,6 +947,7 @@ export class PaseoAdapter implements PaseoSource {
     this.refuseSubagent(agentId);
     const client = this.requireClient();
     const files = await this.prepareFiles(client, attachments);
+    checkDeviceSignal();
     // Paseo's own app sends it this way too: while the agent works, a message steers
     // the running turn where the provider can; other providers stop it and start this one.
     const steer = this.agents.get(agentId)?.status === 'running';
@@ -778,6 +961,7 @@ export class PaseoAdapter implements PaseoSource {
       });
     } catch (err) {
       this.sentFiles.delete(messageId);
+      checkDeviceSignal();
       throw new UserFacingError(`Paseo: ${message(err)}`);
     }
   }
@@ -806,6 +990,7 @@ export class PaseoAdapter implements PaseoSource {
 
   private async upload(client: DaemonClient, file: Attachment): Promise<AgentAttachment> {
     const reply = await client.uploadFile({ fileName: file.name, mimeType: file.mimeType, bytes: file.bytes }).catch((err) => {
+      checkDeviceSignal();
       throw new UserFacingError(`Paseo couldn't take ${file.name}: ${message(err)}`);
     });
     if (!reply.file) throw new UserFacingError(`Paseo couldn't take ${file.name}: ${reply.error ?? 'the upload failed'}`);
@@ -819,15 +1004,17 @@ export class PaseoAdapter implements PaseoSource {
     if (this.sentFiles.size > MAX_REMEMBERED_MESSAGES) this.sentFiles.delete(this.sentFiles.keys().next().value!);
   }
 
-  async listCommands(agentId: string): Promise<SlashCommand[]> {
+  async listCommands(agentId: string, deliberate = false): Promise<SlashCommand[]> {
     this.refuseSubagent(agentId);
     const client = this.requireClient();
     const hit = this.commandLists.get(agentId);
     if (hit && Date.now() - hit.at < COMMANDS_TTL_MS) return hit.commands;
+    if (!deliberate && this.background.role !== 'primary') return hit?.commands ?? [];
     // Asking a stored agent for its commands makes Paseo resume it; only ask agents that are up.
     const agent = this.agents.get(agentId);
     if (!agent || !agentLoaded(agent)) return [];
     const reply = await client.listCommands(agentId).catch((err) => {
+      checkDeviceSignal();
       throw new UserFacingError(`Paseo: ${message(err)}`);
     });
     if (reply.error) {
@@ -853,6 +1040,7 @@ export class PaseoAdapter implements PaseoSource {
     try {
       await client.cancelAgent(agentId);
     } catch (err) {
+      checkDeviceSignal();
       throw new UserFacingError(`Paseo: ${message(err)}`);
     }
   }
@@ -901,8 +1089,10 @@ export class PaseoAdapter implements PaseoSource {
     try {
       await client.respondToPermissionAndWait(pending.agentId, pending.request.id, response, 15_000);
     } catch (err) {
+      checkDeviceSignal();
       throw new UserFacingError(`Paseo: ${message(err)}`);
     }
+    checkDeviceSignal();
     this.removePermission(pending.request.id);
   }
 
@@ -946,7 +1136,7 @@ export class PaseoAdapter implements PaseoSource {
     } catch (err) {
       throw readRefusal(err);
     }
-    if (file.kind !== 'image') throw new UserFacingError("That file isn't an image Signalbox can show.", 415);
+    if (file.kind !== 'image') throw new UserFacingError("That file isn't an image Wayroost can show.", 415);
     return { bytes: Buffer.from(file.bytes) };
   }
 
@@ -983,6 +1173,7 @@ export class PaseoAdapter implements PaseoSource {
       else if (change.control === 'reasoning') notice = await client.setAgentThinkingOption(agentId, option.id);
       else notice = await client.setAgentMode(agentId, option.id);
     } catch (err) {
+      checkDeviceSignal();
       throw new UserFacingError(`Paseo: ${message(err)}`);
     }
     await this.refreshAgent(agentId);
@@ -1000,7 +1191,7 @@ export class PaseoAdapter implements PaseoSource {
     let snapshot = await client.getProvidersSnapshot({ cwd: agent.cwd });
     if (find(snapshot.entries)?.status === 'loading') {
       // Paseo is still asking the agent CLI what it offers.
-      const ready = async () => createPaseoApi(client).providers.waitForReady({ cwd: agent.cwd, timeoutMs: CATALOG_WAIT_MS });
+      const ready = async () => this.api!.providers.waitForReady({ cwd: agent.cwd, timeoutMs: CATALOG_WAIT_MS });
       snapshot = await ready().catch(() => snapshot);
     }
     const entry = find(snapshot.entries);
@@ -1027,9 +1218,8 @@ export class PaseoAdapter implements PaseoSource {
 
   private async loadProviders(): Promise<ProviderEntry[]> {
     const client = this.rawClient();
-    const snapshot = await (async () => createPaseoApi(client).providers.waitForReady({ timeoutMs: 20_000 }))().catch(
-      () => client.getProvidersSnapshot(),
-    );
+    const ready = async () => this.api!.providers.waitForReady({ timeoutMs: 20_000 });
+    const snapshot = await ready().catch(() => client.getProvidersSnapshot());
     const providers = snapshot.entries
       .filter((e) => e.enabled && e.status === 'ready')
       .map((e): ProviderEntry => {
@@ -1100,7 +1290,7 @@ export class PaseoAdapter implements PaseoSource {
       if (!mode) throw new UserFacingError('Pick a permission mode for this agent.', 400);
       const tier = modeTier(provider.id, mode);
       if (tier === 'blocked') {
-        throw new UserFacingError("That mode turns off every safeguard, so it can't be started from Signalbox.", 400);
+        throw new UserFacingError("That mode turns off every safeguard, so it can't be started from Wayroost.", 400);
       }
       actsWithoutAsking = tier === 'auto';
     }
@@ -1111,6 +1301,7 @@ export class PaseoAdapter implements PaseoSource {
     const workspace = this.workspaces.find((w) => (w.workspaceDirectory ?? w.projectRootPath) === input.cwd);
     const attachments = input.attachments ?? [];
     const files = await this.prepareFiles(client, attachments);
+    checkDeviceSignal();
     const messageId = randomUUID();
     this.rememberFiles(messageId, attachments);
     let agent: AgentSnapshotPayload;
@@ -1131,8 +1322,13 @@ export class PaseoAdapter implements PaseoSource {
       });
     } catch (err) {
       this.sentFiles.delete(messageId);
+      checkDeviceSignal();
       throw new UserFacingError(`Paseo: ${message(err)}`);
     }
+    // The daemon has likely already moved on: live updates for the new agent beat the
+    // create response home, so this snapshot is stale. Take the current one.
+    const current = await client.fetchAgent(agent.id).catch(() => null);
+    if (current?.agent) agent = current.agent;
     if (input.startedBy) {
       this.startedBy.set(agent.id, input.startedBy);
       if (this.startedBy.size > MAX_STARTED_BY) this.startedBy.delete(this.startedBy.keys().next().value!);
@@ -1145,18 +1341,18 @@ export class PaseoAdapter implements PaseoSource {
   // ---- tidying up ----------------------------------------------------------------
 
   /** Archive agents in Paseo itself, so its app hides them too. */
-  async archiveThreads(ids: string[]): Promise<ThreadActionResult> {
-    const client = this.requireClient();
+  async archiveThreads(ids: string[], _folder?: FolderScope, signal = deviceSignal()): Promise<ThreadActionResult> {
+    const client = this.requireClient(signal);
     // Paseo takes an agent's delegated children along; archive those first.
     return eachThread('paseo', this.childrenFirst(ids), async (id) => {
       await client.archiveAgent(id);
       this.forgetAgent(id);
-    });
+    }, signal);
   }
 
   /** Paseo un-archives an agent when it reloads it from disk. */
-  async restoreThreads(ids: string[]): Promise<ThreadActionResult> {
-    const client = this.requireClient();
+  async restoreThreads(ids: string[], signal = deviceSignal()): Promise<ThreadActionResult> {
+    const client = this.requireClient(signal);
     return eachThread('paseo', ids, async (id) => {
       await client.refreshAgent(id);
       // Normally Paseo's own update brings it back; don't wait for that.
@@ -1166,15 +1362,15 @@ export class PaseoAdapter implements PaseoSource {
         this.placements.set(id, found.project ?? null);
         this.publishSummary(id);
       }
-    });
+    }, signal);
   }
 
-  async deleteThreads(ids: string[]): Promise<ThreadActionResult> {
-    const client = this.requireClient();
+  async deleteThreads(ids: string[], signal = deviceSignal()): Promise<ThreadActionResult> {
+    const client = this.requireClient(signal);
     return eachThread('paseo', this.childrenFirst(ids), async (id) => {
       await client.deleteAgent(id);
       this.forgetAgent(id);
-    });
+    }, signal);
   }
 
   async listArchived(limit: number): Promise<ArchivedThread[]> {
@@ -1240,9 +1436,12 @@ export class PaseoAdapter implements PaseoSource {
    */
   async setCloudAgentEnabled(id: CloudAgentId, enabled: boolean): Promise<CloudAgentsStatus> {
     const client = this.requireClient();
+    if (!this.configWriter) throw new UserFacingError('The Safety helper is required to switch cloud agents safely.', 424);
     try {
-      await client.patchDaemonConfig({ providers: { [id]: { enabled } } });
+      await this.configWriter.setCloudAgentEnabled(id, enabled);
     } catch (err) {
+      if (err instanceof UserFacingError) throw err;
+      checkDeviceSignal();
       throw new UserFacingError(`Paseo: ${message(err)}`);
     }
     this.log.info({ provider: id, enabled }, 'cloud agent switched');
@@ -1298,7 +1497,7 @@ export class PaseoAdapter implements PaseoSource {
   /** The client even while (re)bootstrapping; for internal use. */
   private rawClient(): DaemonClient {
     if (!this.client) throw new UserFacingError('Paseo is not connected.', 503);
-    return this.client;
+    return deviceClient(this.client);
   }
 
   /** The client once the inbox is in sync; for user actions. */
@@ -1307,6 +1506,7 @@ export class PaseoAdapter implements PaseoSource {
 
   private async scheduleCall<T extends { error: string | null }>(work: (c: DaemonClient) => Promise<T>): Promise<T> {
     const reply = await work(this.requireClient()).catch((err: unknown) => {
+      checkDeviceSignal();
       throw new UserFacingError(`Paseo: ${message(err)}`);
     });
     if (reply.error) throw new UserFacingError(`Paseo: ${reply.error}`, /not found/i.test(reply.error) ? 404 : 400);
@@ -1350,10 +1550,10 @@ export class PaseoAdapter implements PaseoSource {
     return typeof agent?.title === 'string' && agent.title ? agent.title : undefined;
   }
 
-  private requireClient(): DaemonClient {
+  private requireClient(signal = deviceSignal()): DaemonClient {
     if (!this.client || this.statusValue.state !== 'connected') {
       throw new UserFacingError('Paseo is reconnecting. Try again in a moment.', 503);
     }
-    return this.client;
+    return deviceClient(this.client, signal);
   }
 }

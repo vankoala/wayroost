@@ -17,6 +17,7 @@ import type { Schedules } from '../schedules.js';
 import { UserFacingError, type HermesSource } from '../sources.js';
 import { oneLine, type CardInput, type FeedStore, type StoredSettings } from './store.js';
 import type { PushMessage, PushSender, PushSubscriptionInput } from './push.js';
+import { shadowBackground, type BackgroundGate } from '../background.js';
 
 // For you: Hermes' pulse (the 7am brief and the daytime checks) posts cards
 // through the bridge listener; you act on them here. "Do it" starts a Hermes
@@ -43,6 +44,7 @@ export interface FeedLog {
 }
 
 export interface FeedDeps {
+  background?: BackgroundGate;
   store: FeedStore;
   hub: EventHub;
   hermes: Pick<HermesSource, 'createConversation'>;
@@ -78,10 +80,12 @@ export class Feed {
   }
 
   start(): void {
-    this.deps.hub.observe((event) => this.observe(event));
-    this.timer = setInterval(() => this.wake(), 60_000);
-    this.timer.unref?.();
-    void this.findPulse();
+    (this.deps.background ?? shadowBackground).run(() => {
+      this.deps.hub.observe((event) => this.observe(event));
+      this.timer = setInterval(() => this.wake(), 60_000);
+      this.timer.unref?.();
+      void this.findPulse();
+    });
   }
 
   stop(): void {
@@ -133,6 +137,10 @@ export class Feed {
   // ---- The pulse's side -------------------------------------------------------------
 
   ingest(source: FeedSource, cards: CardInput[]): { created: number; updated: number } {
+    return (this.deps.background ?? shadowBackground).run(() => this.ingestCards(source, cards)) ?? { created: 0, updated: 0 };
+  }
+
+  private ingestCards(source: FeedSource, cards: CardInput[]): { created: number; updated: number } {
     const { created, updated, removed } = this.deps.store.ingest(source, cards);
     for (const card of [...created, ...updated]) this.publish(card);
     for (const id of removed) this.deps.hub.publish({ type: 'feed_removed', id });
@@ -150,6 +158,17 @@ export class Feed {
       });
     }
     return { created: created.length, updated: updated.length };
+  }
+
+  /**
+   * Signalbox's own side: close an open card whose subject is over (the task log
+   * closes "task:<worker id>" when an overdue worker stops running). The browser
+   * drops it on the update. A closed card has no chat, so it counts as done in
+   * preferences(); harmless, since the pulse only ticks off its own "loop:" keys.
+   */
+  close(key: string): void {
+    const card = this.deps.store.close(key);
+    if (card) this.publish(card);
   }
 
   // ---- Your side ------------------------------------------------------------------
@@ -211,12 +230,12 @@ export class Feed {
 
   /** The key browsers subscribe with. */
   pushKey(): string {
-    if (!this.deps.push) throw new UserFacingError('Phone notifications need Signalbox on https.', 409);
+    if (!this.deps.push) throw new UserFacingError('Phone notifications need Wayroost on https.', 409);
     return this.deps.push.publicKey();
   }
 
   addDevice(input: PushSubscriptionInput): number {
-    if (!this.deps.push) throw new UserFacingError('Phone notifications need Signalbox on https.', 409);
+    if (!this.deps.push) throw new UserFacingError('Phone notifications need Wayroost on https.', 409);
     try {
       return this.deps.push.add(input, this.now());
     } catch (err) {
@@ -224,7 +243,7 @@ export class Feed {
         throw new UserFacingError(`That browser can't get notifications here (${err.message}).`, 400);
       }
       this.deps.log.warn({ err: (err as Error).name }, 'could not save a device for notifications');
-      throw new UserFacingError("Signalbox couldn't save this device. Try again.", 500);
+      throw new UserFacingError("Wayroost couldn't save this device. Try again.", 500);
     }
   }
 
@@ -233,11 +252,12 @@ export class Feed {
   }
 
   async testPush(): Promise<{ sent: number }> {
-    if (!this.deps.push) throw new UserFacingError('Phone notifications need Signalbox on https.', 409);
+    if (!this.deps.push) throw new UserFacingError('Phone notifications need Wayroost on https.', 409);
     if (!this.deps.push.devices()) throw new UserFacingError('No phone or browser is set up for notifications yet.', 409);
     const result = await this.deps.push.send(
-      { title: 'Signalbox', body: 'Notifications work.', url: '/#for-you', tag: 'test', ttl: 300, urgency: 'normal' },
+      { title: 'Wayroost', body: 'Notifications work.', url: '/#for-you', tag: 'test', ttl: 300, urgency: 'normal' },
       this.now(),
+      true,
     );
     if (!result.sent) throw new UserFacingError("The push service didn't take the test notification.", 502);
     return { sent: result.sent };
@@ -255,7 +275,9 @@ export class Feed {
   }
 
   private observe(event: ServerEvent): void {
-    if (event.type === 'approval_upsert') this.notifyApproval(event.approval);
+    (this.deps.background ?? shadowBackground).run(() => {
+      if (event.type === 'approval_upsert') this.notifyApproval(event.approval);
+    });
   }
 
   /**
@@ -269,7 +291,7 @@ export class Feed {
     this.notify(
       {
         title: `${SOURCE_NAMES[approval.source]} needs you`,
-        body: oneLine(approval.title, 80) || 'Open Signalbox to answer.',
+        body: oneLine(approval.title, 80) || 'Open Wayroost to answer.',
         url: `/c/${approval.source}/${encodeURIComponent(approval.conversationId)}`,
         tag: `approval-${approval.source}-${approval.conversationId}`.slice(0, 64),
         ttl: 3600,
@@ -283,7 +305,7 @@ export class Feed {
   private notify(message: PushMessage, { evenWhenQuiet = false } = {}): void {
     const { push } = this.deps;
     if (!push || !push.devices() || (!evenWhenQuiet && this.quiet(this.now()))) return;
-    push.send(message, this.now()).catch((err: Error) => this.deps.log.warn({ err: err.message }, 'notification not sent'));
+    (this.deps.background ?? shadowBackground).run(() => push.send(message, this.now()).catch((err: Error) => this.deps.log.warn({ err: err.message }, 'notification not sent')));
   }
 
   /** Local "HH:MM". */
@@ -353,7 +375,7 @@ export class Feed {
   /** Pause, resume and reschedule the pulse jobs for a level. */
   private async applyLevel(level: ProactivityLevel): Promise<void> {
     const schedules = this.deps.schedules;
-    if (!schedules) throw new UserFacingError("Signalbox can't reach Hermes' scheduled jobs here.", 409);
+    if (!schedules) throw new UserFacingError("Wayroost can't reach Hermes' scheduled jobs here.", 409);
     let jobs: { brief?: ScheduleJob; scout?: ScheduleJob };
     try {
       jobs = await this.pulseJobs();

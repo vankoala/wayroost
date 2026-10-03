@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,7 +27,7 @@ const ONESHOT = '20260315_101700_decade';
 const T = Date.parse('2026-09-28T23:00:00Z');
 
 describe('the nearest launcher', () => {
-  const lineage = new Lineage(null, quietLog, () => T);
+  const lineage = new Lineage(null, quietLog, () => T, new BackgroundGate('primary'));
   const starts: Record<string, number> = { [PI]: T - 3600_000, [CHAT]: T - 7200_000 };
   lineage.setStartLookup('paseo', (id) => starts[id]);
   lineage.setStartLookup('hermes', (id) => starts[id]);
@@ -59,7 +60,7 @@ describe('the nearest launcher', () => {
 describe('Claude Code runs', () => {
   it('keeps the first prompt as the task, the latest answer, and ends as done or error', () => {
     let now = T;
-    const lineage = new Lineage(null, quietLog, () => now);
+    const lineage = new Lineage(null, quietLog, () => now, new BackgroundGate('primary'));
     lineage.noteRun(RUN1, 'start', { candidates: [{ kind: 'hermes', id: CHAT }], cwd: '/home/me/app', entrypoint: 'sdk-cli' });
     lineage.noteRun(RUN1, 'prompt', { task: 'Audit the repo' });
     lineage.noteRun(RUN1, 'prompt', { task: 'a later prompt is not the task' });
@@ -72,7 +73,7 @@ describe('Claude Code runs', () => {
 
   it('never invents a run from an event without a launcher, and stops calling a silent run running', () => {
     let now = T;
-    const lineage = new Lineage(null, quietLog, () => now);
+    const lineage = new Lineage(null, quietLog, () => now, new BackgroundGate('primary'));
     lineage.noteRun(RUN1, 'stop', { final: 'orphan answer' });
     expect(lineage.run(RUN1)).toBeUndefined();
     lineage.noteRun(RUN2, 'start', { candidates: [{ kind: 'paseo', id: PI }] });
@@ -85,13 +86,13 @@ describe('Claude Code runs', () => {
 describe('the lineage file', () => {
   it('survives a restart, private to the service', () => {
     const dir = mkdtempSync(join(tmpdir(), 'sb-lineage-'));
-    const a = new Lineage(dir, quietLog, () => T);
+    const a = new Lineage(dir, quietLog, () => T, new BackgroundGate('primary'));
     a.noteLaunch(ONESHOT, [{ kind: 'paseo', id: PI }], T - 5000);
     a.noteRun(RUN1, 'start', { candidates: [{ kind: 'paseo', id: PI }], task: 'x' });
     a.setStartedBy(`hermes:${CHAT}`, { source: 'paseo', id: PI, title: 'Manager' });
     a.save();
     expect(statSync(join(dir, 'lineage.json')).mode & 0o777).toBe(0o600);
-    const b = new Lineage(dir, quietLog, () => T);
+    const b = new Lineage(dir, quietLog, () => T, new BackgroundGate('primary'));
     expect(b.launchOf([ONESHOT])?.candidates).toEqual([{ kind: 'paseo', id: PI }]);
     expect(b.run(RUN1)?.task).toBe('x');
     expect(b.startedBy(`hermes:${CHAT}`)).toEqual({ source: 'paseo', id: PI, title: 'Manager' });
@@ -99,19 +100,19 @@ describe('the lineage file', () => {
 
   it('starts empty from a damaged file instead of failing', () => {
     const dir = mkdtempSync(join(tmpdir(), 'sb-lineage-'));
-    const a = new Lineage(dir, quietLog, () => T);
+    const a = new Lineage(dir, quietLog, () => T, new BackgroundGate('primary'));
     a.noteLaunch(ONESHOT, [{ kind: 'paseo', id: PI }], T);
     a.save();
     const path = join(dir, 'lineage.json');
     writeFileSync(path, readFileSync(path, 'utf8').slice(0, 20));
-    expect(new Lineage(dir, quietLog, () => T).launchOf([ONESHOT])).toBeUndefined();
+    expect(new Lineage(dir, quietLog, () => T, new BackgroundGate('primary')).launchOf([ONESHOT])).toBeUndefined();
   });
 });
 
 describe('launch reports through the bridge', () => {
   const make = () => {
-    const lineage = new Lineage(null, quietLog, () => T);
-    const bridge = new Bridge({ sources: { hermes: new FakeHermesSource(), paseo: new FakePaseo() }, hub: new EventHub(), log: quietLog, pollMs: 0, lineage, now: () => T });
+    const lineage = new Lineage(null, quietLog, () => T, new BackgroundGate('primary'));
+    const bridge = new Bridge({ background: new BackgroundGate('primary'), sources: { hermes: new FakeHermesSource(), paseo: new FakePaseo() }, hub: new EventHub(), log: quietLog, pollMs: 0, lineage, now: () => T });
     return { lineage, bridge };
   };
 
@@ -142,7 +143,7 @@ describe('launch reports through the bridge', () => {
     const { bridge } = make();
     bridge.setPaused(true);
     await expect(bridge.call('note_launch', { child: ONESHOT, candidates: [{ kind: 'paseo', id: PI }] })).resolves.toEqual({ ok: true });
-    const bare = new Bridge({ sources: { hermes: new FakeHermesSource(), paseo: new FakePaseo() }, hub: new EventHub(), log: quietLog, pollMs: 0 });
+    const bare = new Bridge({ background: new BackgroundGate('primary'), sources: { hermes: new FakeHermesSource(), paseo: new FakePaseo() }, hub: new EventHub(), log: quietLog, pollMs: 0 });
     await expect(bare.call('note_launch', { child: ONESHOT, candidates: [{ kind: 'paseo', id: PI }] })).rejects.toMatchObject({ status: 404 });
   });
 });
@@ -158,8 +159,8 @@ describe('a one-shot started from a shell, against the fake dashboard', () => {
     await fake.start();
     const stateDir = mkdtempSync(join(tmpdir(), 'sb-lineage-hermes-'));
     new SecretStore(stateDir).writeHermes(FAKE_USER);
-    lineage = new Lineage(stateDir, quietLog);
-    adapter = new HermesAdapter(fake.url, new EventHub(), new SecretStore(stateDir), quietLog, { lineage });
+    lineage = new Lineage(stateDir, quietLog, undefined, new BackgroundGate('primary'));
+    adapter = new HermesAdapter(fake.url, new EventHub(), new SecretStore(stateDir), quietLog, { background: new BackgroundGate('primary'), lineage });
   });
 
   afterEach(async () => {
@@ -192,11 +193,11 @@ describe('launch reports over the bridge listener (HTTP)', () => {
   it('accepts note_launch and note_run with the token, and still 404s unknown tools', async () => {
     const { buildBridgeServer } = await import('../src/bridge/server.js');
     const TOKEN = 'test-token-0123456789abcdefghijklmnopqrstuv';
-    const lineage = new Lineage(null, quietLog, () => T);
-    const bridge = new Bridge({ sources: { hermes: new FakeHermesSource(), paseo: new FakePaseo() }, hub: new EventHub(), log: quietLog, pollMs: 0, lineage, now: () => T });
-    const app = await buildBridgeServer({ bridge, token: TOKEN, port: 8792, log: quietLog });
+    const lineage = new Lineage(null, quietLog, () => T, new BackgroundGate('primary'));
+    const bridge = new Bridge({ background: new BackgroundGate('primary'), sources: { hermes: new FakeHermesSource(), paseo: new FakePaseo() }, hub: new EventHub(), log: quietLog, pollMs: 0, lineage, now: () => T });
+    const app = await buildBridgeServer({ background: new BackgroundGate('primary'), bridge, token: TOKEN, port: 19012, log: quietLog });
     const post = (tool: string, body: unknown, token = TOKEN) =>
-      app.inject({ method: 'POST', url: `/bridge/v1/${tool}`, headers: { host: '127.0.0.1:8792', authorization: `Bearer ${token}`, 'content-type': 'application/json' }, payload: JSON.stringify(body) });
+      app.inject({ method: 'POST', url: `/bridge/v1/${tool}`, headers: { host: '127.0.0.1:19012', authorization: `Bearer ${token}`, 'content-type': 'application/json' }, payload: JSON.stringify(body) });
     try {
       const launch = await post('note_launch', { child: ONESHOT, candidates: [{ kind: 'paseo', id: PI }] });
       expect(launch.statusCode).toBe(200);
@@ -213,7 +214,7 @@ describe('launch reports over the bridge listener (HTTP)', () => {
 
 describe("Paseo's own Claude agents", () => {
   it('stand for themselves when a child names their Claude session', () => {
-    const lineage = new Lineage(null, quietLog, () => T);
+    const lineage = new Lineage(null, quietLog, () => T, new BackgroundGate('primary'));
     const agentId = '4f0e8a6c-1d2b-4c3a-9e8f-7a6b5c4d3e2f';
     lineage.setStartLookup('paseo', (id) => (id === agentId ? T - 600_000 : undefined));
     lineage.setClaudeOwner((sid) => (sid === RUN2 ? agentId : undefined));

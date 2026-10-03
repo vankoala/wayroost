@@ -5,7 +5,7 @@ import { api, dropThreads, loadConversation, reportTidy } from '../api';
 import { readableBridgeText } from '../bridge';
 import { chatIndex, parentOf, threadFamily } from '../projects';
 import { unwatchConversation, watchConversation } from '../events';
-import { conversationPath, goBack, navigate } from '../router';
+import { chatsPath, conversationPath, goBack, navigate, parseChatsFilter, useUrl } from '../router';
 import { convKey, toast, useStore } from '../store';
 import { ApprovalDock } from './Approvals';
 import { Composer } from './Composer';
@@ -32,6 +32,7 @@ export function ConversationView({
   /** Open the new-conversation sheet ("/new"). */
   onNew: (request: NewConversationRequest) => void;
 }) {
+  const filter = parseChatsFilter(useUrl());
   const key = convKey(source, id);
   const conversation = useStore((s) => s.conversations[key]);
   const detail = useStore((s) => s.details[key]);
@@ -72,7 +73,9 @@ export function ConversationView({
       const gone = reportTidy('archived', threads, await api.archiveThreads(threads));
       dropThreads(gone);
       setMenu(false);
-      if (gone.some((t) => t.source === source && t.id === id)) goBack();
+      if (gone.some((t) => t.source === source && t.id === id)) {
+        navigate(chatsPath(parseChatsFilter(location.pathname + location.search)), { replace: true });
+      }
     } catch (err) {
       toast((err as Error).message);
     } finally {
@@ -87,7 +90,7 @@ export function ConversationView({
       const gone = reportTidy('deleted', threads, await api.deleteThreads(threads));
       dropThreads(gone);
       setConfirmDelete(false);
-      if (gone.length) goBack();
+      if (gone.length) navigate(chatsPath(parseChatsFilter(location.pathname + location.search)), { replace: true });
     } catch (err) {
       toast((err as Error).message);
     } finally {
@@ -206,7 +209,7 @@ export function ConversationView({
               <button
                 type="button"
                 className="link-chip"
-                onClick={() => navigate(conversationPath(parent.source, parent.id))}
+                onClick={() => navigate(conversationPath(parent.source, parent.id, filter))}
               >
                 <CornerLeftUp size={13} /> Started by {mark(parent.source)}
                 <strong>{readableBridgeText(parent.title)}</strong>
@@ -220,7 +223,7 @@ export function ConversationView({
             <button
               type="button"
               className="link-chip"
-              onClick={() => navigate(conversationPath(startedBy.source, startedBy.id))}
+              onClick={() => navigate(conversationPath(startedBy.source, startedBy.id, filter))}
             >
               <CornerLeftUp size={13} /> Started by {mark(startedBy.source)}
               <strong>{readableBridgeText(startedBy.title)}</strong>
@@ -231,7 +234,7 @@ export function ConversationView({
               key={convKey(child.source, child.id)}
               type="button"
               className="link-chip"
-              onClick={() => navigate(conversationPath(child.source, child.id))}
+              onClick={() => navigate(conversationPath(child.source, child.id, filter))}
             >
               <CornerDownRight size={13} /> {child.subagent ? 'Sub-agent: ' : child.hermesInPaseo ? 'Hermes: ' : ''}
               {mark(child.source)}
@@ -239,6 +242,13 @@ export function ConversationView({
             </button>
           ))}
         </nav>
+      )}
+
+      {detail?.needsOpen && !subagent && (
+        <div className="readonly-bar">
+          <span>This is a shadow connection. Open the live chat to load its history and updates.</span>
+          <button type="button" className="link-btn" onClick={() => void loadConversation(source, id, true)}>Open live chat</button>
+        </div>
       )}
 
       <Timeline
@@ -259,7 +269,7 @@ export function ConversationView({
           <span>
             Sub-agent of{' '}
             {parent ? (
-              <button type="button" className="link-btn" onClick={() => navigate(conversationPath(parent.source, parent.id))}>
+              <button type="button" className="link-btn" onClick={() => navigate(conversationPath(parent.source, parent.id, filter))}>
                 {readableBridgeText(parent.title)}
               </button>
             ) : (

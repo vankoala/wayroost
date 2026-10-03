@@ -51,9 +51,16 @@ export function SchedulesSheet({
   onClose,
   focus,
   startNew = false,
+  title = 'Scheduled jobs',
+  as = 'sheet',
 }: {
   onClose: () => void;
+  /** Open at one job ("source:id") and scroll it into view. */
   focus?: string;
+  /** Page title; the Schedule page calls it just "Schedule". */
+  title?: string;
+  /** Render as a page of the shell instead of a sheet over it. */
+  as?: 'sheet' | 'page';
   /** Open straight into the AI job builder. */
   startNew?: boolean;
 }) {
@@ -64,15 +71,29 @@ export function SchedulesSheet({
   const [open, setOpen] = useState<string | null>(focus ?? null);
   const focused = useRef(false);
 
+  useEffect(() => {
+    setOpen(focus ?? null);
+    focused.current = false;
+  }, [focus]);
+
   // Opened from the home page at one job: scroll it into view once the list is in.
   useEffect(() => {
     if (!focus || focused.current || !data) return;
-    focused.current = true;
-    requestAnimationFrame(() => document.getElementById(`job-${focus}`)?.scrollIntoView({ block: 'center' }));
+    const frame = requestAnimationFrame(() => {
+      const job = document.getElementById(`job-${focus}`);
+      if (!job) return;
+      job.scrollIntoView({ block: 'center' });
+      focused.current = true;
+    });
+    return () => cancelAnimationFrame(frame);
   }, [focus, data]);
   const [editing, setEditing] = useState<ScheduleJob | 'new' | null>(startNew ? 'new' : null);
   const [deleting, setDeleting] = useState<ScheduleJob | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEditing(startNew ? 'new' : null);
+  }, [startNew]);
 
   useEffect(() => {
     let live = true;
@@ -110,7 +131,7 @@ export function SchedulesSheet({
 
   const stale = data?.schedulerAgeS !== undefined && data.schedulerAgeS > 180;
   return (
-    <Sheet title="Scheduled jobs" onClose={onClose}>
+    <Sheet title={title} onClose={onClose} as={as}>
       <p className="muted connector-note">
         Jobs Hermes and Paseo run on a schedule. Results go where each job says; every run is also kept here.
       </p>
@@ -173,7 +194,7 @@ export function SchedulesSheet({
                   }
                   onDelete={() => setDeleting(job)}
                   onOpenRun={(run) => {
-                    onClose();
+                    if (as === 'sheet') onClose();
                     navigate(conversationPath(run.source, run.id));
                   }}
                 />
@@ -288,13 +309,15 @@ function JobRow({
           aria-checked={job.state !== 'paused' && job.state !== 'done'}
           aria-label={`${job.name} on`}
           onClick={onPause}
-          disabled={anyBusy || job.state === 'done' || job.state === 'running'}
+          disabled={anyBusy || (!!job.inactiveReason && job.state === 'paused') || job.state === 'done' || (job.state === 'running' && !job.inactiveReason)}
         />
       </div>
       {open && editForm && <div className="schedule-detail editing">{editForm}</div>}
       {open && !editForm && (
         <div className="schedule-detail">
-          {job.idea ? (
+          {job.inactiveReason ? (
+            <p className="schedule-idea muted">{job.inactiveReason}</p>
+          ) : job.idea ? (
             <p className="schedule-idea">{job.idea}</p>
           ) : (
             job.prompt && <p className="schedule-idea muted">Writing a one-line summary…</p>
@@ -354,7 +377,7 @@ function JobRow({
           )}
           {job.trigger && <p className="muted">A mail trigger: edit it under Connectors.</p>}
           <div className="confirm-actions schedule-actions">
-            <button type="button" className="btn btn-secondary" onClick={onRun} disabled={anyBusy || job.state === 'running'}>
+            <button type="button" className="btn btn-secondary" onClick={onRun} disabled={anyBusy || !!job.inactiveReason || job.state === 'running'}>
               <Play size={16} /> Run now
             </button>
             {!job.trigger && (

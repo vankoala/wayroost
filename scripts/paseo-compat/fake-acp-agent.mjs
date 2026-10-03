@@ -6,6 +6,8 @@
 // two "/" commands, says which files a prompt brought, "draws" a PNG into
 // its folder, and tells its ACP session id when asked. With --modes it also
 // offers modes (one without safeguards), two models and thinking levels.
+// "mcp-call {json}" makes it call one of Paseo's own agent tools through the
+// MCP server Paseo gave its session, and reply with what happened.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -15,6 +17,7 @@ let nextId = 1;
 const pending = new Map();
 const cancelled = new Set();
 const folders = new Map();
+const paseoServers = new Map(); // sessionId → the "paseo" MCP server from session/new
 const DOT_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 
 const COMMANDS = [
@@ -96,6 +99,35 @@ function describeFiles(prompt) {
   return seen.join(', ');
 }
 
+/**
+ * One of Paseo's agent tools, called like a real agent would: through the "paseo" MCP
+ * server (streamable HTTP, URL and headers as Paseo gave them). `dropCaller` removes
+ * ?callerAgentId from that URL. Answers which tools the server listed, and the outcome.
+ */
+async function callPaseoTool(sessionId, { tag, tool, args = {}, dropCaller = false }) {
+  const server = paseoServers.get(sessionId);
+  if (!server) return { tag, error: 'no paseo MCP server in this session' };
+  const url = new URL(server.url);
+  if (dropCaller) url.searchParams.delete('callerAgentId');
+  const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
+  for (const { name, value } of server.headers ?? []) headers[name] = value;
+  const rpc = async (method, params) => {
+    const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+    const body = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${body}`);
+    // The reply comes as one server-sent event, or as plain JSON.
+    const json = /^data: (.*)$/m.exec(body)?.[1] ?? body;
+    const message = JSON.parse(json);
+    if (message.error) throw new Error(message.error.message);
+    return message.result;
+  };
+  const tools = (await rpc('tools/list', {})).tools.map((t) => t.name);
+  if (!tool) return { tag, tools };
+  const result = await rpc('tools/call', { name: tool, arguments: args });
+  const said = (result.content ?? []).map((c) => c.text ?? '').join(' ');
+  return { tag, listed: tools.includes(tool), ...(result.isError ? { refused: said } : { ok: true }) };
+}
+
 function request(method, params) {
   const id = nextId++;
   return new Promise((resolve, reject) => {
@@ -111,21 +143,24 @@ const handlers = {
       agentCapabilities: {
         loadSession: true,
         promptCapabilities: { image: true, audio: false, embeddedContext: false },
+        mcpCapabilities: { http: true, sse: false },
       },
       authMethods: [],
     };
   },
 
-  async 'session/new'({ cwd }) {
+  async 'session/new'({ cwd, mcpServers }) {
     const sessionId = `fake-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     folders.set(sessionId, cwd);
+    paseoServers.set(sessionId, (mcpServers ?? []).find((server) => server.name === 'paseo'));
     announceCommands(sessionId);
     return { sessionId, ...tunables(sessionId) };
   },
 
   // Resuming after a daemon restart. Nothing to replay: Paseo keeps its own timeline.
-  async 'session/load'({ sessionId, cwd }) {
+  async 'session/load'({ sessionId, cwd, mcpServers }) {
     folders.set(sessionId, cwd);
+    paseoServers.set(sessionId, (mcpServers ?? []).find((server) => server.name === 'paseo'));
     announceCommands(sessionId);
     return tunables(sessionId);
   },
@@ -149,6 +184,14 @@ const handlers = {
   async 'session/prompt'({ sessionId, prompt }) {
     const text = (prompt ?? []).map((block) => block.text ?? '').join(' ');
     cancelled.delete(sessionId);
+
+    const call = /\bmcp-call (\{[\s\S]*\})/.exec(text);
+    if (call) {
+      const asked = JSON.parse(call[1]);
+      const result = await callPaseoTool(sessionId, asked).catch((err) => ({ tag: asked.tag, error: String(err) }));
+      update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `MCP ${JSON.stringify(result)}` } });
+      return { stopReason: 'end_turn' };
+    }
 
     const files = describeFiles(prompt);
     if (files) {

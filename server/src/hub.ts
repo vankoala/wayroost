@@ -13,6 +13,8 @@ export interface HubClient {
   readonly socket: WebSocket;
   readonly email: string;
   readonly subscriptions: Set<string>;
+  /** Checked for each direct or published event, so access can change while connected. */
+  readonly accepts: (event: ServerEvent) => boolean;
 }
 
 export type WatchListener = (source: Source, conversationId: string, watching: boolean) => void;
@@ -51,8 +53,8 @@ export class EventHub {
     this.transform = transform;
   }
 
-  add(socket: WebSocket, email: string): HubClient {
-    const client: HubClient = { socket, email, subscriptions: new Set() };
+  add(socket: WebSocket, email: string, accepts: (event: ServerEvent) => boolean = () => true): HubClient {
+    const client: HubClient = { socket, email, subscriptions: new Set(), accepts };
     this.clients.add(client);
     return client;
   }
@@ -65,6 +67,8 @@ export class EventHub {
 
   subscribe(client: HubClient, source: Source, conversationId: string): void {
     const key = keyOf(source, conversationId);
+    // A client already removed would hold the watch open for good: remove() is done with it.
+    if (!this.clients.has(client)) return;
     if (client.subscriptions.has(key) || client.subscriptions.size >= MAX_SUBSCRIPTIONS_PER_CLIENT) return;
     client.subscriptions.add(key);
     const count = (this.watchCounts.get(key) ?? 0) + 1;
@@ -92,6 +96,7 @@ export class EventHub {
     const key = conversationKey(event);
     let payload: string | undefined;
     for (const client of this.clients) {
+      if (!client.accepts(event)) continue;
       if (key !== null && !client.subscriptions.has(key)) continue;
       payload ??= JSON.stringify(this.transform(event));
       this.sendRaw(client, payload);
@@ -99,6 +104,7 @@ export class EventHub {
   }
 
   sendTo(client: HubClient, event: ServerEvent): void {
+    if (!client.accepts(event)) return;
     this.sendRaw(client, JSON.stringify(event));
   }
 

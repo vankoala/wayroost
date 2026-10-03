@@ -1,49 +1,51 @@
-# How Signalbox talks to Paseo
+# How Wayroost talks to Paseo
 
-Signalbox connects to the Paseo daemon on your machine
-(`ws://127.0.0.1:6777/ws` by default) with Paseo's own client library,
-`@getpaseo/client`, pinned to **0.5.1**. Code: `server/src/paseo/`.
+Wayroost connects to the Paseo daemon on your machine
+(`ws://127.0.0.1:19007/ws` by default) with Paseo's own client library,
+`@getpaseo/client`, pinned to **0.9.2**. Code: `server/src/paseo/`.
 
 ## Compatibility
 
-Paseo promises that daemons keep accepting older clients: "an old app still
-parses messages from a new daemon, and a new daemon still parses messages from
-an old app" (Paseo's `docs/protocol-compatibility.md`). An older client gets the
-older, broadcast style of event delivery, which is exactly what Signalbox needs.
-So one pinned client works across daemon versions.
+Since 0.9.2, the daemon sends a client only what it has subscribed to: the
+agent list, each agent's timeline, and permission and sub-agent events. The
+client library owns those subscriptions and releases them when Wayroost stops.
+Wayroost holds one subscription for the agent list, one for permission and
+sub-agent events, and one for each timeline it keeps open, and takes fresh ones
+on every connection.
 
 This is verified end to end, not assumed: `scripts/paseo-compat/run.ts` starts a
-real Paseo daemon of any version and drives Signalbox through launching an agent
-(with consent), a permission request, streaming, a follow-up, stopping, the
-agent's "/" commands, files, a message sent while the agent works, the model,
-reasoning and mode pickers, reading images the agent shows, a Hermes-in-Paseo
-agent's parent label and ACP session id, and a daemon restart after which
-stored agents must not be woken and that label and id must still be there. CI
-runs it against 0.5.1 and against the latest release (0.9.2 at the time of
-writing). A failure against the latest release is reported but doesn't fail
-the build.
+real Paseo daemon of any version and drives Wayroost through launching an agent
+(with consent), a permission request, an approval answered outside Wayroost,
+streaming, a follow-up, stopping, the agent's "/" commands, files, a message
+sent while the agent works, the model, reasoning and mode pickers, reading
+images the agent shows, a Hermes-in-Paseo agent's parent label and ACP session
+id, and a daemon restart after which stored agents must not be woken and that
+label and id must still be there. CI runs it against 0.9.2 and against the
+latest release. A failure against the latest release is reported but doesn't
+fail the build.
 
 ## Connecting
 
 - The client identifies itself with a **stable client id**, kept in
   `/var/lib/signalbox/paseo-client-id`. Paseo groups sockets into sessions by
   client id.
-- It sends **`appVersion: "0.5.1"`**. Without an app version of at least
-  0.1.45, the daemon hides custom providers such as Hermes and Pi.
-- On **every (re)connect**, Signalbox re-lists agents and subscribes to agent
+- It sends its client library's version as its **`appVersion`** (`0.9.2`).
+  Without an app version of at least 0.1.45, the daemon hides custom providers
+  such as Hermes and Pi.
+- On **every (re)connect**, Wayroost re-lists agents and subscribes to agent
   updates, rebuilds the list of pending permissions from the agents' snapshots,
   asks running agents for their [sub-agents](#sub-agents), and catches up
   every open timeline. The daemon forgets subscriptions when a socket drops.
 - It never sends Paseo's "I'm looking at this" heartbeat, so it doesn't suppress
   the push notifications of Paseo's own phone app.
-- **A daemon password** (`paseo daemon set-password`) reaches Signalbox as the
+- **A daemon password** (`paseo daemon set-password`) reaches Wayroost as the
   systemd credential `paseo-password`: `LoadCredential=paseo-password:/etc/signalbox/paseo-password`
   in a `signalbox.service.d` drop-in, with the file root-only.
   - The client sends the password as a bearer header and as the WebSocket
     subprotocol `paseo.bearer.<password>`, so it must use HTTP token characters
-    only: no spaces, commas, quotes or slashes. Signalbox refuses one that
+    only: no spaces, commas, quotes or slashes. Wayroost refuses one that
     doesn't and logs why.
-  - If the daemon refuses Signalbox ("Password required" / "Incorrect
+  - If the daemon refuses Wayroost ("Password required" / "Incorrect
     password"), the log says so once, and Settings shows Paseo disconnected
     with that reason.
   - No credential means no password, which an open daemon accepts.
@@ -52,13 +54,13 @@ the build.
 
 Each agent becomes a conversation:
 
-| Signalbox | From Paseo |
+| Wayroost | From Paseo |
 | --- | --- |
 | title | the agent's title |
 | status | `running`/`initializing` → working; `error` → error; pending permissions → needs you |
 | agent | the provider label (Claude Code, Codex, OpenCode, Pi, Hermes…) |
 | project | the git root (worktrees group with the main repo) or the working directory |
-| nested under | the agent in Paseo's `paseo.parent-agent-id` label, else the Hermes chat in Signalbox's `signalbox.parent-hermes-chat` label, else (while Signalbox remembers it) the chat that started it through the [bridge](bridge.md#starting-chats) |
+| nested under | the agent in Paseo's `paseo.parent-agent-id` label, else the Hermes chat in Wayroost's `signalbox.parent-hermes-chat` label, else (while Wayroost remembers it) the chat that started it through the [bridge](bridge.md#starting-chats) |
 | Hermes · in Paseo | agents whose provider is `hermes`. Such an agent is also known by its ACP session id, the id Hermes gives it, so the `delegate_task` runs it starts nest under it. Nothing else of how Paseo resumes it leaves the server. |
 
 Only active agents are listed: archived ones are left out, like in the Paseo
@@ -68,7 +70,7 @@ app.
 
 Claude Code's Task tool (and its counterparts in Codex, OpenCode and OMP) runs
 sub-agents inside an agent. Paseo tells every client as they start, change and
-end, and Signalbox lists each as a read-only row under the agent that runs it,
+end, and Wayroost lists each as a read-only row under the agent that runs it,
 in that agent's project:
 
 - It's titled with its name, else its task, else "Sub-agent", and marked
@@ -77,10 +79,10 @@ in that agent's project:
 - Opening it says which agent it's a sub-agent of, and that its work shows in
   that agent's tool cards. Nothing is fetched from Paseo.
 - It can't be messaged, stopped or changed, and it has no commands or
-  approvals of its own. Signalbox refuses such requests.
-- Signalbox keeps the newest 20 per agent and 200 in all, in memory, while
+  approvals of its own. Wayroost refuses such requests.
+- Wayroost keeps the newest 20 per agent and 200 in all, in memory, while
   Paseo has the agent running. It forgets them when the agent closes or goes.
-- When it connects, and when an agent starts running, Signalbox asks Paseo for
+- When it connects, and when an agent starts running, Wayroost asks Paseo for
   that agent's sub-agents. It asks only about agents of providers that have
   them, never about Hermes, and never about an agent Paseo only has stored:
   asking would make Paseo resume it.
@@ -90,7 +92,7 @@ in that agent's project:
 
 Opening a conversation loads the last 120 timeline entries. Opening a **stored**
 agent makes Paseo resume it, which can take a few seconds the first time.
-Signalbox only does this when you open a conversation, never in the background.
+Wayroost only does this when you open a conversation, never in the background.
 
 Live updates are reconciled the way the Paseo app does it
 (`server/src/paseo/mirror.ts`):
@@ -98,16 +100,21 @@ Live updates are reconciled the way the Paseo app does it
 - Every live event carries an **epoch** and a **sequence number**. Events
   already covered by the loaded history are ignored. The next expected number
   is applied.
-- A **gap** triggers a catch-up that fetches the exact raw events after the last
-  one seen.
-- A **new epoch** means the agent was reloaded: the timeline is fetched again
-  and replaced.
-- Streamed text chunks are merged into one reply, and a tool call's updates
-  are merged into one card.
+- A **gap**, or a timeline subscription restored after a reconnect, triggers a
+  catch-up. Paseo answers with snapshots of the rows after the last one seen,
+  and each snapshot replaces the row it overlaps, so text is never repeated.
+- A **new epoch** or a replacement notice means the agent was reloaded: the
+  timeline is fetched again and replaced. A fetch that was already under way
+  is thrown away.
+- Contiguous streamed text chunks are merged into one reply, and a tool call's
+  updates are merged into one card.
+- If Paseo ends a timeline subscription with an error, Wayroost drops that
+  timeline; opening the conversation again subscribes afresh. A timeline being
+  opened is never evicted from the cache mid-load.
 
 Item mapping:
 
-| Paseo item | Signalbox |
+| Paseo item | Wayroost |
 | --- | --- |
 | `user_message`, `assistant_message`, `reasoning` | your message (with the files you sent, see below), reply (markdown), thinking |
 | `tool_call` (shell, read, edit, write, search, fetch, sub-agent, plan…) | a tool card with a one-line summary, the input and output, and its status |
@@ -118,8 +125,9 @@ Item mapping:
 
 ## Permissions and questions
 
-Paseo sends `agent_permission_request` and `agent_permission_resolved` to every
-client. Signalbox turns each request into an approval card:
+Wayroost subscribes to Paseo's `agent_permission_request` and
+`agent_permission_resolved` events, so an approval answered in the Paseo app
+clears here too. It turns each request into an approval card:
 
 - **Tool permissions** carry the agent's own actions, for example Allow once /
   Allow for session / Always allow / Deny for ACP agents such as Hermes. The
@@ -138,9 +146,9 @@ Your answer is checked against the offered actions before it's sent with
 
 The **New → Paseo** sheet lists every provider Paseo reports as ready, your
 recent project folders, and each provider's permission modes. The first
-message can carry files, as described below. Signalbox classifies every mode:
+message can carry files, as described below. Wayroost classifies every mode:
 
-| Tier | Meaning | Examples | In Signalbox |
+| Tier | Meaning | Examples | In Wayroost |
 | --- | --- | --- | --- |
 | asks you | the agent waits for your approval before risky actions | Claude *Always Ask*, *Plan*; Codex *Default permissions*; Copilot *Agent*, *Plan*; OpenCode *Plan*; Hermes *default* | offered normally, the default |
 | acts on its own | some or all actions run without asking | Claude *Accept File Edits*, *Auto*; Codex *Auto-review*; OpenCode *Build*; Hermes *accept_edits*; providers with no modes, like Pi | offered with ⚡; launching needs an explicit "I understand", checked by the server |
@@ -150,7 +158,7 @@ Unknown providers are classified by name: conservative ids like `default`,
 `ask`, `plan` count as asking, names matching the blocked patterns are blocked,
 and everything else needs consent.
 
-Signalbox always sends an explicit mode and never relies on the daemon's
+Wayroost always sends an explicit mode and never relies on the daemon's
 default. For Hermes agents it also turns Paseo's `auto_accept` feature off. If
 your chosen folder matches an existing Paseo workspace, the agent joins it
 instead of creating a new one.
@@ -161,7 +169,7 @@ instead of creating a new one.
 runs on a cloud model: Claude Code, Codex and OpenCode, when Paseo knows them.
 The switch is Paseo's own (`agents.providers.<id>.enabled` in
 `~/.paseo/config.json`, set through the daemon's config API), so it holds
-everywhere, not only in Signalbox:
+everywhere, not only in Wayroost:
 
 - A switched-off agent can't be started by anyone: not from the **New → Paseo**
   sheet, not by another agent through the bridge or Paseo's own agent tools,
@@ -182,17 +190,17 @@ against accidents, not against a determined agent.
 ## Archiving and deleting
 
 A thread's ⋯ menu archives or deletes it, and so do **Archive folder** in the
-Projects view and **Settings → Tidy up**. Signalbox uses Paseo's own archive,
+Projects view and **Settings → Tidy up**. Wayroost uses Paseo's own archive,
 so the Paseo app hides an archived agent too.
 
 - **Archive** calls Paseo's `archiveAgent`. Paseo archives an agent's delegated
-  children with it; Signalbox archives the deepest first, so none is left
+  children with it; Wayroost archives the deepest first, so none is left
   behind. The chats a thread started through the bridge go too.
 - **Restore** has Paseo reload the agent (`refreshAgent`), which un-archives
   it. Paseo also un-archives an agent that gets a new message.
 - **Delete** calls `deleteAgent`. It can't be undone.
 - **Archive idle threads** takes every agent Paseo lists whose last activity
-  (its last message from you, or when Signalbox saw it run) is older than the
+  (its last message from you, or when Wayroost saw it run) is older than the
   days you pick, except sub-agents and agents that are working or waiting on
   you.
 
@@ -219,11 +227,11 @@ sees it (see [SECURITY.md](../SECURITY.md)). Then:
 | text file up to 100 KB | inline, as a `text/plain` attachment titled with the file name. Its text starts with "Attached file: <name>", because agents see only the text. |
 | PDF, document (xlsx, docx, zip…), or a larger text file | uploaded with Paseo's `uploadFile`, and attached as the `uploaded_file` it returns, so the agent gets its path. Paseo saves these under `~/.paseo/uploads` and never deletes them. |
 
-- Signalbox doesn't check first whether the agent can see images. Paseo gives a
+- Wayroost doesn't check first whether the agent can see images. Paseo gives a
   provider without vision the image's path instead.
 - An upload Paseo refuses shows as "Paseo couldn't take <name>: …", and nothing
   is sent.
-- Paseo's timeline keeps only the text of your message. Signalbox remembers
+- Paseo's timeline keeps only the text of your message. Wayroost remembers
   which files each message carried, by message id, for the last 500 messages
   in memory, and shows them as chips on the message.
 
@@ -232,7 +240,7 @@ sees it (see [SECURITY.md](../SECURITY.md)). Then:
 Typing `/` offers the agent's own commands and skills, from Paseo's
 `listCommands`:
 
-- Signalbox asks only agents Paseo reports as running. Asking a stored agent
+- Wayroost asks only agents Paseo reports as running. Asking a stored agent
   would make Paseo resume it, so a stored agent's commands appear once you open
   the conversation.
 - A list is kept for five minutes. An empty one isn't kept, because an agent
@@ -258,15 +266,15 @@ snapshot, as Paseo's own composer reads them:
   chip says "Hermes can switch models between turns."
 - Reading the chips never wakes a stored agent. Changing one does, because
   Paseo loads the agent to apply the change.
-- Only offered options are accepted. After a change, Signalbox reads the agent
+- Only offered options are accepted. After a change, Wayroost reads the agent
   again, so the chips show what Paseo applied.
-- Signalbox never touches the agent's `features`, so Hermes' `auto_accept`
+- Wayroost never touches the agent's `features`, so Hermes' `auto_accept`
   stays off.
 
 ## Images the agent shows
 
 When an agent's reply or tool call points at an image on your machine,
-Signalbox reads it through Paseo's `readFile`, the way the Paseo app does
+Wayroost reads it through Paseo's `readFile`, the way the Paseo app does
 (see [how-it-works.md](how-it-works.md#images-from-your-machine)):
 
 - The folder the path is read against is chosen as the Paseo app chooses it:
@@ -300,7 +308,7 @@ Settings → Scheduled jobs lists them next to Hermes' jobs, with a Paseo badge:
   opens the agent that ran it.
 
 Paseo's update takes only a cron line, so "every 15m" or "every 2h" typed in Edit becomes the
-matching cron line. Other wording is refused with a hint. New jobs from Signalbox are Hermes
+matching cron line. Other wording is refused with a hint. New jobs from Wayroost are Hermes
 jobs: a Paseo schedule needs a provider and a folder, so set those up in Paseo.
 
 Per-agent heartbeats (`create_heartbeat`) aren't in Paseo's schedule list, and don't show here.

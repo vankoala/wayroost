@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -73,7 +74,7 @@ class HookTests(unittest.TestCase):
                 self.assertIsNone(self.call(tool_name=tool))
 
     def test_does_nothing_when_paseo_runs_this_hermes(self):
-        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "644f0c2e"}):
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "demo-paseo-agent"}):
             self.assertIsNone(self.call())
         with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "  "}):  # blank counts as unset
             self.assertIsNotNone(self.call())
@@ -167,7 +168,7 @@ class HermesRuntimeTests(_ThrowawayHermesHome, unittest.TestCase):
     def test_other_calls_are_untouched(self):
         self.assertEqual(self.dispatch("terminal", {"command": "ls"}), (None, None))
         self.assertEqual(self.dispatch("mcp__signalbox__list_chats", {}, session_id=""), (None, None))
-        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "644f0c2e"}):
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "demo-paseo-agent"}):
             self.assertEqual(self.dispatch("mcp__signalbox__list_chats", {}), (None, None))
 
     def test_the_agent_loop_passes_agent_session_id_and_applies_the_change(self):
@@ -195,10 +196,6 @@ class HermesRuntimeNotEnabledTests(_ThrowawayHermesHome, unittest.TestCase):
         self.assertEqual(self.dispatch("mcp__signalbox__send_message", {"chat": "hermes:x", "text": "hi"}), (None, None))
 
 
-if __name__ == "__main__":
-    sys.exit(unittest.main())
-
-
 class LaunchReportTests(unittest.TestCase):
     """on_session_start: which agent's shell started this Hermes process."""
 
@@ -206,6 +203,9 @@ class LaunchReportTests(unittest.TestCase):
     RUN = "0c1a0de0-0000-4000-8000-000000000003"
 
     def setUp(self):
+        patcher = mock.patch.dict(os.environ, {"WAYROOST_ROLE": "primary"}, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         plugin._reported = False
 
     def _environ_file(self, pairs):
@@ -256,3 +256,29 @@ class LaunchReportTests(unittest.TestCase):
             self.assertIsNone(plugin.on_session_start(session_id=GATEWAY_ID))
         with mock.patch.object(plugin, "_bridge_token", return_value=None):
             self.assertIsNone(plugin._post("note_launch", {}))
+
+
+class IsolatedInstallTests(unittest.TestCase):
+    def test_folder_only_copy_keeps_identity_without_runtime_and_never_reports(self):
+        with tempfile.TemporaryDirectory(prefix="wayroost-plugin-test-") as folder:
+            target = Path(folder) / "signalbox-identity"
+            shutil.copytree(PLUGIN_DIR, target, ignore=shutil.ignore_patterns("__pycache__"))
+            code = """
+import importlib.util, sys
+from unittest.mock import patch
+spec = importlib.util.spec_from_file_location('isolated_plugin', sys.argv[1])
+plugin = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(plugin)
+assert plugin.on_pre_tool_call(tool_name='mcp__signalbox__list_chats', session_id='00000000_000000_fake')
+with patch.object(plugin, '_post') as post:
+    plugin.on_session_start('00000000_000000_fake')
+    post.assert_not_called()
+"""
+            result = subprocess.run([sys.executable, "-I", "-c", code, str(target / "__init__.py")],
+                                    env={"PATH": os.defpath, "WAYROOST_ROLE": "primary"},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(unittest.main())

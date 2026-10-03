@@ -3,6 +3,8 @@
 // counts what arrived so a check can tell the audio really made it through.
 
 import type { SpeechService } from '../server/src/speech.js';
+import type { CloudSpeechService } from '../server/src/cloud-speech.js';
+import { CloudSpeechError } from '../server/src/cloud-speech.js';
 
 export const DEMO_TRANSCRIPT = "Can you check whether last night's backup finished?";
 
@@ -45,5 +47,24 @@ export class DemoSpeech implements SpeechService {
   async speak(text: string) {
     this.spoken.push(text);
     return silence(Math.min(4, 0.5 + text.length / 25));
+  }
+}
+
+export class DemoCloudSpeech implements CloudSpeechService {
+  available = false;
+  spoken: string[] = [];
+  async catalog() {
+    if (!this.available) throw new CloudSpeechError('unreachable');
+    return { voices: [
+      { id: 'fake-demo-clone', name: 'Demo clone', category: 'cloned', preview: true },
+      { id: 'fake-demo-premade', name: 'Demo premade', category: 'premade', preview: true },
+    ], models: [{ id: 'fake-demo-model', name: 'Demo model' }] };
+  }
+  async *synthesize(text: string) {
+    if (!this.available) throw new CloudSpeechError('unreachable');
+    this.spoken.push(text);
+    yield silence(0.25).subarray(44);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    yield silence(0.25).subarray(44);
   }
 }

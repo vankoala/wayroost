@@ -29,7 +29,7 @@ require_root_owned_tree() {
     # Fail closed: a folder stat can't read counts as not root's.
     if [[ ! "$mode" =~ ^[0-7]+$ || "$owner" != 0 || $(( 8#$mode & 8#022 )) -ne 0 ]]; then
       echo "Refusing to use $tree: $dir must be owned by root and not writable by others." >&2
-      echo "Clone Signalbox somewhere root-owned, e.g. /opt/src/signalbox." >&2
+      echo "Clone Wayroost somewhere root-owned, e.g. /opt/src/signalbox." >&2
       exit 1
     fi
     [[ "$dir" == / ]] && break

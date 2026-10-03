@@ -116,7 +116,7 @@ function BridgedMessage({ sender, text }: { sender: string; text: string }) {
       <div className="bridged-head">
         <Bot size={15} aria-hidden="true" />
         <span>
-          From <strong>{sender}</strong> · via Signalbox
+          From <strong>{sender}</strong> · via Wayroost
         </span>
       </div>
       <Markdown text={text} className="bridged-body" />

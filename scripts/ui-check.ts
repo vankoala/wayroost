@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../server/src/background.js';
 // Visual + behavioural check: runs the real server (full security stack) with
 // demo sources, drives headless Chrome at phone and desktop sizes, saves
 // screenshots, and fails on any page error or CSP violation.
@@ -5,24 +6,32 @@
 import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { chromium, type Page } from 'playwright-core';
+import { chromium, type Locator, type Page, type Response as PageResponse } from 'playwright-core';
+import type { ScheduleRun } from '../shared/protocol.js';
 import { buildApp } from '../server/src/app.js';
+import { WorkerUpdatesSetting } from '../server/src/tasks/setting.js';
+import { demoTasks } from './demo-tasks.js';
 import { parseConfig } from '../server/src/config.js';
 import { EventHub } from '../server/src/hub.js';
 import { createAccessVerifier } from '../server/src/security/access.js';
+import { DEVICE_COOKIE, Devices } from '../server/src/devices.js';
+import { PAIR_PATH } from '../shared/protocol.js';
 import { demoAssist, demoConnectors, demoDashboard, demoHelper, demoPaseoSchedules } from './demo-connectors.js';
 import { Schedules } from '../server/src/schedules.js';
 import { SafetyCommandsSetting } from '../server/src/hermes/safety.js';
 import { demoSkills } from './demo-skills.js';
-import { DEMO_TRANSCRIPT, DemoSpeech } from './demo-speech.js';
+import { DEMO_TRANSCRIPT, DemoCloudSpeech, DemoSpeech } from './demo-speech.js';
 import { demoFeed } from './demo-feed.js';
 import { DemoHermes, DemoPaseo, startDemoBridge } from './demo-sources.js';
+import { assertReadable, contrastRatio } from './lib/contrast.js';
+import { DemoSupervisor } from './demo-power.js';
+import { DemoWorkerApprovals } from './demo-safety.js';
 import { createLocalAccess, startEdge } from './lib/local-access.js';
 
 const OUT = resolve(process.argv[2] ?? 'ui-shots');
 // The browser talks to a stand-in for Cloudflare's edge on PORT, which stamps
 // the Access JWT on every request and WebSocket handshake, like the real one.
-const PORT = Number(process.env.PORT ?? 8795);
+const PORT = Number(process.env.PORT ?? 8890);
 const APP_PORT = PORT + 1;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 
@@ -38,22 +47,36 @@ const config = parseConfig(
   },
   { allowLocalDev: true },
 );
+// Two paired devices from a few weeks back (written with a stand-in clock), then
+// the server's own store. Every page signs in as the desktop unless a shot says otherwise.
+const DAY = 86_400_000;
+const seeded = new Devices(config.stateDir, { now: () => Date.now() - 24 * DAY });
+const demoDesktop = seeded.add('Desktop app', 'desktop');
+const demoPhone = new Devices(config.stateDir, { now: () => Date.now() - 9 * DAY }).add('Phone', 'phone');
+const devices = new Devices(config.stateDir);
 const hub = new EventHub();
 const sources = { hermes: new DemoHermes(hub), paseo: new DemoPaseo(hub) };
 const bridge = await startDemoBridge(sources, hub);
 const speech = new DemoSpeech();
+const cloudSpeech = new DemoCloudSpeech();
 const feed = demoFeed(hub, sources.hermes, mkdtempSync(join(tmpdir(), 'sb-ui-feed-')));
 feed.start();
+// A pretend supervisor behind the real power routes: the status block and Status &
+// power run off it in every shot below, with the server's own confirm taps.
+const power = new DemoSupervisor();
 const app = await buildApp({
   config,
-  verifier: createAccessVerifier({ ...config.access, keySource: access.keySource }),
+  verifier: createAccessVerifier({ ...config.access!, keySource: access.keySource }),
+  devices,
+  supervisor: power,
   hub,
   sources,
   feed,
   bridge,
   connectors: demoConnectors(ORIGIN),
-  schedules: new Schedules({
+  schedules: new Schedules({ background: new BackgroundGate('primary'),
     dashboard: () => demoDashboard,
+    triggerRoles: () => demoHelper.triggerRoles(),
     paseo: demoPaseoSchedules,
     assist: demoAssist,
     onChanged: () => hub.publish({ type: 'schedules_changed' }),
@@ -64,9 +87,15 @@ const app = await buildApp({
   skills: demoSkills,
   // Settings → Security reads this on every Settings screen; off, as on a fresh install.
   safetyCommands: new SafetyCommandsSetting(config.stateDir),
+  workerApprovals: new DemoWorkerApprovals(),
+  // Settings → Project bridge → Worker updates; the check drives this row (see shot 30b).
+  workerUpdates: new WorkerUpdatesSetting(config.stateDir),
+  tasks: demoTasks,
   speech,
+  cloudSpeech,
   logger: false,
 });
+app.addHook('onClose', async () => power.stop());
 await app.listen({ host: '127.0.0.1', port: APP_PORT });
 const edge = await startEdge({ port: PORT, appPort: APP_PORT, token: access.token });
 
@@ -78,11 +107,38 @@ const browser = await chromium.launch({
 const problems: string[] = [];
 
 /** Everything a page received, for checking that a secret never came back. */
+/** A response body as the leak checks saw it; null when it couldn't be read in time. */
+interface ResponseBody {
+  url: string;
+  body: string | null;
+}
+/** How long one body may take: a body Playwright never delivers must not hang the whole check. */
+const BODY_READ_MS = 5_000;
+/** Whether an unread body could have carried a secret: an API answer or a WebSocket upgrade. */
+const apiOrSocket = (url: string): boolean => {
+  const { protocol, pathname } = new URL(url);
+  return protocol === 'ws:' || protocol === 'wss:' || pathname.startsWith('/api/') || pathname === '/ws';
+};
+function readBody(res: PageResponse): Promise<ResponseBody> {
+  const url = res.url();
+  const status = res.status();
+  // Nothing to read: a protocol switch, an empty answer or a redirect.
+  if (status === 101 || status === 204 || status === 304 || (status >= 300 && status < 400)) return Promise.resolve({ url, body: '' });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    res.text().then((body) => ({ url, body }), () => ({ url, body: null })),
+    new Promise<ResponseBody>((resolve) => { timer = setTimeout(() => resolve({ url, body: null }), BODY_READ_MS); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 interface Seen {
-  responses: Array<Promise<string>>;
+  /** Every response body, read as it arrived (each settles within BODY_READ_MS). */
+  responses: Array<Promise<ResponseBody>>;
   frames: string[];
   console: string[];
   posts: string[];
+  /** Every URL the page requested. */
+  urls: string[];
 }
 
 async function shoot(
@@ -91,6 +147,7 @@ async function shoot(
     width: number;
     height: number;
     dark: boolean;
+    theme?: 'light' | 'dark' | 'system';
     path: string;
     ready: string;
     act?: (page: Page, seen: Seen) => Promise<void>;
@@ -98,8 +155,12 @@ async function shoot(
     after?: (page: Page, seen: Seen) => Promise<void>;
     /** Console errors this shot causes on purpose (e.g. a failed request it forces). */
     expectErrors?: RegExp;
+    /** Which paired device the page signs in as; null for a browser that isn't paired. Default the desktop. */
+    device?: string | null;
   },
 ) {
+  // SHOTS=77,79 runs only the shots whose name starts with those, for debugging one.
+  if (ONLY?.some((want) => name.startsWith(want)) === false) return;
   const phone = opts.width < 600;
   const context = await browser.newContext({
     viewport: { width: opts.width, height: opts.height },
@@ -109,15 +170,22 @@ async function shoot(
     hasTouch: phone,
     permissions: ['microphone', 'notifications'],
   });
+  const device = opts.device === undefined ? demoDesktop.cookie : opts.device;
+  if (device) await context.addCookies([{ name: DEVICE_COOKIE, value: device, url: ORIGIN, httpOnly: true, sameSite: 'Strict' }]);
+  // The saved theme is in place before the first page load.
+  if (opts.theme) {
+    await context.addInitScript((theme) => localStorage.setItem('wayroost.theme', theme), opts.theme);
+  }
   const page = await context.newPage();
-  const seen: Seen = { responses: [], frames: [], console: [], posts: [] };
+  const seen: Seen = { responses: [], frames: [], console: [], posts: [], urls: [] };
   page.on('console', (m) => {
     seen.console.push(m.text());
     if (m.type() === 'error' && !opts.expectErrors?.test(m.text())) problems.push(`${name}: console: ${m.text()}`);
   });
   page.on('pageerror', (e) => problems.push(`${name}: pageerror: ${e.message}`));
-  page.on('response', (res) => seen.responses.push(res.text().catch(() => '')));
+  page.on('response', (res) => seen.responses.push(readBody(res)));
   page.on('request', (req) => {
+    seen.urls.push(req.url());
     if (req.method() === 'POST') seen.posts.push(req.postData() ?? '');
   });
   page.on('websocket', (ws) => ws.on('framereceived', (f) => seen.frames.push(String(f.payload))));
@@ -131,10 +199,405 @@ async function shoot(
   await context.close();
 }
 
+async function themeProperties(page: Page): Promise<Record<string, string>> {
+  return page.evaluate(() => {
+    const { document, getComputedStyle } = globalThis as unknown as {
+      document: { documentElement: unknown };
+      getComputedStyle(el: unknown): { length: number; item(i: number): string; getPropertyValue(name: string): string };
+    };
+    const style = getComputedStyle(document.documentElement);
+    const names = Array.from({ length: style.length }, (_, i) => style.item(i)).filter((name) => name.startsWith('--'));
+    return Object.fromEntries(['color-scheme', ...names].map((name) => [name, style.getPropertyValue(name).trim()]));
+  });
+}
+
+/** Hovered and selected rows must stand apart from the list behind them and from each other. */
+const MIN_STATE_RATIO = 1.05;
+
+/**
+ * The colour of every piece of text in a row that sits straight on the row's own background
+ * (title, preview, "started by", time), with the row's background. Pills and tags carry their
+ * own background, so they are left out.
+ */
+async function rowTextColours(
+  row: Locator,
+  hovered: boolean,
+): Promise<{ background: string; list: string; texts: { label: string; colour: string }[] }> {
+  return row.evaluate((el, hovered) => {
+    type Node = {
+      parentElement: Node | null;
+      className: string;
+      tagName: string;
+      childNodes: ArrayLike<{ nodeType: number; textContent: string | null }>;
+      matches(selector: string): boolean;
+      querySelectorAll(selector: string): ArrayLike<Node>;
+    };
+    const { getComputedStyle } = globalThis as unknown as {
+      getComputedStyle(node: unknown): { color: string; backgroundColor: string };
+    };
+    const node = el as unknown as Node;
+    if (node.matches(':hover') !== hovered) {
+      throw new Error(hovered ? 'The contrast check must hover a real row' : 'Check the selected row without hovering it');
+    }
+    // No helper functions in here: the bundler would wrap them in a __name() the page doesn't have.
+    const transparent = 'rgba(0, 0, 0, 0)';
+    // The list's own background: the first opaque one above the row.
+    let list = node.parentElement;
+    while (list && getComputedStyle(list).backgroundColor === transparent) list = list.parentElement;
+    if (!list) throw new Error('The row has no opaque background behind it');
+    const texts: { label: string; colour: string }[] = [];
+    for (const child of Array.from(node.querySelectorAll('*'))) {
+      const ownText = Array.from(child.childNodes).some((t) => t.nodeType === 3 && (t.textContent ?? '').trim() !== '');
+      if (!ownText) continue;
+      let onRow = true;
+      for (let up: Node | null = child; up && up !== node; up = up.parentElement) {
+        if (getComputedStyle(up).backgroundColor !== transparent) onRow = false;
+      }
+      if (!onRow) continue;
+      const label = child.className || `${child.parentElement?.className ?? ''} ${child.tagName.toLowerCase()}`;
+      texts.push({ label, colour: getComputedStyle(child).color });
+    }
+    return { background: getComputedStyle(node).backgroundColor, list: getComputedStyle(list).backgroundColor, texts };
+  }, hovered);
+}
+
+async function checkThemeContrast(page: Page, name: string): Promise<void> {
+  // Select one conversation, then hover another, so both row states are on screen.
+  await page.locator('.row').first().click();
+  const selected = page.locator(".row[aria-current='page']");
+  await selected.waitFor();
+  const row = page.locator(".row:not([aria-current='page'])").first();
+  await row.hover();
+  await page.waitForTimeout(200); // Let the row's background transition finish.
+  const colours = await rowTextColours(row, true);
+  const selectedColours = await rowTextColours(selected, false);
+  const selectedBackground = selectedColours.background;
+  const check = (label: string, foreground: string, background: string) => {
+    console.log(`theme-check ${name}: ${label} ${assertReadable(`${name}: ${label}`, foreground, [background]).toFixed(2)}:1`);
+  };
+  // Every text on a hovered or selected row: the title, the secondary line and the time must all be there.
+  for (const [state, measured] of [
+    ['hovered', colours],
+    ['selected', selectedColours],
+  ] as const) {
+    for (const required of ['row-title', 'row-meta span']) {
+      if (!measured.texts.some((text) => text.label === required)) {
+        throw new Error(`${name}: the ${state} row has no ${required} text to measure`);
+      }
+    }
+    if (!measured.texts.some((text) => text.label === 'row-text' || text.label === 'from-text')) {
+      throw new Error(`${name}: the ${state} row has no secondary text to measure`);
+    }
+    for (const text of measured.texts) check(`${state} row ${text.label}`, text.colour, measured.background);
+  }
+  const apart = (label: string, a: string, b: string) => {
+    const ratio = contrastRatio(a, b);
+    console.log(`theme-check ${name}: ${label} ${ratio.toFixed(2)}:1`);
+    if (ratio < MIN_STATE_RATIO) {
+      throw new Error(`${name}: ${label} is ${ratio.toFixed(2)}:1, below ${MIN_STATE_RATIO}:1, so the state can't be seen`);
+    }
+  };
+  apart('hovered row vs list', colours.background, colours.list);
+  apart('selected row vs list', selectedBackground, colours.list);
+  apart('hovered row vs selected row', colours.background, selectedBackground);
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.locator('.sheet textarea').fill('Tidy up the README');
+  const primary = page.locator('.sheet-foot .btn-primary:enabled');
+  await primary.waitFor();
+  await page.waitForTimeout(200); // Enabling the button transitions its opacity.
+  const button = await primary.evaluate((el) => {
+    const { getComputedStyle } = globalThis as unknown as {
+      getComputedStyle(node: unknown): { color: string; backgroundColor: string; opacity: string };
+    };
+    if (el.matches(':hover')) throw new Error('Check the primary button before hovering it');
+    const style = getComputedStyle(el);
+    if (style.opacity !== '1') throw new Error('Check an enabled, opaque primary button');
+    return { foreground: style.color, background: style.backgroundColor };
+  });
+  check('primary button', button.foreground, button.background);
+}
+
+/**
+ * Every visible piece of text inside `scope` (the scope itself included), with its colour and the
+ * backgrounds it sits on, innermost first, down to the first opaque one. Unlike rowTextColours this
+ * keeps text on its own background (a tag, a pill) and translucent washes, for composite().
+ */
+async function textLayers(scope: Locator): Promise<{ label: string; colour: string; backgrounds: string[] }[]> {
+  return scope.evaluate((el) => {
+    type Node = {
+      parentElement: Node | null;
+      className: string | { baseVal: string };
+      tagName: string;
+      childNodes: ArrayLike<{ nodeType: number; textContent: string | null }>;
+      querySelectorAll(selector: string): ArrayLike<Node>;
+      getBoundingClientRect(): { width: number; height: number };
+    };
+    const { getComputedStyle } = globalThis as unknown as {
+      getComputedStyle(node: unknown): { color: string; backgroundColor: string; visibility: string };
+    };
+    // No helper functions in here: the bundler would wrap them in a __name() the page doesn't have.
+    const root = el as unknown as Node;
+    const found: { label: string; colour: string; backgrounds: string[] }[] = [];
+    for (const node of [root, ...Array.from(root.querySelectorAll('*'))]) {
+      const ownText = Array.from(node.childNodes).some((t) => t.nodeType === 3 && (t.textContent ?? '').trim() !== '');
+      const box = node.getBoundingClientRect();
+      if (!ownText || box.width === 0 || box.height === 0 || getComputedStyle(node).visibility !== 'visible') continue;
+      const backgrounds: string[] = [];
+      for (let up: Node | null = node; up; up = up.parentElement) {
+        const background = getComputedStyle(up).backgroundColor;
+        if (background === 'rgba(0, 0, 0, 0)') continue;
+        backgrounds.push(background);
+        // Opaque: rgb(...) or color(srgb ...) with no alpha part.
+        if (/^rgb\(/.test(background) || (/^color\(/.test(background) && !background.includes('/'))) break;
+      }
+      const own = typeof node.className === 'string' ? node.className : node.className.baseVal;
+      const label = own || `${node.parentElement?.className ?? ''} ${node.tagName.toLowerCase()}`;
+      found.push({ label, colour: getComputedStyle(node).color, backgrounds });
+    }
+    return found;
+  });
+}
+
+/** Every text in `scope` must reach WCAG AA (4.5:1) against what is really behind it; returns the labels measured. */
+async function checkTextContrast(name: string, what: string, scope: Locator): Promise<string[]> {
+  await scope.waitFor();
+  const texts = await textLayers(scope);
+  if (!texts.length) throw new Error(`${name}: ${what} has no text to measure`);
+  for (const text of texts) {
+    const ratio = assertReadable(`${name}: ${what} ${text.label}`, text.colour, text.backgrounds);
+    console.log(`theme-check ${name}: ${what} ${text.label} ${ratio.toFixed(2)}:1`);
+  }
+  return texts.map((text) => text.label);
+}
+
+/**
+ * Text on the Sub-agent badge, the Working pill and the plum-tinted "this one" surfaces (For you
+ * strip, chosen folder, current picker choice, highlighted "/" command), in the colours the eye
+ * sees once translucent washes are blended with what is under them.
+ */
+async function checkTintedSurfaces(page: Page, name: string, phone: boolean): Promise<void> {
+  // Each wanted label must have been measured at least as often as it is listed.
+  const needs = (what: string, labels: string[], wanted: string[]) => {
+    for (const label of wanted) {
+      if (labels.filter((l) => l === label).length < wanted.filter((w) => w === label).length) {
+        throw new Error(`${name}: ${what} has no ${label} text to measure`);
+      }
+    }
+  };
+  // A working sub-agent's row, with the Sub-agent badge and the Working pill on their own washes:
+  // plain, and on a desktop also hovered and selected.
+  await page.goto(ORIGIN + '/chats');
+  const subagent = page.locator('.row', { hasText: 'Survey CRDT libraries' });
+  await page.mouse.move(0, 0);
+  const onRow = ['tag tag-subagent', 'pill running'];
+  needs('plain sub-agent row', await checkTextContrast(name, 'plain sub-agent row', subagent), onRow);
+  if (!phone) {
+    await subagent.hover();
+    await page.waitForTimeout(200); // Let the row's background transition finish.
+    needs('hovered sub-agent row', await checkTextContrast(name, 'hovered sub-agent row', subagent), onRow);
+    await subagent.click();
+    await page.mouse.move(0, 0);
+    await page.waitForTimeout(200);
+    const selected = page.locator(".row[aria-current='page']", { hasText: 'Survey CRDT libraries' });
+    needs('selected sub-agent row', await checkTextContrast(name, 'selected sub-agent row', selected), onRow);
+    await page.goto(ORIGIN + '/chats');
+  }
+  // The For you strip on the inbox.
+  needs('for-you strip', await checkTextContrast(name, 'for-you strip', page.locator('.foryou-strip')), ['muted']);
+  // The chosen folder in New conversation (a Paseo agent lists its folders): its name, then its path.
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.click('.sheet .segmented button:nth-child(2)');
+  const folder = page.locator(".sheet .option[aria-checked='true']");
+  needs('chosen folder', await checkTextContrast(name, 'chosen folder', folder), ['label div', 'label div']);
+  // The current choice in a settings picker (the model, with its price as the description).
+  await page.goto(ORIGIN + '/c/hermes/20260927_080000_abcdef');
+  await page.locator('.control-chip[aria-label^="Model:"]').click();
+  const current = page.locator(".sheet .pick-option[aria-checked='true']");
+  needs('current picker choice', await checkTextContrast(name, 'current picker choice', current), ['pick-label', 'pick-desc']);
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('.sheet', { state: 'detached' });
+  // The highlighted command in the "/" menu.
+  await page.locator('.composer textarea').fill('/');
+  const command = page.locator(".composer .slash-row[aria-selected='true']");
+  needs('highlighted command', await checkTextContrast(name, 'highlighted command', command), ['slash-name', 'slash-desc']);
+}
+
 const phone = { width: 393, height: 852 };
+const ONLY = process.env.SHOTS?.split(',').map((name) => name.trim()).filter((name) => name.length > 0);
+
+// Browser-only CSS API, without adding DOM globals to the server's typecheck.
+interface BrowserStyles {
+  getComputedStyle: (element: unknown) => { color: string; backgroundColor: string; boxShadow: string };
+}
+
+/** Check the actual cascade, including inherited SVG foregrounds, in both themes. */
+async function checkContrast(page: Page, selector: string, minimum: number, label: string) {
+  const colors = await page.locator(selector).evaluateAll((elements) => {
+    const styles = globalThis as unknown as BrowserStyles;
+    return elements.map((element) => {
+      let background: typeof element | null = element;
+      let color = 'rgba(0, 0, 0, 0)';
+      while (background && (color === 'rgba(0, 0, 0, 0)' || color === 'transparent')) {
+        color = styles.getComputedStyle(background).backgroundColor;
+        background = background.parentElement;
+      }
+      return { foreground: styles.getComputedStyle(element.querySelector('svg') ?? element).color, background: color };
+    });
+  });
+  const luminance = (color: string) => {
+    const channels = color.match(/[\d.]+/g)?.slice(0, 3).map(Number) ?? [];
+    const linear = channels.map((value) => {
+      const channel = value / 255;
+      return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    return linear[0]! * 0.2126 + linear[1]! * 0.7152 + linear[2]! * 0.0722;
+  };
+  const ratios = colors.map(({ foreground, background }) => {
+    const front = luminance(foreground);
+    const behind = luminance(background);
+    return (Math.max(front, behind) + 0.05) / (Math.min(front, behind) + 0.05);
+  });
+  if (!ratios.length || ratios.some((ratio) => !Number.isFinite(ratio) || ratio < minimum)) {
+    problems.push(`${label}: contrast ${ratios.map((r) => r.toFixed(2)).join(', ')}; want ${minimum}:1`);
+  }
+  console.log(`contrast ${label}: minimum ${Math.min(...ratios).toFixed(2)}:1`);
+}
+
 try {
-  await shoot('01-phone-inbox-dark', { ...phone, dark: true, path: '/', ready: '.row' });
-  await shoot('02-phone-inbox-light', { ...phone, dark: false, path: '/', ready: '.row' });
+  const systemThemes: Record<string, Record<string, string>> = {};
+  for (const theme of ['system', 'light', 'dark'] as const) {
+    for (const os of ['light', 'dark'] as const) {
+      const effective = theme === 'system' ? os : theme;
+      const name = `60-desktop-os-${os}-theme-${theme}`;
+      await shoot(name, {
+        width: 1280,
+        height: 820,
+        dark: os === 'dark',
+        theme,
+        path: '/chats',
+        ready: '.row',
+        act: async (page) => {
+          const attribute = await page.locator('html').getAttribute('data-theme');
+          if (attribute !== (theme === 'system' ? null : theme)) throw new Error(`${name}: saved theme was not applied`);
+          const properties = await themeProperties(page);
+          if (theme === 'system') {
+            systemThemes[os] = properties;
+          } else {
+            const expected = systemThemes[effective]!;
+            for (const key of new Set([...Object.keys(expected), ...Object.keys(properties)])) {
+              if (properties[key] !== expected[key]) throw new Error(`${name}: ${key} does not follow the saved theme`);
+            }
+            console.log(`theme-check ${name}: all ${Object.keys(properties).length} theme properties match ${effective}`);
+          }
+          const themeColors = await page.evaluate(() => {
+            const { document, matchMedia } = globalThis as unknown as {
+              document: { querySelectorAll(selector: string): ArrayLike<{ content: string; media: string }> };
+              matchMedia(query: string): { matches: boolean };
+            };
+            return Array.from(document.querySelectorAll('meta[name="theme-color"]'))
+              .filter((meta) => !meta.media || matchMedia(meta.media).matches)
+              .map((meta) => meta.content);
+          });
+          if (themeColors.length !== 1 || themeColors[0] !== properties['--bg']) {
+            throw new Error(`${name}: theme-color ${themeColors.join(', ')} does not match --bg ${properties['--bg']}`);
+          }
+          console.log(`theme-check ${name}: theme-color ${themeColors[0]} matches --bg`);
+          for (const width of [393, 719, 720, 1280]) {
+            await page.setViewportSize({ width, height: 820 });
+            const size = (await themeProperties(page))['--text-page-title'];
+            if (size !== (width < 720 ? '26px' : '32px')) throw new Error(`${name}: page title is ${size} at ${width}px`);
+          }
+          console.log(`theme-check ${name}: page title 26px below 720px, 32px from 720px`);
+          await checkThemeContrast(page, name);
+        },
+        after: (page) => checkTintedSurfaces(page, name, false),
+      });
+    }
+  }
+  // The same on a phone, where the list and the For you strip sit on --bg rather than --surface.
+  for (const theme of ['system', 'light', 'dark'] as const) {
+    for (const os of ['light', 'dark'] as const) {
+      const name = `61-phone-os-${os}-theme-${theme}`;
+      await shoot(name, {
+        ...phone,
+        dark: os === 'dark',
+        theme,
+        path: '/chats',
+        ready: '.foryou-strip',
+        after: (page) => checkTintedSurfaces(page, name, true),
+      });
+    }
+  }
+  await shoot('01-phone-inbox-dark', { ...phone, dark: true, path: '/chats', ready: '.row' });
+  await shoot('02-phone-inbox-light', { ...phone, dark: false, path: '/chats', ready: '.row' });
+  for (const dark of [false, true]) {
+    for (const size of [phone, { width: 1280, height: 820 }]) {
+      await shoot(`58-${size.width < 600 ? 'phone' : 'desktop'}-tasks-${dark ? 'dark' : 'light'}`, {
+        ...size, dark, path: '/tasks', ready: '.task-card',
+        act: async (page) => {
+          if (await page.locator('.task-card').count() !== 3) problems.push('tasks: missing ledger entries');
+          for (const text of ['Not linked: no successful launch proof.', 'Held: current chat or readiness could not be resolved.',
+            'Not delivered: repeated delivery failures.', 'Overdue', 'Coder', 'Reviewer', 'Working', 'Finished']) {
+            if (!(await page.locator('.page-tasks').innerText()).includes(text)) problems.push(`tasks: missing ${text}`);
+          }
+          if (!(await page.locator('.task-card a').first().getAttribute('href'))?.startsWith('/c/hermes/')) problems.push('tasks: missing launching chat link');
+          await page.reload();
+          await page.waitForSelector('.task-card');
+          if (await page.locator('.task-card').count() !== 3) problems.push('tasks: reload lost ledger');
+        },
+        after: async (page) => {
+          await page.route('**/api/tasks', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{"tasks":[]}' }));
+          await page.click('button[aria-label="Refresh tasks"]');
+          await page.getByText('No worker tasks yet.', { exact: false }).waitFor();
+          await page.unroute('**/api/tasks');
+          await page.click('button[aria-label="Refresh tasks"]');
+          await page.waitForSelector('.task-card');
+          await page.locator('.task-card a').first().click();
+          await page.waitForURL('**/c/hermes/**');
+          if (size.width < 600) {
+            // A thread opened from the ledger goes back to it.
+            await page.click('button[aria-label="Back"]');
+            await page.waitForURL(ORIGIN + '/tasks');
+            await page.waitForSelector('.task-card');
+            await page.click('.tabbar a[href="/chats"]'); // its label carries the waiting count
+            await page.waitForURL(ORIGIN + '/chats');
+          }
+          // Tasks in the navigation: the sidebar on a desktop, the tab bar on a phone.
+          await page.click('a[aria-label="Tasks"]');
+          await page.waitForURL(ORIGIN + '/tasks');
+          await page.waitForSelector('.task-card');
+        },
+      });
+    }
+  }
+  await shoot('58-phone-tasks-unavailable', {
+    ...phone, dark: false, path: '/tasks', ready: '.task-card',
+    expectErrors: /Failed to load resource.*503/,
+    act: async (page) => {
+      await page.route('**/api/tasks', (route) => route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"Demo task status unavailable."}' }));
+      await page.click('button[aria-label="Refresh tasks"]');
+      await page.getByRole('alert').filter({ hasText: 'Demo task status unavailable.' }).waitFor();
+    },
+    after: async (page) => {
+      await page.unroute('**/api/tasks');
+      await page.click('button[aria-label="Refresh tasks"]');
+      await page.getByRole('alert').waitFor({ state: 'detached' });
+      if (await page.locator('.task-card').count() !== 3) problems.push('tasks: refresh did not recover from an error');
+    },
+  });
+  await shoot('58-phone-tasks-disabled', {
+    ...phone, dark: false, path: '/tasks', ready: '.task-card',
+    act: async (page) => {
+      let ledgers = 0;
+      page.on('request', request => { if (new URL(request.url()).pathname === '/api/tasks') ledgers++; });
+      await page.route('**/api/capabilities', route => route.fulfill({ json: { tasks: false } }));
+      await page.click('button[aria-label="Refresh tasks"]');
+      await page.getByRole('status').filter({ hasText: 'Tasks need the bridge, Hermes and Paseo.' }).waitFor();
+      if (ledgers !== 0) problems.push('tasks: requested the ledger while unavailable');
+      if (new URL(page.url()).pathname !== '/tasks') problems.push('tasks: unavailable capability changed the page');
+    },
+  });
   await shoot('03-phone-approval', { ...phone, dark: true, path: '/c/hermes/20260927_071000_a1b2c3', ready: '.approval-dock .approval' });
   await shoot('04-phone-agent', {
     ...phone,
@@ -148,7 +611,7 @@ try {
   await shoot('05-phone-new-paseo', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('.fab');
@@ -159,11 +622,12 @@ try {
   await shoot('06-phone-settings', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
-      await page.waitForSelector('.sheet');
+      // Settings is a page with its own URL now, not a sheet over the inbox.
+      await page.waitForSelector('.page-settings');
     },
   });
   await shoot('07-phone-send-and-stream', {
@@ -184,7 +648,7 @@ try {
   await shoot('11-phone-projects', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('.view-toggle button:has-text("Projects")');
@@ -232,7 +696,7 @@ try {
   await shoot('10-phone-new-pi', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('.fab');
@@ -402,7 +866,7 @@ try {
   await shoot('18-phone-new-with-photo', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       // A photo and no text starts a chat; its thumbnail follows into the new conversation.
@@ -432,7 +896,7 @@ try {
   await shoot('19-phone-compress-moves', {
     ...phone,
     dark: true,
-    path: '/c/hermes/20260926_090000_778899',
+    path: '/c/hermes/20260926_090000_778899?filter=working',
     ready: '.msg-user',
     act: async (page) => {
       // /undo hands the last message back to edit.
@@ -449,11 +913,17 @@ try {
       if (!(await page.locator('.cmd.running').innerText()).includes('Running /compress')) problems.push('no running row');
       await box(page).fill('Next: the agenda');
       await page.waitForURL((url) => url.pathname.startsWith('/c/hermes/') && !url.pathname.endsWith('20260926_090000_778899'));
+      if (new URL(page.url()).searchParams.get('filter') !== 'working') problems.push('move dropped the chats filter');
       await page.waitForSelector('.cmd:not(.running) .cmd-out');
       if (!(await page.locator('.cmd .cmd-out').last().innerText()).includes('Compressed 14 messages')) problems.push('compress output');
       if ((await box(page).inputValue()) !== 'Next: the agenda') problems.push('draft did not follow the move');
       if ((await page.evaluate('history.length')) !== historyLength) problems.push('move added a history entry');
       if (await page.locator('.cmd.running').count()) problems.push('running row left behind');
+    },
+    after: async (page) => {
+      await page.locator('button[aria-label="Back"]').click();
+      await page.waitForURL((url) => url.pathname === '/chats');
+      if (new URL(page.url()).searchParams.get('filter') !== 'working') problems.push('direct thread Back dropped the chats filter');
     },
   });
 
@@ -665,7 +1135,7 @@ try {
       await viewer.waitFor({ state: 'detached' });
       await page.click('.media-strip .media-thumb');
       await viewer.waitFor();
-      if ((await page.locator('.viewer-name').innerText()) !== 'signalbox-icon.png') problems.push('viewer name');
+      if ((await page.locator('.viewer-name').innerText()) !== 'wayroost-icon.png') problems.push('viewer name');
     },
   });
 
@@ -690,7 +1160,7 @@ try {
   await shoot('29-phone-bridged-message', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       // The inbox never shows the envelope, and says who started the chat.
@@ -703,7 +1173,7 @@ try {
       // The chat it started, and the follow-up it sent through the bridge.
       if ((await page.locator('.msg-bridged').count()) !== 2) problems.push('bridged follow-up missing');
       const head = await bubble.locator('.bridged-head').innerText();
-      if (head !== 'From Fix flaky login test (Claude Code) · via Signalbox') problems.push(`bridged header: ${head}`);
+      if (head !== 'From Fix flaky login test (Claude Code) · via Wayroost') problems.push(`bridged header: ${head}`);
       if (!(await bubble.locator('.bridged-body strong').innerText()).includes('webapp release notes')) problems.push('bridged markdown');
       if ((await page.locator('.timeline').innerText()).includes('another AI agent in this project')) problems.push('envelope shown');
       if (await page.locator('.msg-user').count()) problems.push('bridged message shown as yours');
@@ -723,7 +1193,7 @@ try {
   await shoot('30-phone-bridge-settings', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -736,16 +1206,51 @@ try {
       await section.locator('button', { hasText: 'Resume' }).waitFor();
       if ((await section.locator('.bridge-state').innerText()).trim() !== 'Paused') problems.push('bridge not paused');
       // The server kept it: a fresh load says paused too.
-      await page.reload();
-      await page.click('button[aria-label="Settings"]');
+      await page.reload(); // Settings is a page of its own: the reload lands back on it
       await section.locator('button', { hasText: 'Resume' }).waitFor();
+    },
+  });
+
+  await shoot('30b-phone-worker-updates', {
+    ...phone,
+    dark: true,
+    path: '/chats',
+    ready: '.row',
+    act: async (page) => {
+      await page.click('button[aria-label="Settings"]');
+      const section = page.locator('.bridge-settings');
+      const toggle = (checked: boolean) =>
+        section.locator(`button[role="switch"][aria-label="Worker updates"][aria-checked="${checked}"]`);
+      await toggle(true).waitFor();
+      const help = await section.innerText();
+      if (!help.includes('Completion updates may repeat wait results.') || help.includes("Hermes hasn't heard")) {
+        problems.push('worker updates: completion-after-wait text');
+      }
+      const box = section.locator('select[aria-label="Time box for workers"]');
+      if ((await box.inputValue()) !== '60') problems.push('worker updates: default time box');
+      await box.selectOption('90');
+      await page.locator('select[aria-label="Time box for workers"]:not([disabled])').waitFor();
+      await toggle(true).click();
+      await toggle(false).waitFor();
+      if (!(await section.innerText()).includes("Off: Hermes hears about its Paseo workers only through its own waits. What happens while it's off isn't sent later.")) {
+        problems.push('worker updates: off text');
+      }
+      if (await box.count()) problems.push('worker updates: time box shown while off');
+      // The server kept both: a fresh load says off, and 90 minutes once back on.
+      await page.reload(); // Settings is a page of its own: the reload lands back on it
+      await toggle(false).waitFor();
+      await toggle(false).click();
+      await toggle(true).waitFor();
+      if ((await box.inputValue()) !== '90') problems.push('worker updates: time box not kept');
+      await toggle(true).scrollIntoViewIfNeeded();
     },
   });
 
   await shoot('37-phone-cloud-agents-dark', {
     ...phone,
     dark: true,
-    path: '/',
+    device: demoDesktop.cookie,
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -758,8 +1263,7 @@ try {
       await codex(false).waitFor();
       if (!(await section.innerText()).includes('Off')) problems.push('cloud agents: codex row not off');
       // The server kept it: a fresh load says off too.
-      await page.reload();
-      await page.click('button[aria-label="Settings"]');
+      await page.reload(); // Settings is a page of its own: the reload lands back on it
       await codex(false).waitFor();
       await section.scrollIntoViewIfNeeded();
     },
@@ -768,7 +1272,7 @@ try {
   await shoot('37b-phone-whatsapp-settings', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -783,8 +1287,7 @@ try {
       if (await back.isEnabled()) problems.push('whatsapp: return time still enabled with routing off');
       await section.locator('select[aria-label="Start a fresh WhatsApp chat"]').selectOption('8');
       // The server kept both: a fresh load shows them.
-      await page.reload();
-      await page.click('button[aria-label="Settings"]');
+      await page.reload(); // Settings is a page of its own: the reload lands back on it
       await routing(false).waitFor();
       const fresh = await section.locator('select[aria-label="Start a fresh WhatsApp chat"]').inputValue();
       if (fresh !== '8') problems.push(`whatsapp: fresh chat after ${fresh}, not 8`);
@@ -795,7 +1298,7 @@ try {
   await shoot('37c-phone-settings', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -817,7 +1320,7 @@ try {
   await shoot('37d-phone-schedules', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -864,12 +1367,29 @@ try {
       await list.locator('.schedule-head', { hasText: 'Lunch idea' }).waitFor();
       await list.locator('.schedule-head', { hasText: 'Morning briefing' }).scrollIntoViewIfNeeded();
     },
+    after: async (page) => {
+      // The dashboard's generated run IDs have no demo timelines; use the existing digest thread.
+      const runs: ScheduleRun[] = [{
+        id: 'demo-history-run', open: { source: 'hermes', id: '20260926_180000_d4e5f6' },
+        title: 'Weekly research digest', running: false,
+      }];
+      await page.route('**/api/schedules/hermes/123abc456def/runs', (route) => route.fulfill({ json: { runs } }));
+      await page.goto(ORIGIN + '/schedule');
+      const job = page.locator('.schedule-job', { hasText: 'Weekly digest' });
+      await job.locator('.schedule-head').click();
+      await job.locator('button.run-item').first().click();
+      await page.waitForURL((url) => url.pathname.startsWith('/c/'));
+      await page.waitForSelector('.composer');
+      await page.goBack();
+      await page.waitForSelector('.schedules');
+      if (new URL(page.url()).pathname !== '/schedule') problems.push('opening a run lost Schedule from history');
+    },
   });
 
   await shoot('58-phone-home-scheduled', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       // Recent no longer carries a Scheduled block; it has its own tab, with a failure badge.
@@ -913,7 +1433,7 @@ try {
   await shoot('61-phone-scheduled-tab-new', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.locator('.view-tabs button', { hasText: 'Scheduled' }).click();
@@ -931,7 +1451,7 @@ try {
   await shoot('59-phone-schedule-builder', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -961,7 +1481,7 @@ try {
   await shoot('60-phone-schedule-edit', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -1014,8 +1534,8 @@ try {
     act: async (page) => {
       await page.click('button[aria-label="Thread actions"]');
       await page.locator('.thread-actions button', { hasText: 'Archive' }).click();
-      // Back to the inbox, without it.
-      await page.waitForURL((url) => url.pathname === '/');
+      // Back to the inbox, without it. The inbox is a page of its own now.
+      await page.waitForURL((url) => url.pathname === '/chats');
       await page.locator('.row').first().waitFor();
       if (await page.locator('.row', { hasText: 'Summarize open issues' }).count()) problems.push('archived chat still listed');
       await page.click('button[aria-label="Settings"]');
@@ -1027,14 +1547,14 @@ try {
       await page.locator('.archived-list .kv', { hasText: 'Summarize open issues' }).locator('button', { hasText: 'Restore' }).click();
       await page.locator('.archived-empty').waitFor();
       await page.locator('.sheet button[aria-label="Close"]').first().click().catch(() => {});
-      await page.goto(ORIGIN + '/');
+      await page.goto(ORIGIN + '/chats');
       await page.locator('.row', { hasText: 'Summarize open issues' }).waitFor();
     },
   });
   await shoot('40-phone-archive-folder', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('.view-toggle button:has-text("Projects")');
@@ -1053,7 +1573,7 @@ try {
   await shoot('41-phone-tidy-settings-dark', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -1064,11 +1584,384 @@ try {
     },
   });
 
+  // ---- The approval card ----
+  // Each kind of request at phone and desktop size, light and dark: who is
+  // asking, a plain title, the three rows, the buttons, and only the choices
+  // the backend really offers. Nothing here answers a request.
+  const card = (page: Page) => page.locator('.approval-dock .approval-card');
+  const cardText = async (page: Page, selector: string) => (await card(page).locator(selector).first().innerText()).trim();
+  const checkCard = async (
+    page: Page,
+    label: string,
+    want: { role: string; title: string; always?: string; more?: string; risk: string; allow?: boolean },
+  ) => {
+    const strip = await cardText(page, '.approval-strip');
+    if (!strip.includes(`${want.role} is asking`) || !strip.includes('Needs you')) problems.push(`${label}: strip "${strip}"`);
+    const tile = await card(page).locator('.approval-strip .role-tile').getAttribute('aria-label');
+    if (tile !== `${want.role}, needs you`) problems.push(`${label}: tile "${tile}"`);
+    const title = await cardText(page, '.approval-display');
+    if (title !== want.title) problems.push(`${label}: title "${title}"`);
+    const font = await card(page)
+      .locator('.approval-display')
+      .evaluate((el) => (globalThis as unknown as { getComputedStyle(e: unknown): { fontFamily: string } }).getComputedStyle(el).fontFamily);
+    if (!font.includes('Young Serif')) problems.push(`${label}: title not in the display face (${font})`);
+    const rows = await card(page).locator('.approval-row dt').allInnerTexts();
+    if (rows.map((r) => r.toLowerCase()).join('|') !== 'what happens|why|if you say no') problems.push(`${label}: rows ${rows.join('|')}`);
+    if (want.allow !== false) {
+      const allow = await cardText(page, '.approval-foot .btn-approve');
+      if (allow !== 'Allow once') problems.push(`${label}: primary "${allow}"`);
+      const deny = await cardText(page, '.approval-foot .btn-danger');
+      if (deny !== "Don't allow") problems.push(`${label}: secondary "${deny}"`);
+    }
+    const always = card(page).locator('.approval-always');
+    if (!want.always) {
+      if (await always.count()) problems.push(`${label}: "always" checkbox without an "always" choice`);
+    } else {
+      const text = (await always.innerText()).trim();
+      if (text !== want.always) problems.push(`${label}: checkbox "${text}"`);
+      // A real, labelled checkbox that works from the keyboard and turns "Allow once" into the "always" choice.
+      const checkbox = always.locator('input[type="checkbox"]');
+      await checkbox.focus();
+      await page.keyboard.press('Space');
+      if (!(await checkbox.isChecked())) problems.push(`${label}: checkbox not keyboard-operable`);
+      const primary = await cardText(page, '.approval-foot .btn-approve');
+      if (primary !== 'Allow from now on') problems.push(`${label}: checked primary "${primary}"`);
+      await page.keyboard.press('Space');
+      if ((await cardText(page, '.approval-foot .btn-approve')) !== 'Allow once') problems.push(`${label}: unchecking`);
+    }
+    const choices = card(page).locator('.approval-choices');
+    if (!want.more) {
+      if (await choices.count()) problems.push(`${label}: "More choices" with nothing in it`);
+    } else {
+      await choices.locator('summary').click();
+      const more = await choices.locator('.btn').allInnerTexts();
+      if (more.map((m) => m.trim()).join() !== want.more) problems.push(`${label}: more choices ${more.join()}`);
+    }
+    await card(page).locator('.approval-details summary').click();
+    const details = await cardText(page, '.approval-details dl');
+    if (!details.includes(want.risk)) problems.push(`${label}: risk "${details}"`);
+  };
+  const cardShots: Array<{
+    name: string;
+    path: string;
+    want: Parameters<typeof checkCard>[2];
+  }> = [
+    {
+      name: 'command',
+      path: '/c/hermes/20260927_071000_a1b2c3',
+      want: {
+        role: 'Manager',
+        title: 'Delete ~/Downloads/old-installers',
+        always: 'Allow commands like this everywhere without asking',
+        more: 'Allow for this chat',
+        risk: 'High · deletes files',
+      },
+    },
+    {
+      name: 'file-edit',
+      path: '/c/paseo/b3d5f7a9-receipts',
+      want: {
+        role: 'Coder',
+        title: 'Edit src/receipts.ts in billing',
+        always: 'Always allow edits',
+        risk: 'Medium · one file: receipts.ts',
+      },
+    },
+    {
+      name: 'secret',
+      path: '/c/hermes/20260927_101500_c0ffee',
+      want: { role: 'Manager', title: 'Enter your sudo password', risk: 'High · runs as administrator', allow: false },
+    },
+  ];
+  const sizes = [
+    { size: 'phone', ...phone },
+    { size: 'desktop', width: 1280, height: 860 },
+  ];
+  for (const shot of cardShots) {
+    for (const { size, width, height } of sizes) {
+      for (const dark of [false, true]) {
+        const name = `62-${size}-approval-${shot.name}-${dark ? 'dark' : 'light'}`;
+        await shoot(name, {
+          width,
+          height,
+          dark,
+          path: shot.path,
+          ready: '.approval-dock .approval-card',
+          act: async (page) => {
+            await page.waitForTimeout(800); // armed
+            // Check once per kind; the other shots show the same card closed.
+            if (size === 'phone' && !dark) await checkCard(page, name, shot.want);
+            else if (size === 'desktop') {
+              await card(page).locator('.approval-details summary').click();
+              if (shot.want.more) await card(page).locator('.approval-choices summary').click();
+            }
+            await card(page).evaluate((el) => el.scrollTo(0, 0));
+          },
+        });
+      }
+    }
+  }
+  // A request with no "always" choice gets no checkbox, and the inbox banner is the top of a card.
+  await shoot('62-phone-approval-banner', {
+    ...phone,
+    dark: false,
+    path: '/c/paseo/7c1e0b55-deps',
+    ready: '.approval-dock .approval-card',
+    act: async (page) => {
+      if (await card(page).locator('.approval-always').count()) problems.push('hidden payload: checkbox without an "always" choice');
+      const title = await cardText(page, '.approval-display');
+      if (title !== 'Download and run a script') problems.push(`hidden payload: title "${title}"`);
+      await page.goto(ORIGIN + '/chats'); // the inbox is the Chats page
+      const banner = page.locator('.approval-banner');
+      await banner.waitFor();
+      const text = await banner.innerText();
+      if (!/is asking/.test(text) || !text.includes('Needs you') || !/\d+ requests need you/.test(text)) {
+        problems.push(`banner: ${JSON.stringify(text)}`);
+      }
+    },
+  });
+
+  // A question gets the same card: the three rows and the risk under Details.
+  // The demo has no question waiting, so this page alone is handed one; nothing answers it.
+  const QUESTION_CONV = 'c2b4e6f8-hermes';
+  const question = {
+    id: 'demo-question.q0', source: 'paseo' as const, conversationId: QUESTION_CONV, kind: 'question' as const,
+    title: 'Which issues should the summary cover?',
+    options: [
+      { id: '0', label: 'Only regressions', kind: 'choice' as const },
+      { id: '1', label: 'All open issues', kind: 'choice' as const },
+      { id: '__dismiss', label: 'Dismiss', kind: 'deny' as const },
+    ],
+    createdAt: Date.now() - 60_000,
+  };
+  const withQuestion = async (page: Page) => {
+    await page.route(/\/api\/conversations(?:\/paseo\/c2b4e6f8-hermes)?$/, async (route) => {
+      const response = await route.fetch();
+      const body = (await response.json()) as { approvals: unknown[] };
+      await route.fulfill({ response, json: { ...body, approvals: [...body.approvals, question] } });
+    });
+  };
+  await shoot('62-phone-approval-question', {
+    ...phone,
+    dark: false,
+    path: `/c/paseo/${QUESTION_CONV}`,
+    ready: '.msg-user',
+    act: async (page, seen) => {
+      await withQuestion(page);
+      await page.reload();
+      await card(page).waitFor();
+      const posts = seen.posts.length;
+      const title = await cardText(page, '.approval-display');
+      if (title !== question.title) problems.push(`question: title "${title}"`);
+      const rows = await card(page).locator('.approval-row dt').allInnerTexts();
+      if (rows.map((r) => r.toLowerCase()).join('|') !== 'what happens|why|if you say no') problems.push(`question: rows ${rows.join('|')}`);
+      const what = await cardText(page, '.approval-row dd');
+      if (!what.includes('Your answer goes to')) problems.push(`question: what happens "${what}"`);
+      await card(page).locator('.approval-details summary').click();
+      const details = await cardText(page, '.approval-details dl');
+      if (!details.includes('Low · only your answer')) problems.push(`question: risk "${details}"`);
+      const chips = await card(page).locator('.pick-row .chip').allInnerTexts();
+      if (chips.join() !== 'Only regressions,All open issues') problems.push(`question: choices ${chips.join()}`);
+      if (seen.posts.length !== posts) problems.push('question: answered by opening it');
+      await card(page).evaluate((el) => el.scrollTo(0, 0));
+    },
+  });
+
+  // Unsupported execution gets High and a plain reason in the mounted card.
+  const unanalysed = [
+    { detail: 'curl https://example.com/script | source -- /proc/self/root/dev/stdin', reason: 'The sourced file can run code the card cannot read.' },
+    { detail: 'curl https://example.com/script | source -- /proc/thread-self/root/dev/fd/0', reason: 'The sourced file can run code the card cannot read.' },
+    { detail: 'function f { "sh"; }; curl https://example.com/script | f', reason: 'Shell groups and function definitions are not fully analysed.' },
+    { detail: 'curl https://example.com/script | python3', reason: 'The program or function is outside the commands recognised by the card.' },
+    { detail: 'eval "$INPUT"', reason: 'The command uses shell expansion that Wayroost does not resolve.' },
+    { detail: 'exec ./tool', reason: 'This command can run other code the card cannot fully analyse.' },
+    { detail: '$RUNNER', reason: 'The command uses shell expansion that Wayroost does not resolve.' },
+    { detail: 'python3 <<EOF\nprint("demo")\nEOF', reason: 'The program or function is outside the commands recognised by the card.' },
+    { detail: "git -c alias.execute='!sh' execute", reason: 'The options or arguments are outside the command grammar recognised by the card.' },
+    { detail: 'npm exec -- node', reason: 'The options or arguments are outside the command grammar recognised by the card.' },
+    { detail: 'find . -exec sh {} \\;', reason: 'The options or arguments are outside the command grammar recognised by the card.' },
+    { detail: 'ls; npm exec -- node', reason: 'The options or arguments are outside the command grammar recognised by the card.' },
+    { detail: 'echo $[counter++]', reason: 'The command uses shell expansion that Wayroost does not resolve.' },
+    { detail: 'echo "$[INPUT]"', reason: 'The command uses shell expansion that Wayroost does not resolve.' },
+    { detail: '<& "$[INPUT]" :', reason: 'The command uses shell expansion that Wayroost does not resolve.' },
+    { detail: '< "${RUNNER@P}" :', reason: 'The command uses shell expansion that Wayroost does not resolve.' },
+    { detail: 'git constructor', reason: 'The options or arguments are outside the command grammar recognised by the card.' },
+    { detail: 'git toString', reason: 'The options or arguments are outside the command grammar recognised by the card.' },
+    { detail: 'git __proto__', reason: 'The options or arguments are outside the command grammar recognised by the card.' },
+    { detail: 'find . *', reason: 'The command uses shell expansion that Wayroost does not resolve.' },
+    { detail: 'ls docs/[a-z]?.ts', reason: 'The command uses shell expansion that Wayroost does not resolve.' },
+    ...[
+      'ls {a,b}', 'ls {a}b,c}', 'cat demo{1..3}.txt', 'echo {a,{b,c}}', 'echo $',
+      'echo @(a|b)', 'echo !(demo)', 'echo +(demo)', 'echo *(demo)', 'echo ?(demo)',
+      'echo !!', 'ls ~demo', 'echo ~+', 'echo ~-',
+    ].map((detail) => ({ detail, reason: 'The command uses shell expansion that Wayroost does not resolve.' })),
+  ];
+  for (const dark of [false, true]) {
+    for (const [size, viewport] of [['phone', phone], ['desktop', { width: 1440, height: 1000 }]] as const) {
+      await shoot(`64-${size}-approval-unanalysed-${dark ? 'dark' : 'light'}`, {
+        ...viewport, dark, path: `/c/paseo/${QUESTION_CONV}`, ready: '.msg-user',
+        act: async (page, seen) => {
+          let given = unanalysed[0]!;
+          await page.route(/\/api\/conversations(?:\/paseo\/c2b4e6f8-hermes)?$/, async (route) => {
+            const response = await route.fetch();
+            const body = (await response.json()) as { approvals: unknown[] };
+            await route.fulfill({ response, json: { ...body, approvals: [{
+              ...question, id: 'demo-unanalysed', kind: 'permission', title: 'Run shell command',
+              detailKind: 'command', detail: given.detail,
+              options: [{ id: 'demo-allow', label: 'Allow once', kind: 'allow' }, { id: 'demo-deny', label: "Don't allow", kind: 'deny' }],
+            }] } });
+          });
+          const posts = seen.posts.length;
+          const cases = [
+            ...unanalysed.map((request) => ({ ...request, risk: 'High · not fully analysed' })),
+            ...[
+              'ls && echo done', "printf '%s\\n' hello", "printf '%s bytes' hello", "printf '%%n'",
+              '< demo.txt :', "< '${RUNNER@P}' :", "rm '*'", 'rm \\*', 'find . -name "*.ts"',
+              'ls "{a,b}"', "cat 'demo{1..3}.txt'", 'echo \\{a,b}', 'echo {a}',
+              "rm '{x},-rf}' production", 'rm "{x},-rf}" production',
+              'rm \\{x},-rf} production', 'rm {x}\\,-rf} production', 'rm {x},-rf\\} production',
+              "ls '{a}b,c}'", 'ls "{a}b,c}"', 'ls \\{a}b,c}', 'ls {a}b\\,c}', 'ls {a}b,c\\}',
+              'echo "@(a|b)"', "echo '!!'", 'echo "~demo"', 'ls ~/docs',
+            ].map((detail) => ({
+              detail, reason: '', risk: 'Medium · files on your PC',
+            })),
+            ...['rm *', 'rm {Y..a..2}-]rf production', 'rm -{r,f} production', 'rm {x},-rf} production'].map((detail) => ({
+              detail, reason: 'The command uses shell expansion that Wayroost does not resolve.', risk: 'High · deletes files',
+            })),
+            { ...unanalysed[0]!, risk: 'High · not fully analysed' },
+          ];
+          for (const request of cases) {
+            given = request;
+            await page.reload();
+            try { await card(page).waitFor(); }
+            catch (error) {
+              console.error('command grammar context', { size, dark, command: request.detail, page: (await page.locator('body').innerText()).slice(0, 500) });
+              throw error;
+            }
+            await card(page).locator('.approval-details summary').click();
+            const risk = await card(page).locator('.approval-details dd').first().innerText();
+            if (!risk.includes(request.risk) || !risk.includes(request.reason)) {
+              problems.push(`command grammar ${size}: ${JSON.stringify(request.detail)} showed ${JSON.stringify(risk)}`);
+            }
+            if (request.detail === 'ls && echo done') {
+              await page.goto(ORIGIN + '/chats');
+              const banner = page.locator('.approval-banner');
+              await banner.waitFor();
+              if (!(await banner.innerText()).includes('Run 2 commands')) problems.push(`command grammar ${size}: chained command missing from banner`);
+              await page.goto(ORIGIN + `/c/paseo/${QUESTION_CONV}`);
+            }
+          }
+          if (seen.posts.length !== posts) problems.push('unanalysed: answered by opening it');
+          // Keep the risk and its reason in view for the phone screenshot.
+          await card(page).evaluate((el) => el.scrollTo(0, el.scrollHeight));
+        },
+      });
+    }
+  }
+
+  // ---- What each button really answers ----
+  // Every answer is caught on its way out, checked, and answered "ok" here, so
+  // the demo keeps its requests and a reload brings the same card back. Nothing
+  // but a button sends an answer: not mounting, the checkbox or a disclosure,
+  // and not a tap before the card arms or before a long command is opened.
+  await shoot('63-phone-approval-answers', {
+    ...phone,
+    dark: false,
+    path: '/c/hermes/20260927_071000_a1b2c3',
+    ready: '.approval-dock .approval-card',
+    act: async (page) => {
+      const sent: Array<{ url: string; body: unknown }> = [];
+      await page.route('**/approvals/**', async (route) => {
+        sent.push({ url: route.request().url(), body: route.request().postDataJSON() });
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) });
+      });
+      const foot = (selector: string) => card(page).locator(`.approval-foot ${selector}`).first();
+      const open = async (path: string) => {
+        await page.goto(ORIGIN + path);
+        await card(page).waitFor();
+        await page.waitForTimeout(800); // armed
+      };
+      const none = (label: string) => {
+        if (sent.length) problems.push(`answers: ${label} sent ${JSON.stringify(sent)}`);
+        sent.length = 0;
+      };
+      const answers = async (label: string, path: string, click: () => Promise<void>, optionId: string, id: string) => {
+        await click();
+        await until(`${label} to be sent`, async () => sent.length > 0);
+        await card(page).waitFor({ state: 'detached' });
+        const [only, ...extra] = sent;
+        if (extra.length || JSON.stringify(only?.body) !== JSON.stringify({ optionId }) || !only?.url.endsWith(`/approvals/${id}`)) {
+          problems.push(`answers: ${label} sent ${JSON.stringify(sent)}, not ${optionId} for ${id}`);
+        }
+        sent.length = 0;
+        await open(path);
+      };
+
+      // Hermes: once, always (through the checkbox), this chat (under More choices), deny.
+      const hermes = '/c/hermes/20260927_071000_a1b2c3';
+      if (!(await foot('.btn-approve').isDisabled())) problems.push('answers: armed before the first tap');
+      await foot('.btn-approve').click({ force: true, timeout: 2000 }).catch(() => {});
+      await foot('.btn-danger').click({ force: true, timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(800);
+      none('a tap before the card armed');
+      await foot('.approval-always input').check();
+      await foot('.approval-always input').uncheck();
+      await foot('.approval-choices summary').click();
+      await card(page).locator('.approval-details summary').click();
+      await page.waitForTimeout(300);
+      none('the checkbox or a disclosure');
+      await answers('Allow once', hermes, () => foot('.btn-approve').click(), 'once', 'srq-demo1');
+      await answers('Allow from now on', hermes, async () => {
+        await foot('.approval-always input').check();
+        await foot('.btn-approve').click();
+      }, 'always', 'srq-demo1');
+      await answers('Allow for this chat', hermes, async () => {
+        await foot('.approval-choices summary').click();
+        await foot('.approval-choices .btn').filter({ hasText: 'Allow for this chat' }).click();
+      }, 'session', 'srq-demo1');
+      await answers("Don't allow", hermes, () => foot('.btn-danger').click(), 'deny', 'srq-demo1');
+
+      // Paseo: its own option ids.
+      const edit = '/c/paseo/b3d5f7a9-receipts';
+      await open(edit);
+      await answers('Paseo Allow once', edit, () => foot('.btn-approve').click(), 'allow', 'perm-edit');
+      await answers('Paseo always', edit, async () => {
+        await foot('.approval-always input').check();
+        await foot('.btn-approve').click();
+      }, 'allow_always', 'perm-edit');
+      await answers("Paseo Don't allow", edit, () => foot('.btn-danger').click(), 'deny', 'perm-edit');
+
+      // A long command: nothing but "no" goes until it's been opened in full.
+      const long = '/c/hermes/20260927_103000_5ca1ab';
+      await open(long);
+      if (!(await foot('.btn-approve').isDisabled())) problems.push('answers: a long command allowable unopened');
+      await foot('.btn-approve').click({ force: true, timeout: 2000 }).catch(() => {});
+      await foot('.approval-choices summary').click();
+      await foot('.approval-choices .btn').filter({ hasText: 'Allow for this chat' }).click({ force: true, timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(500);
+      none('allowing a long command before opening it');
+      await answers('long command, no', long, () => foot('.btn-danger').click(), 'deny', 'scan-demo1');
+      await answers('long command, once opened', long, async () => {
+        await card(page).locator('.link-btn', { hasText: 'Show everything' }).click();
+        await foot('.btn-approve').click();
+      }, 'once', 'scan-demo1');
+      await page.unroute('**/approvals/**');
+      none('the last reload');
+    },
+  });
+
   // ---- Passwords and codes Hermes asks for ----
   /** A secret must reach the server in the answer, and never come back to the page in any form. */
   const secretNeverLeaks = async (page: Page, seen: Seen, secret: string, label: string, sends = 1) => {
     if (seen.posts.filter((body) => body.includes(secret)).length !== sends) problems.push(`${label}: not sent ${sends}×`);
-    if ((await Promise.all(seen.responses)).some((body) => body.includes(secret))) problems.push(`${label}: in a response`);
+    const bodies = await Promise.all(seen.responses);
+    if (bodies.some(({ body }) => body?.includes(secret))) problems.push(`${label}: in a response`);
+    // An unread static asset can't carry it; an unread API answer might, so it never passes silently.
+    const unread = bodies.filter(({ url, body }) => body === null && apiOrSocket(url));
+    if (unread.length) {
+      const paths = [...new Set(unread.map(({ url }) => new URL(url).pathname))].join(', ');
+      problems.push(`${label}: could not inspect ${unread.length} API responses for the secret (${paths})`);
+    }
     if (seen.frames.some((frame) => frame.includes(secret))) problems.push(`${label}: in a live update`);
     if (seen.console.some((line) => line.includes(secret))) problems.push(`${label}: in the console`);
     if ((await page.content()).includes(secret) || (await page.locator('body').innerText()).includes(secret)) {
@@ -1086,7 +1979,7 @@ try {
   await shoot('31-phone-secret-sudo', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       // Waiting on a password counts as needing you, like any approval.
@@ -1261,7 +2154,7 @@ try {
   await shoot('35-phone-projects-nested', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       // Recent: idle sub-agents stay out of the way; working ones show; search finds the rest.
@@ -1367,7 +2260,7 @@ try {
   await shoot('43-phone-new-chat-folder', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('.fab');
@@ -1395,14 +2288,14 @@ try {
   // ---- Connectors: the page, signing in, and a mail trigger ----
   const openConnectors = async (page: Page) => {
     await page.click('button[aria-label="Settings"]');
-    await page.click('button.settings-link');
+    await page.locator('button.settings-link', { hasText: 'Connectors' }).click();
     await page.waitForSelector('.connector-grid');
   };
-  await shoot('44-phone-connectors-dark', { ...phone, dark: true, path: '/', ready: '.row', act: openConnectors });
+  await shoot('44-phone-connectors-dark', { ...phone, dark: true, path: '/chats', ready: '.row', act: openConnectors });
   await shoot('45-phone-connect-review-light', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await openConnectors(page);
@@ -1425,14 +2318,14 @@ try {
     width: 1280,
     height: 900,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: openConnectors,
   });
   await shoot('47-phone-trigger-form-dark', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await openConnectors(page);
@@ -1514,7 +2407,7 @@ try {
   await shoot('51-phone-settings-voice-light', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -1539,11 +2432,58 @@ try {
     },
   });
 
+  cloudSpeech.available = true;
+  await shoot('86-desktop-voice-elevenlabs-available-light', {
+    width: 1280, height: 1000, dark: false, path: '/settings/voice', ready: '.voice-settings',
+    act: async page => {
+      await page.locator('select[aria-label="App read-aloud provider"] option[value="elevenlabs"]:enabled').waitFor({ state: 'attached' });
+      await page.locator('select[aria-label="App read-aloud provider"]').selectOption('elevenlabs');
+      await page.locator('select[aria-label="ElevenLabs voice"]').waitFor();
+      await until('cloud sample', async () => cloudSpeech.spoken.length > 0);
+      await page.locator('select[aria-label="ElevenLabs voice"]').selectOption('fake-demo-premade');
+      await page.locator('select[aria-label="ElevenLabs voice"]:enabled').waitFor();
+      const notice = await page.locator('.voice-settings').innerText();
+      if (!notice.includes('Text read in an ElevenLabs voice is sent to ElevenLabs.')) problems.push('voice: missing cloud notice');
+      if (await page.locator('.voice-settings input[type="password"]').count()) problems.push('voice: key field exposed');
+    },
+  });
+  await shoot('87-phone-voice-elevenlabs-readonly-dark', {
+    ...phone, dark: true, path: '/settings/voice', ready: '.voice-settings', device: demoPhone.cookie,
+    act: async page => {
+      for (const label of ['App read-aloud provider', 'ElevenLabs voice', 'ElevenLabs model', 'Voice']) {
+        if (!await page.locator(`select[aria-label="${label}"]`).isDisabled()) problems.push(`voice: phone can change ${label}`);
+      }
+      const denied = await page.evaluate(async () => (await fetch('/api/voice', {
+        method: 'PUT', headers: { 'content-type': 'application/json', 'x-wayroost-request': '1' },
+        body: JSON.stringify({ appReadAloud: { provider: 'local' } }),
+      })).status);
+      if (denied !== 403) problems.push(`voice: phone update returned ${denied}`);
+    },
+    expectErrors: /403/,
+  });
+  cloudSpeech.available = false;
+  await shoot('88-desktop-voice-elevenlabs-unavailable-light', {
+    width: 1280, height: 1000, dark: false, path: '/settings/voice', ready: '.voice-settings',
+    act: async page => {
+      // The server caches catalogs. This fixture represents the next failed refresh.
+      await page.route('**/api/voice/catalog', route => route.fulfill({ json: { available: false, voices: [], models: [], error: 'unreachable' } }));
+      await page.reload();
+      await page.getByText('ElevenLabs is unavailable (unreachable); app read-aloud falls back to the local voice.').waitFor();
+      const text = await page.locator('.voice-settings').innerText();
+      if (!text.includes('/etc/wayroost/elevenlabs-api-key') || !text.includes('re-run the installer')) problems.push('voice: missing key setup sentence');
+      const before = speech.spoken.length;
+      await page.getByRole('button', { name: 'Try it', exact: true }).click();
+      await until('local fallback sample', async () => speech.spoken.length > before);
+      await page.locator('select[aria-label="App read-aloud provider"]').selectOption('local');
+      await page.locator('select[aria-label="App read-aloud provider"]:enabled').waitFor();
+    },
+  });
+
   // ---- For you -------------------------------------------------------------------
   await shoot('52-phone-foryou-inbox-dark', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.foryou-strip',
     act: async (page) => {
       const badge = (await page.locator('.foryou-btn .badge').innerText()).trim();
@@ -1553,7 +2493,7 @@ try {
   await shoot('53-phone-foryou-sheet-light', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.foryou-btn',
     act: async (page) => {
       await page.click('.foryou-btn');
@@ -1574,7 +2514,7 @@ try {
       await page.locator('.feed-card', { hasText: 'GitHub' }).waitFor({ state: 'detached' });
       await page.getByRole('button', { name: 'Send to Hermes' }).click();
       await until('the chat "Do it" started', async () => new URL(page.url()).pathname.startsWith('/c/hermes/'));
-      await page.goto(ORIGIN + '/');
+      await page.goto(ORIGIN + '/chats');
       await page.waitForSelector('.foryou-btn');
       if (await page.locator('.foryou-strip, .foryou-btn .badge').count()) problems.push('for you: still "new" after the sheet was opened');
     },
@@ -1582,7 +2522,7 @@ try {
   await shoot('54-phone-settings-foryou-dark', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await page.click('button[aria-label="Settings"]');
@@ -1619,7 +2559,7 @@ try {
   await shoot('55-phone-skills-light', {
     ...phone,
     dark: false,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await openSkills(page);
@@ -1663,7 +2603,7 @@ try {
   await shoot('56-phone-skills-news-dark', {
     ...phone,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await openSkills(page);
@@ -1679,7 +2619,7 @@ try {
     width: 1280,
     height: 900,
     dark: true,
-    path: '/',
+    path: '/chats',
     ready: '.row',
     act: async (page) => {
       await openSkills(page);
@@ -1693,6 +2633,500 @@ try {
       const scan = await page.locator('.skill-scan').innerText();
       if (!scan.includes('Downloads and runs a binary')) problems.push('skills: hub scan findings not shown');
       if (!(await page.locator('button', { hasText: 'Install anyway' }).count())) problems.push('skills: no second confirm');
+    },
+  });
+
+  // ---- Devices and pairing ----------------------------------------------------
+
+  await shoot('62-desktop-devices-light', {
+    width: 1280,
+    height: 860,
+    dark: false,
+    path: '/settings/devices',
+    ready: '.device-row',
+    act: async (page, seen) => {
+      const rows = await page.locator('.device-row').allInnerTexts();
+      if (rows.length !== 2 || !rows[0]!.includes('This device')) problems.push(`devices: unexpected list ${JSON.stringify(rows)}`);
+      await page.locator('button', { hasText: 'Pair a phone' }).click();
+      await page.locator('svg.qr path').waitFor();
+      const code = (await page.locator('.offer-code code').innerText()).replace(/-/g, '');
+      if (!/^[a-z2-7]{26}$/.test(code)) problems.push(`devices: odd pairing code ${code}`);
+      // The QR is drawn here: nothing but this origin was asked for anything.
+      const outside = seen.urls.filter((u) => !u.startsWith(ORIGIN) && !u.startsWith('data:') && !u.startsWith('blob:'));
+      if (outside.length) problems.push(`devices: requests to other hosts: ${outside.join(', ')}`);
+    },
+    after: async (page) => {
+      // A configured hostname can be long enough (here three 63-character
+      // labels) that the link no longer fits a QR code: the card shows the
+      // link and the code instead of taking the page down.
+      const longUrl = `https://${['a', 'b', 'c'].map((c) => c.repeat(63)).join('.')}.example.com${PAIR_PATH}#${'a'.repeat(26)}`;
+      await page.locator('button[aria-label="Close the pairing code"]').click();
+      await page.route(
+        '**/api/pair/offer',
+        (route) =>
+          route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ code: 'a'.repeat(26), kind: 'phone', expiresAt: Date.now() + 600_000, url: longUrl }),
+          }),
+        { times: 1 },
+      );
+      await page.locator('button', { hasText: 'Pair a phone' }).click();
+      await page.locator('.qr-fallback').waitFor({ timeout: 5_000 }).catch(() => problems.push('devices: no fallback for a long pairing link'));
+      if ((await page.locator('.qr-fallback code').innerText().catch(() => '')) !== longUrl) problems.push('devices: long link not shown');
+      if (!(await page.locator('.offer-code code').count())) problems.push('devices: long link lost its typed code');
+      if (!(await page.locator('.device-row').count())) problems.push('devices: page gone after a long pairing link');
+      await page.unroute('**/api/pair/offer');
+    },
+  });
+
+  await shoot('63-phone-devices-dark', {
+    ...phone,
+    dark: true,
+    path: '/settings/devices',
+    ready: '.device-row',
+    device: demoPhone.cookie,
+    act: async (page) => {
+      if (await page.locator('button', { hasText: 'Pair a phone' }).count()) problems.push('devices: a phone was offered pairing');
+      // A phone manages only itself.
+      if ((await page.locator('button[aria-label^="Revoke"]').count()) !== 1) problems.push('devices: a phone can revoke others');
+    },
+  });
+
+  await shoot('64-phone-unpaired-light', {
+    ...phone,
+    dark: false,
+    path: '/',
+    ready: '.pair-card input',
+    device: null,
+    // The page asks for its data and opens its socket once, is told it isn't paired, and shows this.
+    expectErrors: /401|WebSocket connection .* failed/,
+  });
+
+  const link = devices.createCode('phone');
+  const before = devices.size;
+  await shoot('65-phone-pair-link-dark', {
+    ...phone,
+    dark: true,
+    path: `${PAIR_PATH}#${link.code}`,
+    ready: '.pair-card',
+    device: null,
+    act: async (page) => {
+      if (page.url().includes(link.code)) problems.push('pair: the code stayed in the address bar');
+      if (await page.locator('.pair-card input[placeholder]').count()) problems.push('pair: asked for a code it already had');
+    },
+    after: async (page, seen) => {
+      await page.locator('.pair-card button[type="submit"]').click();
+      // A paired browser lands on Home; the chats are one tap away.
+      await page.waitForSelector('.home-tile', { timeout: 10_000 });
+      if (new URL(page.url()).pathname !== '/') problems.push(`pair: landed on ${page.url()}, not Home`);
+      await page.goto(ORIGIN + '/chats');
+      await page.waitForSelector('.row', { timeout: 10_000 });
+      const cookie = (await page.context().cookies()).find((c) => c.name === DEVICE_COOKIE);
+      if (!cookie?.httpOnly || cookie.sameSite !== 'Strict') problems.push('pair: device cookie missing or not HttpOnly/Strict');
+      if (devices.size !== before + 1) problems.push('pair: no device was added');
+      if (seen.urls.some((u) => u.includes(link.code))) problems.push('pair: the code went into a URL');
+    },
+  });
+
+  // ---- The shell, the status block and Status & power ---------------------
+  // The same demo data, at the two widths and in both themes the app supports.
+  const roleNames = /^(Manager|Agent|Coder|Reviewer|Scout|Voice), (idle|working|needs you|stuck|finished)$/;
+
+  const checkShell = async (page: Page, where: string) => {
+    const tiles = await page.locator('.team-row .role-tile').evaluateAll((els) => els.map((el) => el.getAttribute('aria-label') ?? ''));
+    if (tiles.length !== 6) problems.push(`${where}: ${tiles.length} role tiles, not 6`);
+    if (!tiles.every((label) => roleNames.test(label))) problems.push(`${where}: role tile names ${tiles.join(' | ')}`);
+    await page.waitForSelector('.team-row .role-badge');
+    const shadows = await page.locator('.team-row .role-badge').evaluateAll((elements) =>
+      elements.map((element) => (globalThis as unknown as BrowserStyles).getComputedStyle(element).boxShadow),
+    );
+    if (!shadows.length || shadows.some((shadow) => !shadow.includes('0px 0px 0px 2px'))) {
+      problems.push(`${where}: the role badges lost their surface ring`);
+    }
+    const nav = await page.locator(where === 'phone' ? '.tabbar .nav-row' : '.sidebar .nav-row').allInnerTexts();
+    const labels = nav.map((row) => row.replace(/\s+/g, ' ').trim());
+    // Home, Chats, Tasks, Schedule, Team, then Settings; a count may follow a name.
+    if (!labels.every((label) => /^(Home|Chats|Tasks|Schedule|Team|Settings)( \d+\+?)?$/.test(label))) {
+      problems.push(`${where}: nav rows ${labels.join(' | ')}`);
+    }
+    const block = page.locator('.status-block');
+    if ((await block.getAttribute('href')) !== '/settings/status') problems.push(`${where}: the status block link`);
+    if (!(await block.innerText()).includes('needs a look') && !(await block.innerText()).toLowerCase().includes('running')) {
+      problems.push(`${where}: status line "${await block.innerText()}"`);
+    }
+    if (await page.locator('.status-block .pip.off').count()) problems.push(`${where}: the block says status is unavailable`);
+  };
+
+  await shoot('70-desktop-home-light', {
+    width: 1280,
+    height: 820,
+    dark: false,
+    path: '/',
+    ready: '.home-tile',
+    act: async (page) => {
+      if (!(await page.locator('.sidebar').count())) problems.push('desktop: no sidebar');
+      await checkShell(page, 'desktop');
+      const greeting = await page.locator('.home-head h1').innerText();
+      if (!/^Good (morning|afternoon|evening)$/.test(greeting)) problems.push(`home greeting: "${greeting}"`);
+      const summary = await page.locator('.home-summary').innerText();
+      if (!summary.includes('need') && !summary.includes('Nothing needs you')) problems.push(`home summary: ${summary}`);
+      const tiles = (await page.locator('.home-tile .tile-label').allInnerTexts()).map((t) => t.toLowerCase());
+      if (tiles.join() !== 'needs you,working now,done today,coming up') problems.push(`home tiles: ${tiles.join()}`);
+      await checkContrast(page, '.sidebar .role-tile', 3, 'light sidebar role glyphs');
+    },
+  });
+  await shoot('71-desktop-home-dark', {
+    width: 1280, height: 820, dark: true, path: '/', ready: '.home-tile',
+    act: (page) => checkContrast(page, '.sidebar .role-tile', 3, 'dark sidebar role glyphs'),
+  });
+  await shoot('72-desktop-chats-light', {
+    width: 1280,
+    height: 820,
+    dark: false,
+    path: '/chats',
+    ready: '.row',
+    act: async (page) => {
+      await page.waitForSelector('.sidebar .nav-row');
+      await checkShell(page, 'desktop');
+      // The Chats row counts what waits for you, in "needs you" colour.
+      const badge = page.locator('.sidebar .nav-row', { hasText: 'Chats' }).locator('.nav-count');
+      if (await badge.count()) {
+        const count = (await badge.innerText()).trim();
+        if (!/^\d+\+?$/.test(count)) problems.push(`desktop: the chats count says "${count}"`);
+      }
+    },
+  });
+  await shoot('73-phone-home-light', {
+    ...phone,
+    dark: false,
+    path: '/',
+    ready: '.home-tile',
+    act: async (page) => {
+      if (await page.locator('.sidebar').count()) problems.push('phone: the sidebar is still in the document');
+      await checkShell(page, 'phone');
+      const bar = await page.locator('.tabbar > *').count();
+      if (bar !== 5) problems.push(`phone: the bottom bar has ${bar} places, not 5`);
+      if (!(await page.locator('.tabbar button[aria-label="New task"]').count())) problems.push('phone: no New task on the bar');
+      await checkContrast(page, '.tab-new', 3, 'light New task icon');
+      await checkContrast(page, '.page-home .role-tile', 3, 'light Home role glyphs');
+    },
+  });
+  await shoot('74-phone-home-dark', {
+    ...phone, dark: true, path: '/', ready: '.home-tile',
+    act: async (page) => {
+      await checkContrast(page, '.tab-new', 3, 'dark New task icon');
+      await checkContrast(page, '.page-home .role-tile', 3, 'dark Home role glyphs');
+    },
+  });
+  await shoot('75-phone-team-dark', {
+    ...phone,
+    dark: true,
+    path: '/team',
+    ready: '.team-card',
+    act: async (page) => {
+      const cards = await page.locator('.team-card h2').allInnerTexts();
+      if (cards.join() !== 'Manager,Agent,Coder,Reviewer,Scout,Voice') problems.push(`team: ${cards.join()}`);
+    },
+  });
+  await shoot('76-desktop-settings-light', {
+    width: 1280,
+    height: 900,
+    dark: false,
+    path: '/settings',
+    ready: '.page-settings',
+    act: async (page) => {
+      const groups = (await page.locator('.settings-group > .side-label').allInnerTexts()).map((g) => g.toLowerCase());
+      if (groups.join() !== 'overview,you,your ai,work,safety & access,this pc') {
+        problems.push(`settings groups: ${groups.join(' | ')}`);
+      }
+      // Every place under a group is a page of its own, reached by a row.
+      const rows = (await page.locator('.settings-link').allInnerTexts()).map((row) => row.replace(/\s+/g, ' '));
+      for (const want of ['Connectors', 'Skills', 'Scheduled jobs', 'Devices', 'Status & power']) {
+        if (!rows.some((row) => row.includes(want))) problems.push(`settings row "${want}" missing (${rows.join(' | ')})`);
+      }
+      await page.locator('.settings-link', { hasText: 'Status & power' }).click();
+      await page.waitForURL('**/settings/status');
+      await page.goBack();
+      await page.waitForSelector('.page-settings');
+      // The search narrows the groups; "status" means the connection and the page.
+      await page.fill('input[aria-label="Search settings"]', 'status');
+      const matched = (await page.locator('.settings-group:visible > .side-label').allInnerTexts()).map((g) => g.toLowerCase());
+      if (matched.join() !== 'overview,this pc') problems.push(`settings search: ${matched.join(' | ')} match "status"`);
+      if (await page.locator('.settings-empty').count()) problems.push('settings search: false empty message for status');
+      if (await page.locator('.settings-group[hidden]:visible').count()) problems.push('settings search: filtered groups are visible');
+
+      let releaseAgents!: () => void;
+      const pendingAgents = new Promise<void>((resolve) => { releaseAgents = resolve; });
+      await page.route('**/api/cloud-agents', async (route) => {
+        await pendingAgents;
+        await route.fulfill({ json: { agents: [{ id: 'claude', label: 'Demo delayed cloud agent', enabled: true, state: 'ready' }] } });
+      });
+      await page.reload();
+      await page.waitForSelector('.page-settings');
+      await page.fill('input[aria-label="Search settings"]', 'Demo delayed cloud agent');
+      await page.locator('.settings-empty').waitFor();
+      releaseAgents();
+      await page.getByRole('switch', { name: 'Demo delayed cloud agent' }).waitFor();
+      if (await page.locator('.settings-empty').count()) problems.push('settings search: delayed agent label was not indexed');
+      await page.unroute('**/api/cloud-agents');
+      await page.fill('input[aria-label="Search settings"]', '');
+      await page.locator('.page-settings .group').first().scrollIntoViewIfNeeded();
+    },
+  });
+
+  await shoot('77-phone-power-dark', {
+    ...phone,
+    dark: true,
+    path: '/settings/status',
+    ready: '.power-card:not(.power-none)',
+    act: async (page) => {
+      await checkContrast(page, '.state-chip.ok', 4.5, 'dark Running chip');
+      const chips = await page.locator('.state-chip').allInnerTexts();
+      if (!chips.includes('Running') || !chips.includes('Held')) problems.push(`power chips: ${chips.join(', ')}`);
+      if (!(await page.locator('.power-card', { hasText: 'Main model' }).innerText()).includes('Restart')) {
+        problems.push('power: the main model has no main action');
+      }
+      // Ports and units stay one level down.
+      if (await page.locator('.power-facts').first().isVisible()) problems.push('power: details are not folded');
+      await page.locator('.power-card', { hasText: 'Main model' }).locator('summary').click();
+      await page.locator('.power-card', { hasText: 'Main model' }).locator('.power-facts code').first().waitFor();
+      await page.locator('.power-card', { hasText: 'Main model' }).scrollIntoViewIfNeeded();
+    },
+  });
+
+  // An action that is running: the banner, and the lines it prints under "Show progress".
+  await shoot('78-desktop-power-running-light', {
+    width: 1280,
+    height: 860,
+    dark: false,
+    path: '/settings/status',
+    ready: '.power-card:not(.power-none)',
+    act: async (page) => {
+      await checkContrast(page, '.state-chip.ok', 4.5, 'light Running chip');
+      const model = page.locator('.power-card', { hasText: 'Main model' });
+      await model.locator('button', { hasText: 'Switch model' }).click();
+      await page.locator('.power-menu [role="menuitem"]', { hasText: 'Balanced model' }).click();
+      await page.locator('.power-menu [role="menuitem"]', { hasText: 'When idle' }).click();
+      await page.locator('.power-banner').waitFor();
+      await page.locator('.power-banner button', { hasText: 'Show progress' }).click();
+      await until(
+        'progress lines',
+        async () => ((await page.locator('.power-lines pre').count()) ? (await page.locator('.power-lines pre').innerText()).includes('…') : false),
+        12_000,
+      );
+      if (!(await page.locator('.power-banner').innerText()).toLowerCase().includes('switch')) {
+        problems.push(`power banner: ${await page.locator('.power-banner').innerText()}`);
+      }
+    },
+    after: async (page) => {
+      await page.locator('.power-result').waitFor({ timeout: 25_000 });
+      if (!(await page.locator('.power-banner').innerText()).includes('Switch model finished.')) problems.push('power: no final switch result');
+      const live = await page.locator('.status-detail').first().innerText();
+      if (!live.includes('Balanced model')) problems.push(`the block still names the old model: ${live}`);
+    },
+  });
+
+  // A phone taps once to ask, and confirms before anything happens.
+  let phoneConfirmToken: string | undefined;
+  await shoot('79-phone-power-confirm-light', {
+    ...phone,
+    dark: false,
+    path: '/settings/status',
+    ready: '.power-card:not(.power-none)',
+    device: demoPhone.cookie,
+    act: async (page, seen) => {
+      // The paired phone gets a confirm tap from the server before anything happens.
+      power.reset();
+      await page.waitForURL((url) => url.pathname === '/settings/status');
+      await page.reload();
+      await page.waitForSelector('.power-card:not(.power-none)');
+      const coder = page.locator('.power-card', { hasText: 'Second model' });
+      await coder.locator('button', { hasText: 'Restart' }).click();
+      // A restart asks when: now, or when nothing is mid-turn.
+      const confirmation = page.waitForResponse((res) => res.url().endsWith('/api/power/actions') && res.status() === 202);
+      await page.locator('.power-menu [role="menuitem"]', { hasText: 'Now' }).click();
+      phoneConfirmToken = ((await (await confirmation).json()) as { confirm: string }).confirm;
+      const dialog = page.locator('[role="alertdialog"]');
+      await dialog.waitFor();
+      const text = await dialog.innerText();
+      // The server's own sentence for the tap (power.ts confirmSummary).
+      if (!/restart the second model\?/i.test(text)) problems.push(`confirm sheet: ${text}`);
+      const asked = seen.posts.filter((body) => body.includes('"target":"coder"'));
+      if (asked.length !== 1) problems.push(`confirm sheet: ${asked.length} asks sent, want one`);
+      if (asked[0]?.includes('confirm')) problems.push('confirm sheet: a token was sent before there was one');
+    },
+    after: async (page, seen) => {
+      await page.locator('[role="alertdialog"] button', { hasText: 'Run it' }).click();
+      await page.locator('.power-banner').waitFor();
+      const restart = page.locator('.power-card', { hasText: 'Second model' }).getByRole('button', { name: 'Restart', exact: true });
+      if (!(await restart.evaluate((element) => element === element.ownerDocument.activeElement))) {
+        problems.push('phone confirm: focus did not return to Restart');
+      }
+      const asked = seen.posts.filter((body) => body.includes('"target":"coder"'));
+      if (asked.length !== 2) problems.push(`phone confirm: ${asked.length} requests, want the ask and the resend`);
+      if (!asked[1]?.includes('"confirm"')) problems.push('phone confirm: the resend carried no token');
+      const expected = { verb: 'restart', target: 'coder', when: 'now', confirm: phoneConfirmToken };
+      if (!phoneConfirmToken || asked[1] !== JSON.stringify(expected)) {
+        problems.push(`phone confirm: the resend did not match the exact request and issued token`);
+      }
+      await page.locator('.power-result').waitFor({ timeout: 25_000 });
+      if (!(await page.locator('.power-banner').innerText()).includes('Restart finished.')) problems.push('power: no final restart result');
+      power.reset();
+    },
+  });
+
+  await shoot('80-desktop-wide-pages-light', {
+    width: 900, height: 900, dark: false, path: '/settings/connectors', ready: '.sheet-page.sheet-wide',
+    act: async (page) => {
+      for (const path of ['/settings/connectors', '/settings/skills']) {
+        for (const width of [720, 900, 1280]) {
+          await page.setViewportSize({ width, height: 900 });
+          await page.goto(ORIGIN + path);
+          await page.waitForSelector('.sheet-page.sheet-wide');
+          const overflow = await page.locator('.sheet-page').evaluate((element) => {
+            const column = element.parentElement!.getBoundingClientRect();
+            const page = element.getBoundingClientRect();
+            return Math.max(page.right - column.right, column.left - page.left, element.scrollWidth - element.clientWidth);
+          });
+          if (overflow > 1) problems.push(`${path} at ${width}px: page overflows its column by ${overflow}px`);
+        }
+      }
+      await page.setViewportSize({ width: 900, height: 900 });
+      for (const name of ['Connectors', 'Skills', 'Archived threads']) {
+        const path = `/settings/${name === 'Archived threads' ? 'archived' : name.toLowerCase()}`;
+        await page.goto(ORIGIN + '/chats?filter=attention');
+        await page.waitForSelector('.inbox-tools');
+        await page.getByRole('link', { name: 'Settings', exact: true }).click();
+        if (name === 'Archived threads') {
+          await page.locator('.tidy-settings .kv', { hasText: name }).getByRole('button', { name: 'View', exact: true }).click();
+        } else {
+          await page.locator('.settings-link', { hasText: name }).click();
+        }
+        await page.waitForURL(ORIGIN + path);
+        const inAppLength = await page.evaluate('history.length');
+        await page.getByRole('button', { name: 'Back', exact: true }).click();
+        await page.waitForURL(ORIGIN + '/settings');
+        if ((await page.evaluate('history.length')) !== inAppLength) problems.push(`${path}: Back added a history entry`);
+        await page.goBack();
+        await page.waitForURL(ORIGIN + '/chats?filter=attention');
+
+        await page.goto(ORIGIN + path);
+        await page.waitForSelector('.sheet-page');
+        const directLength = await page.evaluate('history.length');
+        await page.getByRole('button', { name: 'Back', exact: true }).click();
+        await page.waitForURL(ORIGIN + '/settings');
+        if ((await page.evaluate('history.length')) !== directLength) problems.push(`${path}: direct Back added a history entry`);
+        await page.goBack();
+        await page.waitForURL(ORIGIN + '/chats?filter=attention');
+      }
+      await page.goto(ORIGIN + '/settings/connectors');
+      await page.waitForSelector('.sheet-page.sheet-wide');
+    },
+  });
+
+  // Settings → Safety & access: "Workers' approvals come to me".
+  await shoot('81-desktop-settings-safety-light', {
+    width: 1280,
+    height: 900,
+    dark: false,
+    path: '/settings',
+    ready: '.worker-approvals',
+    act: async (page) => {
+      const row = page.locator('.worker-approvals');
+      await row.scrollIntoViewIfNeeded();
+      const text = await row.innerText();
+      if (!text.includes('can’t answer another agent’s permission request')) problems.push(`safety: what it protects is missing: ${text}`);
+      if (!text.includes('keep their old limits until they restart') || !text.includes('guardrail')) problems.push('safety: the known gaps are not said');
+      if (!text.includes('Not covered: demo-plugin')) problems.push('safety: uncovered providers are not listed');
+      const toggle = row.getByRole('switch', { name: "Workers' approvals come to me" });
+      if ((await toggle.getAttribute('aria-checked')) !== 'true') problems.push('safety: not on by default');
+      if (await toggle.isDisabled()) problems.push('safety: the paired desktop cannot change it');
+    },
+    after: async (page) => {
+      // Turning it off asks first; it then says so, and goes back on in one tap.
+      const toggle = page.locator('.worker-approvals').getByRole('switch', { name: "Workers' approvals come to me" });
+      await toggle.click();
+      await page.locator('[role="alertdialog"] button', { hasText: 'Turn off' }).click();
+      await until('safety off', async () => (await toggle.getAttribute('aria-checked')) === 'false', 5_000);
+      if (!(await page.locator('.worker-approvals').innerText()).includes('Off: an agent that starts other agents')) {
+        problems.push('safety: the off state is not described');
+      }
+      await toggle.click();
+      await until('safety on again', async () => (await toggle.getAttribute('aria-checked')) === 'true', 5_000);
+      const hermes = page.getByRole('switch', { name: 'Hermes safety commands' });
+      if (await hermes.isDisabled()) problems.push('safety commands: the paired desktop cannot change them');
+      await hermes.click();
+      await page.locator('[role="alertdialog"] button', { hasText: 'Allow' }).click();
+      await until('Hermes safety commands on', async () => (await hermes.getAttribute('aria-checked')) === 'true', 5_000);
+      await hermes.click();
+      await until('Hermes safety commands off', async () => (await hermes.getAttribute('aria-checked')) === 'false', 5_000);
+    },
+  });
+  await shoot('82-phone-settings-safety-dark', {
+    ...phone,
+    dark: true,
+    path: '/settings',
+    ready: '.worker-approvals',
+    device: demoPhone.cookie,
+    act: async (page) => {
+      const row = page.locator('.worker-approvals');
+      await row.scrollIntoViewIfNeeded();
+      if (!(await row.getByRole('switch').isDisabled())) problems.push('safety: a phone can change it');
+      if (!(await row.innerText()).includes('Change this on a paired desktop.')) problems.push('safety: the phone is not told where to change it');
+      const hermes = page.getByRole('switch', { name: 'Hermes safety commands' });
+      if (!(await hermes.isDisabled())) problems.push('safety commands: a phone can change them');
+      if (!(await hermes.locator('..').innerText()).includes('Change this on a paired desktop.')) problems.push('safety commands: missing phone instructions');
+      const cloud = page.locator('.cloud-agents');
+      for (const toggle of await cloud.getByRole('switch').all()) {
+        if (!(await toggle.isDisabled())) problems.push('cloud agents: a phone can change a provider');
+      }
+      if (!(await cloud.innerText()).includes('Change this on a paired desktop.')) problems.push('cloud agents: missing phone instructions');
+    },
+  });
+
+  await shoot('62-phone-shadow-trigger-light', {
+    ...phone,
+    dark: false,
+    path: '/chats',
+    ready: '.row',
+    act: async (page) => {
+      await page.route('**/api/triggers', (route) => route.fulfill({ json: {
+        ready: true, targets: [{ id: 'local', label: 'Only in Hermes' }],
+        triggers: [{ id: 'fake-shadow-trigger', name: 'Demo mail', query: 'label:demo', action: 'Describe demo mail',
+          every: 15, deliver: 'local', paused: true, role: 'shadow', inactiveReason: 'Created in shadow, inactive' }],
+      } }));
+      await openConnectors(page);
+      const row = page.locator('.trigger-row', { hasText: 'Demo mail' });
+      await row.getByText('Created in shadow, inactive').waitFor();
+      if (!(await row.locator('[role="switch"]').isDisabled())) problems.push('shadow trigger: resume switch enabled');
+      await row.scrollIntoViewIfNeeded();
+    },
+  });
+
+  await shoot('63-desktop-shadow-schedule-dark', {
+    width: 1280,
+    height: 900,
+    dark: true,
+    path: '/chats',
+    ready: '.row',
+    act: async (page) => {
+      await page.route('**/api/schedules', async (route) => {
+        const response = await route.fetch();
+        const data = await response.json();
+        const demo = data.jobs.find((job: { source: string }) => job.source === 'hermes');
+        data.jobs = [{ ...demo, name: 'Demo mail', title: 'Demo mail',
+          trigger: true, script: true, state: 'paused', inactiveReason: 'Created in shadow, inactive' }];
+        await route.fulfill({ json: data });
+      });
+      await page.click('button[aria-label="Settings"]');
+      await page.locator('.settings-link', { hasText: 'Scheduled jobs' }).click();
+      const job = page.locator('.schedule-job', { hasText: 'Demo mail' });
+      await job.waitFor();
+      await job.locator('.schedule-head').click();
+      if (!(await job.innerText()).includes('Created in shadow, inactive')) problems.push('shadow schedule: inactive label missing');
+      if (!(await job.locator('[role="switch"]').isDisabled())) problems.push('shadow schedule: resume switch enabled');
+      if (!(await job.getByRole('button', { name: 'Run now' }).isDisabled())) problems.push('shadow schedule: Run now enabled');
     },
   });
 

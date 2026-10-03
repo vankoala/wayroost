@@ -1,0 +1,222 @@
+/* Wayroost M1 design tokens. Single source for colour, type,
+   shape, space, depth and motion. Components use these, never literals.
+
+   The OS theme is followed by default; Settings → App can force light or dark by
+   putting data-theme="light" | data-theme="dark" on <html> (see theme.ts). */
+
+:root {
+  color-scheme: light;
+
+  /* colour — light (warm paper) */
+  --bg: #f2ede3;
+  --sidebar: #ebe4d7;
+  --surface: #fbf8f2;
+  --surface-2: #f4efe6;
+  --ink: #2a241d;
+  --ink-2: #6b6052;
+  --ink-3: #74685a;
+  --line: #e0d7c7;
+  --accent: #4b2a45;
+  --on-accent: #fffaf3;
+  --nav-active: #e4d8d8;
+  /* Derived hover wash. Mixed from --ink and --surface-2 on :root, so it
+     follows whichever palette is active and differs from --bg, --surface and --surface-2
+     in both themes (about 1.1:1 against --bg in light, 1.4:1 in dark). */
+  --hover: color-mix(in srgb, var(--ink) 6%, var(--surface-2));
+  /* Derived secondary and metadata text on a hovered or selected row. --ink-2
+     and --ink-3 drop below 4.5:1 on --hover and --nav-active (4.42:1 for --ink-2 on the light
+     --nav-active, 3.93:1 for --ink-3 on the dark --hover), so they are pulled towards --ink;
+     like --hover they follow the active palette. Lowest: 5.35:1 light, 5.45:1 dark. */
+  --ink-2-on-state: color-mix(in srgb, var(--ink-2) 75%, var(--ink));
+  --ink-3-on-state: color-mix(in srgb, var(--ink-3) 70%, var(--ink));
+  --btn-line: #d4c9b6;
+  --need: #b4472a;
+  --need-bg: #f6e0d6;
+  --ok: #4f7a55;
+  /* --ok as text on a surface: readable at body size */
+  --ok-ink: #456c4b;
+  --bad: #a8432f;
+  --banner-bg: #e9e1d0;
+  --tile-needs: #f3dccf;
+  --tile-working: #dde6d6;
+  --tile-done: #f0e2bf;
+  --tile-coming: #e6dce8;
+  --role-manager: #8a5a83;
+  --role-agent: #5f7f9c;
+  --role-coder: #6f8f73;
+  --role-reviewer: #a8744a;
+  --role-scout: #8c7a3a;
+  --role-voice: #8d5a62;
+  --role-glyph: #fffaf3;
+
+  /* Existing source/status colours, until these screens use the role tiles. */
+  --surface-glass: color-mix(in srgb, var(--bg) 86%, transparent);
+  --source-hermes: #b8780f;
+  --source-hermes-bg: rgba(212, 140, 20, 0.12);
+  --source-paseo: #0d8f7c;
+  --source-paseo-bg: rgba(13, 143, 124, 0.1);
+  --warning: #b36b00;
+  --warning-bg: rgba(245, 160, 40, 0.1);
+  --warning-border: rgba(200, 120, 0, 0.4);
+  --error-bg: rgba(210, 60, 60, 0.08);
+
+  /* type — faces are bundled locally (@fontsource), never loaded from the internet */
+  --font-display: 'Young Serif', Georgia, serif;
+  --font-body: 'Figtree', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-wordmark: 'Outfit', 'Figtree', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-code: ui-monospace, Consolas, monospace;
+  --text-meta: 12px;
+  --text-body: 14px;
+  --text-emphasized: 15px;
+  --text-card-title: 17.6px;
+  --text-dialog-title: 20px;
+  --text-page-title: 32px;
+  --text-tile-number: 37px;
+
+  /* shape, space, depth */
+  --radius-card: 16px;
+  --radius-control: 10px;
+  --radius-tile: 11px;
+  --radius-chip: 6px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 22px;
+  --space-6: 30px;
+  --border-width: 1px;
+  --border-width-approval: 1.5px;
+  --shadow: 0 1px 2px rgba(60, 40, 20, 0.05);
+
+  /* motion */
+  --motion-fast: 150ms;
+  --motion-slow: 200ms;
+  --ease-motion: ease-out;
+
+  /* Names the shell and the approval cards use, as aliases of the tokens
+     above. Change the token, never the alias. */
+  --font-ui: var(--font-body);
+  --font-mono: var(--font-code);
+  --text-body-lg: var(--text-emphasized);
+  --text-page-title-phone: 26px;
+  --radius-inset: var(--radius-control);
+  --radius-pill: 999px;
+  --gap-card: var(--space-4);
+  --label-tracking: 0.07em;
+  --shadow-card: var(--shadow);
+  --motion-ease: var(--ease-motion);
+  --sidebar-width: 210px;
+  --tabbar-height: 60px;
+  /* …and the approval cards. */
+  --text-body-em: var(--text-emphasized);
+  --need-border-width: var(--border-width-approval);
+  --motion: var(--motion-slow);
+  --ease: var(--ease-motion);
+}
+
+/* A role badge's ring is the colour of the surface around it, so it is resolved here. */
+.role-badge {
+  --shadow-badge: 0 0 0 2px var(--tile-ring);
+}
+
+/* colour — dark (warm brown-black), when the OS is dark and the user did not pick light */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --bg: #1c1814;
+    --sidebar: #191512;
+    --surface: #25201a;
+    --surface-2: #2c261f;
+    --ink: #efe7da;
+    --ink-2: #b8ab98;
+    --ink-3: #9a8d7c;
+    --line: #3a3229;
+    --accent: #d2a6c8;
+    --on-accent: #1c1814;
+    --nav-active: #33262f;
+    --btn-line: #4a4035;
+    --need: #e3794f;
+    --need-bg: #3a241c;
+    --ok: #8fb093;
+    --ok-ink: #8fb093;
+    --bad: #e07a63;
+    --banner-bg: #2a241d;
+    --tile-needs: #3a271e;
+    --tile-working: #26302a;
+    --tile-done: #352c1a;
+    --tile-coming: #2f2733;
+    --role-manager: #c08ab6;
+    --role-agent: #93afcb;
+    --role-coder: #9cbb9f;
+    --role-reviewer: #d39a6c;
+    --role-scout: #cdb66a;
+    --role-voice: #d495a0;
+    --role-glyph: #1c1814;
+    --source-hermes: #f2b54a;
+    --source-hermes-bg: rgba(242, 181, 74, 0.14);
+    --source-paseo: #35c9b0;
+    --source-paseo-bg: rgba(53, 201, 176, 0.14);
+    --warning: #f5b041;
+    --warning-bg: rgba(245, 176, 65, 0.1);
+    --warning-border: rgba(245, 176, 65, 0.45);
+    --error-bg: rgba(242, 114, 114, 0.12);
+    --shadow: none;
+  }
+}
+
+/* Forced dark from Settings → App */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #1c1814;
+  --sidebar: #191512;
+  --surface: #25201a;
+  --surface-2: #2c261f;
+  --ink: #efe7da;
+  --ink-2: #b8ab98;
+  --ink-3: #9a8d7c;
+  --line: #3a3229;
+  --accent: #d2a6c8;
+  --on-accent: #1c1814;
+  --nav-active: #33262f;
+  --btn-line: #4a4035;
+  --need: #e3794f;
+  --need-bg: #3a241c;
+  --ok: #8fb093;
+  --ok-ink: #8fb093;
+  --bad: #e07a63;
+  --banner-bg: #2a241d;
+  --tile-needs: #3a271e;
+  --tile-working: #26302a;
+  --tile-done: #352c1a;
+  --tile-coming: #2f2733;
+  --role-manager: #c08ab6;
+  --role-agent: #93afcb;
+  --role-coder: #9cbb9f;
+  --role-reviewer: #d39a6c;
+  --role-scout: #cdb66a;
+  --role-voice: #d495a0;
+  --role-glyph: #1c1814;
+  --source-hermes: #f2b54a;
+  --source-hermes-bg: rgba(242, 181, 74, 0.14);
+  --source-paseo: #35c9b0;
+  --source-paseo-bg: rgba(53, 201, 176, 0.14);
+  --warning: #f5b041;
+  --warning-bg: rgba(245, 176, 65, 0.1);
+  --warning-border: rgba(245, 176, 65, 0.45);
+  --error-bg: rgba(242, 114, 114, 0.12);
+  --shadow: none;
+}
+
+@media (width < 720px) {
+  :root {
+    --text-page-title: 26px;
+  }
+}
+
+/* honour prefers-reduced-motion: no pulse, no bob */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-slow: 0ms;
+  }
+}

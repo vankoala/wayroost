@@ -1,7 +1,9 @@
+import { checkDeviceSignal, actionSignal } from '../security/device-signal.js';
 import { createCipheriv, createECDH, createHmac, createPrivateKey, generateKeyPairSync, randomBytes, sign, type KeyObject } from 'node:crypto';
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { z } from 'zod';
+import { shadowBackground, type BackgroundGate } from '../background.js';
 
 // Phone notifications (Web Push). Signalbox signs each request to the browser's
 // push service with its own key (VAPID, RFC 8292) and encrypts the message so
@@ -125,6 +127,7 @@ export class PushSender {
   private readonly path: string;
   private file: PushFile;
   private readonly key: KeyObject;
+  private persisted = false;
 
   constructor(
     stateDir: string,
@@ -132,6 +135,7 @@ export class PushSender {
     private readonly subject: string,
     private readonly log: PushLog,
     private readonly fetchImpl: typeof fetch = fetch,
+    private readonly background: BackgroundGate = shadowBackground,
   ) {
     this.path = join(stateDir, FILE);
     [this.file, this.key] = this.load();
@@ -143,6 +147,7 @@ export class PushSender {
       if (raw.vapid?.d && raw.vapid.x && raw.vapid.y) {
         const vapid = { kty: 'EC', crv: 'P-256', d: raw.vapid.d, x: raw.vapid.x, y: raw.vapid.y };
         const key = createPrivateKey({ key: vapid, format: 'jwk' });
+        this.persisted = true;
         return [{ vapid, devices: Array.isArray(raw.devices) ? raw.devices : [] }, key];
       }
     } catch (err) {
@@ -152,28 +157,34 @@ export class PushSender {
       }
     }
     // Keep what was there (push.json.bad) rather than writing over the only copy.
-    if (existsSync(this.path)) {
-      try {
-        renameSync(this.path, `${this.path}.bad`);
-      } catch {
-        // can't move it: the new file replaces it
+    this.background.run(() => {
+      if (existsSync(this.path)) {
+        try {
+          renameSync(this.path, `${this.path}.bad`);
+        } catch {
+          // can't move it: the new file replaces it
+        }
       }
-    }
+    });
     const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
     const jwk = privateKey.export({ format: 'jwk' }) as PushFile['vapid'];
     const file: PushFile = { vapid: { kty: 'EC', crv: 'P-256', d: jwk.d, x: jwk.x, y: jwk.y }, devices: [] };
-    this.write(file);
+    this.background.run(() => this.write(file));
     return [file, privateKey];
   }
 
   private write(file: PushFile): void {
+    checkDeviceSignal();
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;
     writeFileSync(tmp, JSON.stringify(file), { mode: 0o600 });
     renameSync(tmp, this.path);
+    this.persisted = true;
   }
 
   /** The public key browsers subscribe with (uncompressed P-256 point, base64url). */
   publicKey(): string {
+    if (!this.persisted) this.write(this.file);
     const x = Buffer.from(this.file.vapid.x, 'base64url');
     const y = Buffer.from(this.file.vapid.y, 'base64url');
     return Buffer.concat([Buffer.from([4]), x, y]).toString('base64url');
@@ -185,6 +196,7 @@ export class PushSender {
 
   /** Remember a browser's subscription (replacing one with the same endpoint). Returns the device count. */
   add(input: PushSubscriptionInput, now = Date.now()): number {
+    checkDeviceSignal();
     const problem = endpointProblem(input.endpoint);
     if (problem) throw new RangeError(problem);
     const p256dh = Buffer.from(input.keys.p256dh, 'base64url');
@@ -204,6 +216,7 @@ export class PushSender {
   }
 
   remove(endpoint: string): number {
+    checkDeviceSignal();
     const devices = this.file.devices.filter((d) => d.endpoint !== endpoint);
     if (devices.length !== this.file.devices.length) {
       this.file = { ...this.file, devices };
@@ -221,7 +234,8 @@ export class PushSender {
   }
 
   /** Send to every device. Ones the push service says are gone (404/410) are forgotten. */
-  async send(message: PushMessage, now = Date.now()): Promise<{ sent: number; failed: number; removed: number }> {
+  async send(message: PushMessage, now = Date.now(), requested = false): Promise<{ sent: number; failed: number; removed: number }> {
+    if (!requested && !this.background.run(() => true)) return { sent: 0, failed: 0, removed: 0 };
     const payload = Buffer.from(
       JSON.stringify({ title: message.title, body: message.body, url: message.url, tag: message.tag }),
       'utf8',
@@ -242,6 +256,7 @@ export class PushSender {
             Buffer.from(device.p256dh, 'base64url'),
             Buffer.from(device.auth, 'base64url'),
           );
+          checkDeviceSignal();
           const res = await this.fetchImpl(device.endpoint, {
             method: 'POST',
             headers: {
@@ -254,7 +269,7 @@ export class PushSender {
             },
             body,
             redirect: 'error',
-            signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+            signal: actionSignal(AbortSignal.timeout(SEND_TIMEOUT_MS)),
           });
           // Nothing to read in the answer: let the connection go.
           await res.body?.cancel().catch(() => {});

@@ -1,7 +1,9 @@
+import { checkDeviceSignal } from '../security/device-signal.js';
 import { createHash } from 'node:crypto';
-import { readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { z } from 'zod';
+import { INVISIBLE } from '../../../shared/invisible.js';
 import {
   FEED_KINDS,
   PROACTIVITY_LEVELS,
@@ -44,15 +46,6 @@ interface FeedFile {
   /** Approvals already sent to the phone, so a restart doesn't send them again. */
   notified: string[];
 }
-
-/**
- * Controls, and characters that hide or reorder text: the set web/src/reveal.ts
- * shows on approvals (soft hyphen, bidi controls, zero-width and joiners,
- * invisible separators and fillers, variation selectors, BOM), plus Unicode tag
- * characters, which no screen shows but a model reads as text.
- */
-const INVISIBLE =
-  /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb\u{e0000}-\u{e007f}]/gu;
 
 /** One line of plain text: no hidden characters or links, whitespace collapsed, at most `max` characters. */
 export function oneLine(text: string, max: number): string {
@@ -122,6 +115,8 @@ export class FeedStore {
   }
 
   private save(): void {
+    checkDeviceSignal();
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.file), { mode: 0o600 });
     renameSync(tmp, this.path);
@@ -207,6 +202,7 @@ export class FeedStore {
     status: FeedStatus,
     extra: { laterUntil?: number; chat?: FeedCard['chat'] } = {},
   ): FeedCard | undefined {
+    checkDeviceSignal();
     const card = this.get(id);
     if (!card) return undefined;
     card.status = status;
@@ -218,8 +214,30 @@ export class FeedStore {
     return card;
   }
 
+  /**
+   * Close the card with this key because what it was about is over (an overdue
+   * worker finished). Only an open card (new, seen or put off) changes; one you
+   * finished or turned down stays as you left it. Returns the card if it changed.
+   */
+  close(key: string): FeedCard | undefined {
+    const card = this.file.cards.find((c) => c.key === key);
+    if (!card || !(card.status === 'new' || card.status === 'seen' || card.status === 'later')) return undefined;
+    const previous = { ...card };
+    card.status = 'done';
+    card.updatedAt = this.now();
+    delete card.laterUntil;
+    try { this.save(); }
+    catch (error) {
+      // Keep the card open so a later close retries persistence before clearing its task key.
+      Object.assign(card, previous);
+      throw error;
+    }
+    return card;
+  }
+
   /** New cards become seen once you've opened For you. Returns the ones that changed. */
   markSeen(): FeedCard[] {
+    checkDeviceSignal();
     const changed = this.file.cards.filter((c) => c.status === 'new');
     if (!changed.length) return [];
     for (const card of changed) card.status = 'seen';
@@ -242,12 +260,14 @@ export class FeedStore {
   }
 
   updateSettings(patch: Partial<StoredSettings>): StoredSettings {
+    checkDeviceSignal();
     this.file.settings = { ...this.file.settings, ...patch };
     this.save();
     return this.file.settings;
   }
 
   addLessLike(topic: string, example: string): void {
+    checkDeviceSignal();
     const clean = oneLine(topic, 40);
     if (!clean) return;
     const rest = this.file.settings.lessLike.filter((l) => l.topic.toLowerCase() !== clean.toLowerCase());
@@ -259,6 +279,7 @@ export class FeedStore {
   }
 
   removeLessLike(topic: string): void {
+    checkDeviceSignal();
     const before = this.file.settings.lessLike.length;
     this.file.settings.lessLike = this.file.settings.lessLike.filter(
       (l) => l.topic.toLowerCase() !== topic.trim().toLowerCase(),
@@ -276,6 +297,7 @@ export class FeedStore {
 
   /** Forget old cards (30 days, closed ones after 14, at most 300); returns the ids that went. */
   prune(): string[] {
+    checkDeviceSignal();
     const removed = this.forget();
     if (removed.length) this.save();
     return removed;

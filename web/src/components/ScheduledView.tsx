@@ -130,7 +130,7 @@ export function ScheduledView({
   };
 
   const when = (j: ScheduleJob) =>
-    j.state === 'paused' ? 'paused' : j.state === 'done' ? 'finished' : j.nextRunAt ? inTime(j.nextRunAt) : j.schedule;
+    j.inactiveReason ?? (j.state === 'paused' ? 'paused' : j.state === 'done' ? 'finished' : j.nextRunAt ? inTime(j.nextRunAt) : j.schedule);
   const nothing = !running.length && !failed.length && !next.length && !recent.length && !all.length;
 
   return (

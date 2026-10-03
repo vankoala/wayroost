@@ -4,7 +4,7 @@ One view of every coding agent's skills on your PC, kept the same everywhere,
 plus a marketplace. A skill is a folder with a `SKILL.md` that tells an agent
 how to do something; Hermes, pi, Claude Code, Codex and OpenCode each read
 skills from their own folders. Settings → **Skills** shows them all and keeps
-them in step. It needs the Signalbox helper (below).
+them in step. It needs the Wayroost helper (below).
 
 ## Using it
 
@@ -13,7 +13,7 @@ them in step. It needs the Signalbox helper (below).
   copy, view its `SKILL.md`, and switch it off for an app that gets a copy.
   Filters: **Shared**, **In one app**, **Needs a look**, and one app at a time.
 - **Shared skills reach every app.** The shared folder (`~/.agents/skills`) is
-  the source. pi, OpenCode, Codex and Hermes read it directly; Signalbox copies
+  the source. pi, OpenCode, Codex and Hermes read it directly; Wayroost copies
   it, within seconds, to the apps that don't (Claude Code, and on Windows the
   `.agents` and `.claude` folders), and refreshes any copy an app keeps under
   the same name (Hermes' own copy wins over the shared one, so a stale one
@@ -44,7 +44,7 @@ Skills are instructions your agents follow, so:
 - **Only the shared folder spreads by itself.** An app's edited copy waits for
   your decision.
 - **Nothing is lost.** A copy is overwritten or removed only if it still matches
-  what Signalbox last wrote there; anything else is backed up first, under
+  what Wayroost last wrote there; anything else is backed up first, under
   `~/.hermes/signalbox-skills/backups/`.
 - **Links are left alone.** A skill folder that is a symlink is read, never written.
 - **Platforms.** Windows folders skip skills marked `platforms: [linux]`.
@@ -53,11 +53,11 @@ Skills are instructions your agents follow, so:
 
 ## How it works
 
-The Signalbox service can't see your home folder, so the helper
+The Wayroost service can't see your home folder, so the helper
 (`signalbox-helper`, running as the Hermes user on 127.0.0.1) does the work:
 `helper/signalbox_skills.py` watches the skill folders (every 5 seconds, the
 Windows ones every 30), copies, and keeps its state in
-`~/.hermes/signalbox-skills/state.json`. Signalbox polls the helper's change
+`~/.hermes/signalbox-skills/state.json`. Wayroost polls the helper's change
 counter and tells open pages (`skills_changed`). The marketplace goes through
 the Hermes dashboard's `/api/skills/hub/*` routes.
 

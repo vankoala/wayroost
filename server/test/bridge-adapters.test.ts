@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -41,7 +42,7 @@ describe('hermes adapter: chats the bridge starts', () => {
     const events = browser(hub);
     const stateDir = mkdtempSync(join(tmpdir(), 'sb-bridge-hermes-'));
     new SecretStore(stateDir).writeHermes(FAKE_USER);
-    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog);
+    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { background: new BackgroundGate('primary') });
     adapter.start();
     await expect.poll(() => adapter.status().state).toBe('connected');
     return { events };
@@ -102,6 +103,7 @@ describe('hermes adapter: chats the bridge starts', () => {
 function fakeDaemon() {
   let statusListener: ((s: { status: string }) => void) | undefined;
   const created: Array<Record<string, unknown>> = [];
+  const byId = new Map<string, Record<string, unknown>>();
   const agent = (id: string, overrides: Record<string, unknown> = {}) => ({
     id,
     provider: 'claude',
@@ -120,11 +122,21 @@ function fakeDaemon() {
       return () => {};
     },
     on: () => () => {},
+    observeEvents: () => ({
+      ready: Promise.resolve({ subscriptionId: 'fake-events' }),
+      subscribe: () => () => {},
+      release: async () => {},
+    }),
     connect: async () => statusListener?.({ status: 'connected' }),
     close: async () => {},
     fetchAgents: async () => ({
       entries: [{ agent: agent('caller', { title: 'Fix flaky login test', status: 'idle' }), project: null }],
       pageInfo: { hasMore: false, nextCursor: null },
+    }),
+    observeAgents: () => ({
+      ready: client.fetchAgents().then((page) => ({ ...page, subscriptionId: 'fake-agents' })),
+      subscribe: () => () => {},
+      release: async () => {},
     }),
     // An older daemon: no waiting for provider discovery, the snapshot is used as is.
     getLastServerInfoMessage: () => null,
@@ -148,11 +160,14 @@ function fakeDaemon() {
     listProjects: async () => ({ projects: [] }),
     createAgent: async (options: Record<string, unknown>) => {
       created.push(options);
-      return agent(`agent-${created.length}`, {
+      const a = agent(`agent-${created.length}`, {
         title: options.title ?? null,
         labels: options.labels ?? {},
       });
+      byId.set(a.id, a);
+      return a;
     },
+    fetchAgent: async (id: string) => ({ agent: byId.get(id) ?? null }),
   };
   return { client, created };
 }
@@ -162,7 +177,7 @@ describe('paseo adapter: agents the bridge starts', () => {
     const daemon = fakeDaemon();
     const hub = new EventHub();
     const events = browser(hub);
-    const adapter = new PaseoAdapter('ws://127.0.0.1:6777', hub, quietLog, 'cid_signalbox_test', () => daemon.client as never);
+    const adapter = new PaseoAdapter('ws://127.0.0.1:19007', hub, quietLog, 'cid_signalbox_test', () => daemon.client as never, new BackgroundGate('primary'));
     adapter.start();
     await expect.poll(() => adapter.status().state).toBe('connected');
     return { adapter, daemon, events };

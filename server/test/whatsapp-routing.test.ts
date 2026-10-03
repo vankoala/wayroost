@@ -11,7 +11,7 @@ class FakeHelper {
   puts: unknown[] = [];
   down = false;
   async whatsappRouting() {
-    if (this.down) throw new UserFacingError("The Signalbox helper isn't running on the PC.", 503);
+    if (this.down) throw new UserFacingError("The Wayroost helper isn't running on the PC.", 503);
     return { ...this.wa };
   }
   async setWhatsappRouting(settings: Omit<WhatsAppRouting, 'installed' | 'active'>) {

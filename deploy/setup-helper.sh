@@ -25,7 +25,7 @@ TOKEN_FILE=$ETC/helper.token
 UNIT=/etc/systemd/system/signalbox-helper.service
 DROPIN_DIR=/etc/systemd/system/signalbox.service.d
 DROPIN=$DROPIN_DIR/10-helper.conf
-PORT=8793
+PORT=19013
 
 usage() {
   echo "Usage: $0 <user> [--remove]" >&2
@@ -72,7 +72,7 @@ PY
 }
 
 if (( REMOVE )); then
-  echo "==> Removing the Signalbox helper"
+  echo "==> Removing the Wayroost helper"
   systemctl disable --now signalbox-helper.service 2>/dev/null || true
   rm -f "$UNIT" "$DROPIN" /etc/systemd/system/signalbox-helper.service.d/30-skills-windows.conf
   rmdir "$DROPIN_DIR" 2>/dev/null || true

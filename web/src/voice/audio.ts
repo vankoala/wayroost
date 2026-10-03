@@ -111,10 +111,11 @@ export class MicCapture {
 
 /** Plays clips one after another without gaps; stop() silences everything queued. */
 export class Player {
-  private readonly sources = new Set<AudioBufferSourceNode>();
+  private readonly sources = new Map<AudioBufferSourceNode, { piece?: symbol; end: number }>();
   private endAt = 0;
   /** Bumped by stop(), so a clip still decoding when it ran is never started. */
   private generation = 0;
+  private readonly pieceGenerations = new Map<symbol, number>();
   private waiters: Array<() => void> = [];
   /** Told whenever a clip starts or ends, or playback stops. */
   onChange: (() => void) | null = null;
@@ -124,9 +125,22 @@ export class Player {
     return this.sources.size;
   }
 
-  /** Resolves the next time a clip starts or ends. */
+  bufferedSeconds(): number {
+    return Math.max(0, this.endAt - (context?.currentTime ?? 0));
+  }
+
+  /** Also wakes as queued time decreases, even during a long local WAV. */
   changed(): Promise<void> {
-    return new Promise((resolve) => this.waiters.push(resolve));
+    return new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        const index = this.waiters.indexOf(finish);
+        if (index >= 0) this.waiters.splice(index, 1);
+        resolve();
+      };
+      const timer = setTimeout(finish, 125);
+      this.waiters.push(finish);
+    });
   }
 
   private notify(): void {
@@ -136,11 +150,12 @@ export class Player {
     this.onChange?.();
   }
 
-  async play(wav: ArrayBuffer): Promise<void> {
+  async play(wav: ArrayBuffer, piece?: symbol): Promise<void> {
     const ctx = audioContext();
     const generation = this.generation;
+    const pieceGeneration = piece ? this.pieceGenerations.get(piece) : undefined;
     const buffer = await ctx.decodeAudioData(wav);
-    if (generation !== this.generation) return; // stopped while decoding
+    if (generation !== this.generation || (piece && pieceGeneration !== this.pieceGenerations.get(piece))) return; // stopped while decoding
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
@@ -148,15 +163,27 @@ export class Player {
     source.onended = () => {
       if (this.sources.delete(source)) this.notify();
     };
-    this.sources.add(source);
+    this.sources.set(source, { piece, end: at + buffer.duration });
     source.start(at);
     this.endAt = at + buffer.duration;
     this.notify();
   }
 
+  stopPiece(piece: symbol): void {
+    this.pieceGenerations.set(piece, (this.pieceGenerations.get(piece) ?? 0) + 1);
+    for (const [source, clip] of this.sources) {
+      if (clip.piece !== piece) continue;
+      source.onended = null;
+      try { source.stop(); } catch { /* Already ended. */ }
+      this.sources.delete(source);
+    }
+    this.endAt = Math.max(0, ...[...this.sources.values()].map(clip => clip.end));
+    this.notify();
+  }
+
   stop(): void {
     this.generation += 1;
-    for (const source of this.sources) {
+    for (const [source] of this.sources) {
       source.onended = null;
       try {
         source.stop();
@@ -165,6 +192,7 @@ export class Player {
       }
     }
     this.sources.clear();
+    this.pieceGenerations.clear();
     this.endAt = 0;
     this.notify();
   }

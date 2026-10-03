@@ -1,8 +1,8 @@
-> This is the guide to **Signalbox**, the app Wayroost starts from. For Wayroost itself, see the [main README](../README.md).
+> This is the guide to the current **Wayroost** app. For the broader roadmap, see the [main README](../README.md).
 
-# Signalbox
+# Wayroost
 
-Signalbox is a self-hosted web app that puts your
+Wayroost is a self-hosted web app that puts your
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) chats and your
 [Paseo](https://github.com/getpaseo/paseo) coding agents into one
 phone-friendly interface. It runs on the machine where your agents run. Your
@@ -48,7 +48,7 @@ new work.
 - **Agents that work together (optional).** With the project bridge on, the
   agents in one project, across Hermes and Paseo, can list, read, message and
   start each other's chats, and wait for an answer. Messages are labelled as
-  coming from an agent, say which chat to reply to when Signalbox knows the
+  coming from an agent, say which chat to reply to when Wayroost knows the
   sender, and wait until the other chat is idle. Rate limits and a loop breaker
   hold runaway agents back, new agents start only in modes that ask you,
   approvals stay with you, and one tap in Settings pauses it all.
@@ -95,7 +95,7 @@ new work.
   app. Light and dark themes follow your phone, and unsent drafts are kept per
   conversation.
 - **Locked down.** Cloudflare Access checks your email at the edge, cloudflared
-  checks the Access token again, and Signalbox verifies it a third time on every
+  checks the Access token again, and Wayroost verifies it a third time on every
   request and WebSocket, apart from the home-screen icons and manifest. On top
   of that: CSRF and WebSocket-origin checks, Host
   checks against DNS rebinding, a strict Content-Security-Policy, sanitized
@@ -125,9 +125,9 @@ new work.
 
 | A message from another agent | The project bridge in Settings |
 | --- | --- |
-| <img src="images/29-phone-bridged-message.png" width="250" alt="A Hermes chat started by a Paseo agent, with its messages shown as From Fix flaky login test (Claude Code) via Signalbox"> | <img src="images/30-phone-bridge-settings.png" width="250" alt="The Project bridge section of Settings, paused, with the last hour's activity"> |
+| <img src="images/29-phone-bridged-message.png" width="250" alt="A Hermes chat started by a Paseo agent, with its messages shown as From Fix flaky login test (Claude Code) via Wayroost"> | <img src="images/30-phone-bridge-settings.png" width="250" alt="The Project bridge section of Settings, paused, with the last hour's activity"> |
 
-<img src="images/08-desktop.png" width="780" alt="Signalbox on a desktop browser: inbox and conversation side by side">
+<img src="images/08-desktop.png" width="780" alt="Wayroost on a desktop browser: inbox and conversation side by side">
 
 The screenshots use the built-in demo data. `npm run check:ui` takes them.
 
@@ -138,18 +138,18 @@ The screenshots use the built-in demo data. `npm run check:ui` takes them.
                                         │
                                         ▼  Cloudflare Tunnel (outbound from your machine, no open ports)
                                    cloudflared ── checks the Access token again
-                                        │  127.0.0.1:8790
+                                        │  127.0.0.1:19010
                                         ▼
-                                    Signalbox ── checks the token a third time
-                                     ├──▶ Hermes dashboard  127.0.0.1:9119
-                                     └──▶ Paseo daemon      127.0.0.1:6777
+                                    Wayroost ── checks the token a third time
+                                     ├──▶ Hermes dashboard  127.0.0.1:19006
+                                     └──▶ Paseo daemon      127.0.0.1:19007
 ```
 
-Signalbox is a small server plus a web app. The server runs next to your agents
-as a sandboxed systemd service and listens only on loopback (`127.0.0.1:8790`
+Wayroost is a small server plus a web app. The server runs next to your agents
+as a sandboxed systemd service and listens only on loopback (`127.0.0.1:19010`
 by default). It turns Hermes and Paseo into one stream of conversations,
 timelines and approvals, and pushes live updates to your browser over one
-WebSocket. Hermes and Paseo stay local: only Signalbox is routed through the
+WebSocket. Hermes and Paseo stay local: only Wayroost is routed through the
 tunnel. The optional project bridge, which lets agents reach each other's
 chats, listens on `127.0.0.1` only and is never routed.
 
@@ -163,9 +163,9 @@ Read more in [docs/how-it-works.md](how-it-works.md).
 | Node.js 22 or newer, installed system-wide | The installer checks the version, and refuses a `node` or `npm` that anyone but root could modify, such as one from nvm in your home directory. |
 | `cloudflared` | From [Cloudflare's downloads](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/). The scripts also use `git`, `rsync`, `curl` and `python3`. |
 | A Cloudflare account and a domain on Cloudflare | The free plan works. Cloudflare Access (Zero Trust) is free for up to 50 users. |
-| Hermes Agent and/or Paseo | Either or both. Hermes: its dashboard running (default port 9119) with password sign-in. Paseo: its daemon running (default port 6777). |
+| Hermes Agent and/or Paseo | Either or both. Hermes: its dashboard running (default port 19006) with password sign-in. Paseo: its daemon running (default port 19007). |
 
-Tested with Hermes Agent 0.21 and Paseo 0.5.1 and 0.9.2.
+Tested with Hermes Agent 0.21 and Paseo 0.9.2.
 
 ## Quick start
 
@@ -183,7 +183,7 @@ every step is safe to repeat. In short:
 
 2. **Create a Cloudflare Access application** (Zero Trust → Access →
    Applications → Self-hosted) for your hostname, for example
-   `signalbox.example.com`, with a policy that allows only your email. Do this
+   `wayroost.example.com`, with a policy that allows only your email. Do this
    before the tunnel exists, so the hostname is protected from the moment it
    resolves.
 
@@ -212,18 +212,18 @@ every step is safe to repeat. In short:
    points your hostname at it (replacing any existing DNS record for that
    name), writes `publicOrigin` and the Access team and AUD tag from
    Cloudflare's login redirect into the config, writes
-   `/etc/signalbox/cloudflared.yml`, and starts Signalbox and
+   `/etc/signalbox/cloudflared.yml`, and starts Wayroost and
    `signalbox-tunnel.service`.
 
    ```bash
    sudo -H cloudflared tunnel login
-   sudo /opt/src/signalbox/deploy/setup-tunnel.sh signalbox.example.com
+   sudo /opt/src/signalbox/deploy/setup-tunnel.sh wayroost.example.com
    ```
 
-6. **Open it on your phone.** Go to `https://signalbox.example.com` and sign in
+6. **Open it on your phone.** Go to `https://wayroost.example.com` and sign in
    through Cloudflare Access. If you run Hermes, enter your Hermes dashboard
    username and password under **Settings → Hermes sign-in**. Then add
-   Signalbox to your home screen (Safari: **Share → Add to Home Screen**;
+   Wayroost to your home screen (Safari: **Share → Add to Home Screen**;
    Chrome: **⋮ → Add to Home screen**).
 
 To let the agents in a project work together, turn on the project bridge
@@ -244,8 +244,8 @@ covered in [docs/setup.md](setup.md).
 | [docs/setup.md](setup.md) | Installing step by step, checking the lock-down, updating, uninstalling, WSL2, troubleshooting. |
 | [docs/configuration.md](configuration.md) | Every config field, environment variables, files and ports. |
 | [docs/how-it-works.md](how-it-works.md) | The architecture, the checks on every request, live updates, approvals. |
-| [docs/hermes.md](hermes.md) | How Signalbox signs in to and talks with the Hermes dashboard. |
-| [docs/paseo.md](paseo.md) | How Signalbox talks to the Paseo daemon, and the permission-mode tiers. |
+| [docs/hermes.md](hermes.md) | How Wayroost signs in to and talks with the Hermes dashboard. |
+| [docs/paseo.md](paseo.md) | How Wayroost talks to the Paseo daemon, and the permission-mode tiers. |
 | [docs/bridge.md](bridge.md) | The optional project bridge: the tools agents get, who's calling, delivery and replies, limits, pausing, setup and upgrading. |
 | [docs/voice.md](voice.md) | Optional voice mode: talking and listening, how it works, setup, privacy and security. |
 | [docs/for-you.md](for-you.md) | Optional For you: cards from Hermes' brief and daytime checks, proactivity and quiet hours, phone notifications, the card routes, privacy and security. |
@@ -257,13 +257,13 @@ covered in [docs/setup.md](setup.md).
 
 ## Development
 
-You don't need Hermes, Paseo or Cloudflare to work on Signalbox. The demo runs
+You don't need Hermes, Paseo or Cloudflare to work on Wayroost. The demo runs
 the real server, including the full Access check, with built-in demo data and a
 local stand-in for Cloudflare:
 
 ```bash
 npm ci --ignore-scripts
-npm run build:web && npm run demo    # http://127.0.0.1:8795
+npm run build:web && npm run demo    # http://127.0.0.1:8890
 ```
 
 | Command | What it does |
@@ -275,7 +275,7 @@ npm run build:web && npm run demo    # http://127.0.0.1:8795
 | `npm run build:server` | Bundles the server with esbuild into `dist/server/index.js`. |
 | `npm start` | Runs the built server with the config at `SIGNALBOX_CONFIG` (default `/etc/signalbox/config.json`). |
 | `npm run dev:web` | Starts the Vite dev server for the web app alone. It has no API proxy, so use the demo for a working local stack. |
-| `npm run demo` | Runs the real server with demo data behind a local stand-in for Cloudflare Access, at `http://127.0.0.1:8795` (set `PORT` to move it). Build the web app first. Open it in any browser. |
+| `npm run demo` | Runs the real server with demo data behind a local stand-in for Cloudflare Access, at `http://127.0.0.1:8890` (set `PORT` to move it). Build the web app first. Open it in any browser. |
 | `npm run check:ui` | Builds the web app, drives headless Chrome at phone and desktop sizes, and saves screenshots to `ui-shots/`. Fails on any page error or CSP violation. Needs Chrome at `/usr/bin/google-chrome`, or set `CHROME`. |
 | `npm run check:paseo -- <dir>` | Runs the Paseo adapter end to end against a real Paseo daemon. `<dir>` is an installed `@getpaseo/server` package. |
 
@@ -287,7 +287,7 @@ request.
 
 ## Credits
 
-- Signalbox talks to [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+- Wayroost talks to [Hermes Agent](https://github.com/NousResearch/hermes-agent)
   by Nous Research (MIT License) through the Hermes dashboard's HTTP and
   WebSocket APIs. Two parts are adapted from Hermes Agent's own clients: the
   JSON-RPC connection in `server/src/hermes/gateway.ts`, and how stored skill
@@ -298,13 +298,13 @@ request.
   reconciliation in `server/src/paseo/mirror.ts`, and answers to multi-question
   requests in `server/src/paseo/normalize.ts`.
 - [Hermes Conduit](https://github.com/kaishi00/hermes-conduit) (MIT License)
-  inspired Signalbox. Its native iOS client showed how a third-party app signs
+  inspired Wayroost. Its native iOS client showed how a third-party app signs
   in to and talks with the Hermes dashboard.
 
 Neither Hermes Agent nor Paseo is included in this repository. See
 [NOTICE](../NOTICE) for the full attributions and licenses.
 
-Signalbox is an independent project. It is not affiliated with or endorsed by
+Wayroost is an independent project. It is not affiliated with or endorsed by
 Nous Research, the Paseo project, the Hermes Conduit project, or Cloudflare,
 Inc. Cloudflare is a trademark of Cloudflare, Inc. Other product names and
 trademarks belong to their owners. They are used only to describe

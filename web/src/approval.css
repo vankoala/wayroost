@@ -1,0 +1,622 @@
+/*
+ * The approval card and the inbox's "needs you" banner
+ * (components/Approvals.tsx). Uses only the tokens in tokens.css; the role tile
+ * they show is the shell's.
+ *
+ * This file loads before styles.css, so every rule is scoped under the card or
+ * the banner: that way the shared classes it restyles (.btn, .chip,
+ * .composer-box) keep their old look everywhere else.
+ */
+
+/* The role tile and its badge are the shell's (shell.css); a strip or banner sets
+   --tile-ring to its own background so the badge's ring matches what is behind it. */
+
+/* ---------- Where the card sits in a chat ---------- */
+
+/* Never more than about 58% of the visible screen, and it gives way first
+   when space runs out: the message box and Stop below always keep theirs. */
+.approval-dock {
+  flex: 0 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px 0;
+  max-width: 820px;
+  width: 100%;
+  margin: 0 auto;
+  max-height: 58vh;
+  max-height: 58dvh;
+  max-height: calc(var(--app-height, 100dvh) * 0.58);
+}
+
+/* ---------- The card ---------- */
+
+/* The card scrolls inside itself; its buttons stay pinned to its bottom. */
+.approval-card {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  border: var(--need-border-width) solid var(--need);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--text-body);
+  line-height: 1.45;
+  animation: approval-rise var(--motion) var(--ease);
+}
+
+@keyframes approval-rise {
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+}
+
+/* Header strip: who is asking, when, in which task, and the "Needs you" tag. */
+.approval-strip {
+  --tile-ring: var(--need-bg);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--need-bg);
+  border-bottom: var(--border-width) solid var(--line);
+}
+
+.approval-who {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.approval-who strong {
+  font-size: var(--text-body-em);
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.approval-when {
+  font-size: var(--text-meta);
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-of {
+  flex-shrink: 0;
+  font-size: var(--text-meta);
+  font-weight: 600;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* One full pill on its own is fine. */
+.need-tag {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--need);
+  color: var(--on-accent);
+  font-family: var(--font-body);
+  font-size: var(--text-meta);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.approval-body {
+  padding: var(--space-4) var(--space-4) 0;
+}
+
+/* The title in the display face, naming the action in plain words. */
+.approval-display {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-card-title);
+  font-weight: 400;
+  line-height: 1.3;
+  color: var(--ink);
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+}
+
+.approval-display code,
+.approval-banner-title code {
+  font-family: var(--font-code);
+  font-size: 0.88em;
+  padding: 1px 5px;
+  border-radius: var(--radius-chip);
+  background: var(--surface-2);
+}
+
+.approval-title.folded {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+
+.approval-card .approval-more {
+  display: inline-flex;
+  margin-top: 2px;
+  color: var(--accent);
+}
+
+/* What happens / Why / If you say no. */
+.approval-rows {
+  margin: var(--space-3) 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.approval-row dt {
+  font-size: var(--text-meta);
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.approval-row dd {
+  margin: 2px 0 0;
+  color: var(--ink);
+}
+
+.approval-row p {
+  margin: 0;
+}
+
+.approval-row p + p {
+  margin-top: var(--space-1);
+}
+
+.approval-request {
+  color: var(--ink-2);
+}
+
+.approval-request-label {
+  font-weight: 600;
+}
+
+/* A command, diff or text. No scroller inside the scroller: the card itself scrolls. */
+.approval-card pre {
+  margin: var(--space-2) 0 0;
+  padding: 10px var(--space-3);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--line);
+  color: var(--ink);
+  font-family: var(--font-code);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: none;
+}
+
+.approval-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  font-size: var(--text-meta);
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.approval-card .link-btn {
+  color: var(--accent);
+}
+
+.approval-warn,
+.approval-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: var(--space-2) 0 0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+/* Hidden characters, a cut-off command, a failed send: errors, so --bad. */
+.approval-warn {
+  color: var(--bad);
+  font-weight: 600;
+}
+
+.approval-hint {
+  color: var(--ink-2);
+}
+
+.approval-warn svg,
+.approval-hint svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+/* ---------- Details: risk and engine words, one level down ---------- */
+
+.approval-details {
+  margin-top: var(--space-3);
+  border-top: var(--border-width) solid var(--line);
+  padding-top: var(--space-2);
+}
+
+.approval-details summary,
+.approval-choices summary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) 0;
+  border-radius: var(--radius-chip);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+
+.approval-details summary::-webkit-details-marker,
+.approval-choices summary::-webkit-details-marker {
+  display: none;
+}
+
+.approval-details summary svg,
+.approval-choices summary svg {
+  transition: transform var(--motion) var(--ease);
+}
+
+.approval-details[open] summary svg,
+.approval-choices[open] summary svg {
+  transform: rotate(180deg);
+}
+
+.approval-details dl {
+  margin: var(--space-2) 0 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+  font-size: 13px;
+}
+
+.approval-details dl > div {
+  display: contents;
+}
+
+.approval-details dt {
+  color: var(--ink-3);
+}
+
+.approval-details dd {
+  margin: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.risk-level {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  border-radius: var(--radius-chip);
+  font-weight: 700;
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--line);
+}
+
+.risk-low {
+  color: var(--ok);
+}
+
+.risk-medium {
+  color: var(--ink);
+}
+
+/* Terracotta means "needs you" only; a high risk is shown in the error colour. */
+.risk-high {
+  color: var(--bad);
+}
+
+.approval-fine {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-meta);
+  color: var(--ink-3);
+}
+
+/* ---------- Foot: buttons and answer fields, pinned to the bottom ---------- */
+
+.approval-foot {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: var(--space-3);
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border-top: var(--border-width) solid var(--line);
+  /* Opaque, so text scrolling under it is hidden. */
+  background: var(--surface);
+}
+
+.approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.approval-card .approval-actions .btn {
+  flex: 1 1 0;
+  min-width: 96px;
+}
+
+.approval-card .btn {
+  height: 44px;
+  border-radius: var(--radius-control);
+  font-family: var(--font-body);
+  font-size: var(--text-body-em);
+  font-weight: 600;
+  transition:
+    background var(--motion-fast) var(--ease),
+    border-color var(--motion-fast) var(--ease),
+    opacity var(--motion-fast) var(--ease);
+}
+
+/* Primary: plum with cream text, once per card. */
+.approval-card .btn-approve,
+.approval-card .btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+/* Secondary: "Don't allow", Back, More choices. */
+.approval-card .btn-danger,
+.approval-card .btn-secondary {
+  background: var(--surface);
+  border-color: var(--btn-line);
+  color: var(--ink);
+}
+
+.approval-card .btn-danger:hover:not(:disabled),
+.approval-card .btn-secondary:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.approval-card :focus-visible,
+.approval-banner:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* "Allow this kind … without asking". */
+.approval-always {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  font-size: var(--text-body);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.approval-always input {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+}
+
+.approval-choices .approval-actions {
+  margin-top: var(--space-2);
+}
+
+/* Question choices: square-ish chips, never a long row of pills. */
+.approval-card .chip {
+  height: 36px;
+  border-radius: var(--radius-chip);
+  border-color: var(--btn-line);
+  background: var(--surface);
+  color: var(--ink);
+  white-space: normal;
+  flex-shrink: 1;
+}
+
+.approval-card .chip:hover {
+  background: var(--surface-2);
+}
+
+.approval-card .chip[aria-pressed='true'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.approval-card .composer-box {
+  max-width: none;
+  margin: 0;
+  border-color: var(--btn-line);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+}
+
+.approval-card .composer-box:focus-within {
+  border-color: var(--accent);
+}
+
+.approval-card .composer-box textarea {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: 16px; /* no zoom on focus in iOS */
+  line-height: 1.4;
+  padding: 7px 0;
+}
+
+.approval-card .composer-box textarea::placeholder,
+.approval-card .composer-box .muted {
+  color: var(--ink-3);
+}
+
+.approval-card .send-btn {
+  border-radius: var(--radius-control);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* ---------- Passwords and codes Hermes asks for ---------- */
+
+.secret-box input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: 16px; /* no zoom on focus in iOS */
+  padding: 7px 0;
+  letter-spacing: 0.08em;
+}
+
+.secret-box input::placeholder {
+  color: var(--ink-3);
+  letter-spacing: normal;
+}
+
+.secret-confirm {
+  padding: var(--space-3);
+  border-radius: var(--radius-control);
+  border: var(--border-width) solid var(--btn-line);
+  background: var(--surface-2);
+  font-size: var(--text-body-em);
+}
+
+.secret-confirm .approval-actions {
+  margin-top: 10px;
+}
+
+.secret-note {
+  color: var(--ink-3);
+  font-size: var(--text-meta);
+}
+
+.approval-secret .secret-note {
+  margin-top: var(--space-3);
+}
+
+/* A login to save: two labelled fields. */
+.secret-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: var(--space-3);
+}
+
+.secret-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.secret-field input {
+  width: 100%;
+  border: var(--border-width) solid var(--btn-line);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  padding: 10px var(--space-3);
+  font-size: 16px; /* no zoom on focus in iOS */
+  font-weight: 400;
+  color: var(--ink);
+  outline: none;
+}
+
+.secret-field input:focus {
+  border-color: var(--accent);
+}
+
+/* ---------- The inbox's "needs you" banner ---------- */
+
+.approval-banner {
+  --tile-ring: var(--need-bg);
+  margin: 4px 12px 6px;
+  width: calc(100% - 24px);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-card);
+  border: var(--need-border-width) solid var(--need);
+  background: var(--need-bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--text-body);
+  text-align: left;
+  transition: background var(--motion-fast) var(--ease);
+}
+
+.approval-banner-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.approval-banner-who {
+  color: var(--ink-2);
+  font-size: var(--text-meta);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-banner-who strong {
+  color: var(--ink);
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+
+.approval-banner-title {
+  font-family: var(--font-display);
+  font-size: var(--text-body-em);
+  line-height: 1.3;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-banner-meta {
+  color: var(--ink-3);
+  font-size: var(--text-meta);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .approval-card,
+  .approval-banner,
+  .approval-card .btn,
+  .approval-details summary svg,
+  .approval-choices summary svg {
+    animation: none;
+    transition: none;
+  }
+}

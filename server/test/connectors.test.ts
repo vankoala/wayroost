@@ -1,13 +1,34 @@
+import { mkdtempSync } from 'node:fs';
+import { BackgroundGate } from '../src/background.js';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TOOLSETS } from '../src/schedules.js';
 import { parseConfig } from '../src/config.js';
 import type { PhoneStatus, WhatsAppRouting } from '../../shared/protocol.js';
 import type { HelperApi, HelperStatus } from '../src/connectors/helper.js';
-import { CALLBACK_PREFIX, Connectors, GATE_SCRIPT, type Dashboard } from '../src/connectors/service.js';
+import { buildApp } from '../src/app.js';
+import { CALLBACK_PREFIX, CALLBACK_TRIES, CALLBACK_WINDOW_MS, Connectors, GATE_SCRIPT, type Dashboard } from '../src/connectors/service.js';
+import { EventHub } from '../src/hub.js';
 import { UserFacingError } from '../src/sources.js';
-import { apiHeaders, AUD, EMAIL, ISSUER, makeApp, makeKeys, makeToken, ORIGIN, postHeaders, type Keys } from './helpers.js';
+import {
+  apiHeaders,
+  AUD,
+  DESKTOP_COOKIE,
+  EMAIL,
+  FakeHermes,
+  FakePaseo,
+  ISSUER,
+  makeApp,
+  makeKeys,
+  makeToken,
+  ORIGIN,
+  postHeaders,
+  seedDevices,
+  type Keys,
+} from './helpers.js';
 
 const quietLog = { info() {}, warn() {} };
 
@@ -82,7 +103,7 @@ class FakeDashboard implements Dashboard {
       return json({
         flow_id: 'flow-abc12345',
         status: 'authorization_required',
-        authorization_url: `https://auth.example.com/authorize?server=${name}`,
+        authorization_url: `https://auth.example.com/authorize?server=${name}&state=st-${name}`,
         ...this.authBody,
       });
     }
@@ -146,9 +167,13 @@ class FakeHelper implements HelperApi {
   async triggerQueries() {
     return { ...this.folders };
   }
+  async triggerRoles() {
+    return Object.fromEntries(Object.keys(await this.triggerQueries()).map((id) => [id, 'primary' as const]));
+  }
+
   async putTrigger(id: string, query: string) {
     this.folders[id] = query;
-    return { workdir: `/home/me/.hermes/signalbox-triggers/${id}`, script: GATE_SCRIPT };
+    return { role: 'primary' as const, workdir: `/home/me/.hermes/signalbox-triggers/${id}`, script: GATE_SCRIPT };
   }
   async deleteTrigger(id: string) {
     delete this.folders[id];
@@ -179,11 +204,11 @@ class FakeHelper implements HelperApi {
   }
 }
 
-function make(opts: { signedIn?: boolean; helper?: FakeHelper | null; dashboardUrl?: string } = {}) {
+function make(opts: { signedIn?: boolean; helper?: FakeHelper | null; dashboardUrl?: string; now?: () => number } = {}) {
   const dashboard = new FakeDashboard();
   const helper = opts.helper === null ? undefined : (opts.helper ?? new FakeHelper());
   const reloads: number[] = [];
-  const connectors = new Connectors({
+  const connectors = new Connectors({ background: new BackgroundGate('primary'),
     dashboard: () => (opts.signedIn === false ? undefined : dashboard),
     dashboardUrl: opts.dashboardUrl ?? 'http://127.0.0.1:9',
     publicOrigin: ORIGIN,
@@ -192,6 +217,7 @@ function make(opts: { signedIn?: boolean; helper?: FakeHelper | null; dashboardU
       reloads.push(Date.now());
     },
     log: quietLog,
+    ...(opts.now ? { now: opts.now } : {}),
   });
   return { connectors, dashboard, helper, reloads };
 }
@@ -260,7 +286,7 @@ describe('Connectors.connect', () => {
   it("installs from Hermes' catalog, points the redirect at Signalbox, asks before changes, and starts the sign-in", async () => {
     const { connectors, dashboard } = make();
     const start = await connectors.connect('notion');
-    expect(start).toEqual({ flowId: 'flow-abc12345', url: 'https://auth.example.com/authorize?server=notion' });
+    expect(start).toEqual({ flowId: 'flow-abc12345', url: 'https://auth.example.com/authorize?server=notion&state=st-notion' });
     expect(dashboard.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
       'GET /api/mcp/servers',
       'POST /api/mcp/catalog/install',
@@ -376,11 +402,17 @@ describe('the sign-in callback', () => {
   let url: string;
   const seen: string[] = [];
   let status = 200;
+  // While set, Hermes holds its answer to a callback until this settles.
+  let hold: Promise<void> | undefined;
   beforeAll(async () => {
     server = createServer((req, res) => {
       seen.push(req.url ?? '');
-      res.writeHead(status, { 'content-type': 'text/html' });
-      res.end('<h1>Hermes page</h1>');
+      const answer = () => {
+        res.writeHead(status, { 'content-type': 'text/html' });
+        res.end('<h1>Hermes page</h1>');
+      };
+      if (hold) void hold.then(answer);
+      else answer();
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -389,6 +421,7 @@ describe('the sign-in callback', () => {
   beforeEach(() => {
     seen.length = 0;
     status = 200;
+    hold = undefined;
   });
 
   let keys: Keys;
@@ -401,15 +434,22 @@ describe('the sign-in callback', () => {
   it("hands the code to the dashboard's own callback and answers with Signalbox's page", async () => {
     const { connectors } = make({ dashboardUrl: url });
     const { app } = await makeApp(keys, { connectors });
-    const res = await app.inject({ url: `${CALLBACK_PREFIX}notion?code=abc&state=xyz&iss=https%3A%2F%2Fmcp.notion.com`, headers: apiHeaders(token) });
+    await connectors.connect('notion');
+    const res = await app.inject({ url: `${CALLBACK_PREFIX}notion?code=abc&state=st-notion&iss=https%3A%2F%2Fmcp.notion.com`, headers: apiHeaders(token) });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toContain('text/html');
     expect(res.body).toContain('Signed in');
     expect(res.body).not.toContain('Hermes page');
-    expect(seen).toEqual(['/api/mcp/oauth/callback/notion?code=abc&state=xyz&iss=https%3A%2F%2Fmcp.notion.com']);
+    expect(seen).toEqual(['/api/mcp/oauth/callback/notion?code=abc&state=st-notion&iss=https%3A%2F%2Fmcp.notion.com']);
 
+    // Arriving from the service's own site, the browser sends no SameSite=Strict device cookie.
+    await connectors.connect('notion');
+    const { cookie: _cookie, ...noDevice } = apiHeaders(token);
+    expect((await app.inject({ url: `${CALLBACK_PREFIX}notion?code=abc&state=st-notion`, headers: noDevice })).statusCode).toBe(200);
+
+    await connectors.connect('notion');
     status = 404;
-    const expired = await app.inject({ url: `${CALLBACK_PREFIX}notion?code=abc&state=old`, headers: apiHeaders(token) });
+    const expired = await app.inject({ url: `${CALLBACK_PREFIX}notion?code=abc&state=st-notion`, headers: apiHeaders(token) });
     expect(expired.statusCode).toBe(400);
     expect(expired.body).toContain('expired');
   });
@@ -417,6 +457,7 @@ describe('the sign-in callback', () => {
   it('needs Cloudflare Access like every page, and never forwards an unknown connector or an empty query', async () => {
     const { connectors } = make({ dashboardUrl: url });
     const { app } = await makeApp(keys, { connectors });
+    await connectors.connect('notion');
     const noAccess = await app.inject({ url: `${CALLBACK_PREFIX}notion?code=a&state=b`, headers: { host: new URL(ORIGIN).host } });
     expect(noAccess.statusCode).toBe(401);
     const unknown = await app.inject({ url: `${CALLBACK_PREFIX}paypal?code=a&state=b`, headers: apiHeaders(token) });
@@ -424,6 +465,195 @@ describe('the sign-in callback', () => {
     const empty = await app.inject({ url: `${CALLBACK_PREFIX}notion`, headers: apiHeaders(token) });
     expect(empty.statusCode).toBe(400);
     expect(seen).toEqual([]);
+  });
+
+  it('forwards nothing from an unpaired caller on a public origin without Access, unless a paired device started a sign-in', async () => {
+    let t = Date.now();
+    const { connectors, dashboard } = make({ dashboardUrl: url, now: () => t });
+    const stateDir = mkdtempSync(join(tmpdir(), 'sb-state-'));
+    seedDevices(stateDir);
+    // Device sign-in alone: no Access in front of the public origin.
+    const config = parseConfig({ publicOrigin: ORIGIN, stateDir });
+    const app = await buildApp({
+      config,
+      hub: new EventHub(),
+      sources: { hermes: new FakeHermes(), paseo: new FakePaseo() },
+      logger: false,
+      connectors,
+    });
+    const stranger = { host: new URL(ORIGIN).host };
+    const call = (query = 'code=a&state=st-notion') => app.inject({ url: `${CALLBACK_PREFIX}notion?${query}`, headers: stranger });
+
+    // Nobody started a sign-in: an attacker's query never reaches Hermes.
+    const cold = await call();
+    expect(cold.statusCode).toBe(400);
+    expect(cold.body).toContain('No sign-in is waiting');
+    expect(seen).toEqual([]);
+
+    // Starting one needs a paired device; the stranger can't.
+    const start = (cookie?: string) =>
+      app.inject({
+        method: 'POST',
+        url: '/api/connectors/notion/connect',
+        headers: {
+          host: new URL(ORIGIN).host,
+          origin: ORIGIN,
+          'x-wayroost-request': '1',
+          'content-type': 'application/json',
+          ...(cookie ? { cookie } : {}),
+        },
+        payload: '{}',
+      });
+    expect((await start()).statusCode).toBe(401);
+    expect((await call()).statusCode).toBe(400);
+    expect(seen).toEqual([]);
+
+    // Once a paired device starts it, the service's redirect (no cookie) goes through, once.
+    expect((await start(DESKTOP_COOKIE)).statusCode).toBe(200);
+    expect((await call('code=real&state=st-notion')).statusCode).toBe(200);
+    expect(seen).toEqual(['/api/mcp/oauth/callback/notion?code=real&state=st-notion']);
+    expect((await call('code=again&state=st-notion')).statusCode).toBe(400);
+    expect(seen).toHaveLength(1);
+
+    // A few tries per sign-in, not a guessing game.
+    expect((await start(DESKTOP_COOKIE)).statusCode).toBe(200);
+    status = 400;
+    for (let i = 0; i < CALLBACK_TRIES; i++) expect((await call(`code=g${i}&state=st-notion`)).statusCode).toBe(400);
+    expect(seen).toHaveLength(1 + CALLBACK_TRIES);
+    await call('code=more&state=st-notion');
+    expect(seen).toHaveLength(1 + CALLBACK_TRIES);
+
+    // Only within the window after Connect.
+    status = 200;
+    expect((await start(DESKTOP_COOKIE)).statusCode).toBe(200);
+    t += CALLBACK_WINDOW_MS + 1;
+    expect((await call()).body).toContain('No sign-in is waiting');
+    expect(seen).toHaveLength(1 + CALLBACK_TRIES);
+
+    // Cancelling the sign-in closes it too.
+    const { flowId } = await connectors.connect('notion');
+    await connectors.cancelFlow(flowId);
+    expect((await call()).statusCode).toBe(400);
+    expect(seen).toHaveLength(1 + CALLBACK_TRIES);
+
+    // Connect while Hermes still has one open that this server didn't start
+    // (from before a restart, say): nothing ties a callback to it, so none is taken.
+    dashboard.authStatus = 409;
+    const reopened = await start(DESKTOP_COOKIE);
+    expect(reopened.statusCode).toBe(409);
+    expect(reopened.json().error).toMatch(/expire/);
+    expect((await call()).statusCode).toBe(400);
+    expect(seen).toHaveLength(1 + CALLBACK_TRIES);
+    await app.close();
+  });
+
+  it("keeps the open sign-in's state, flow and tries when Connect is pressed again", async () => {
+    const { connectors, dashboard } = make({ dashboardUrl: url });
+    const { app } = await makeApp(keys, { connectors });
+    const call = (query: string) => app.inject({ url: `${CALLBACK_PREFIX}notion?${query}`, headers: apiHeaders(token) });
+    const { flowId } = await connectors.connect('notion');
+    dashboard.authStatus = 409;
+    await expect(connectors.connect('notion')).rejects.toMatchObject({ status: 409, message: expect.stringMatching(/Finish it/) });
+    // Made-up callbacks still need the sign-in's state, and still cost it nothing.
+    for (let i = 0; i < CALLBACK_TRIES + 2; i++) {
+      expect((await call(`code=g${i}&state=nope`)).statusCode).toBe(400);
+      expect((await call(`code=g${i}`)).statusCode).toBe(400);
+    }
+    expect(seen).toEqual([]);
+    // The tries it had are the tries it has: a second 409 doesn't top them up.
+    status = 400;
+    expect((await call('code=a&state=st-notion')).statusCode).toBe(400);
+    await expect(connectors.connect('notion')).rejects.toMatchObject({ status: 409 });
+    for (let i = 1; i < CALLBACK_TRIES; i++) expect((await call(`code=a${i}&state=st-notion`)).statusCode).toBe(400);
+    expect(seen).toHaveLength(CALLBACK_TRIES);
+    expect((await call('code=more&state=st-notion')).body).toContain('No sign-in is waiting');
+    expect(seen).toHaveLength(CALLBACK_TRIES);
+
+    // And Cancel still closes it after a 409.
+    dashboard.authStatus = 200;
+    status = 200;
+    const again = await connectors.connect('notion');
+    expect(again.flowId).toBe(flowId);
+    dashboard.authStatus = 409;
+    await expect(connectors.connect('notion')).rejects.toMatchObject({ status: 409 });
+    await connectors.cancelFlow(again.flowId);
+    expect((await call('code=real&state=st-notion')).body).toContain('No sign-in is waiting');
+    expect(seen).toHaveLength(CALLBACK_TRIES);
+    await app.close();
+  });
+
+  /** Make Hermes' next sign-in a different one: its own flow and state. */
+  const nextSignIn = (dashboard: FakeDashboard, n: string) => {
+    dashboard.authBody = { flow_id: `flow-new${n}`, authorization_url: `https://auth.example.com/authorize?server=notion&state=st-new${n}` };
+  };
+
+  it("leaves a newer sign-in's window open when an older one's callback finishes late", async () => {
+    const { connectors, dashboard } = make({ dashboardUrl: url });
+    const { app } = await makeApp(keys, { connectors });
+    const call = (query: string) => app.inject({ url: `${CALLBACK_PREFIX}notion?${query}`, headers: apiHeaders(token) });
+    const first = await connectors.connect('notion');
+    // The first sign-in's callback reaches Hermes, which is slow to answer...
+    let release!: () => void;
+    hold = new Promise<void>((resolve) => (release = resolve));
+    const late = call('code=old&state=st-notion');
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    // ...and meanwhile it's cancelled and a new one started.
+    await connectors.cancelFlow(first.flowId);
+    nextSignIn(dashboard, '1');
+    expect((await connectors.connect('notion')).flowId).toBe('flow-new1');
+    hold = undefined;
+    release();
+    expect((await late).statusCode).toBe(200);
+    // The new sign-in's own callback still goes through.
+    const res = await call('code=real&state=st-new1');
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('Signed in');
+    expect(seen).toEqual(['/api/mcp/oauth/callback/notion?code=old&state=st-notion', '/api/mcp/oauth/callback/notion?code=real&state=st-new1']);
+    await app.close();
+  });
+
+  it("leaves a newer sign-in's window open when an older approved one is polled", async () => {
+    const { connectors, dashboard } = make({ dashboardUrl: url });
+    const { app } = await makeApp(keys, { connectors });
+    const call = (query: string) => app.inject({ url: `${CALLBACK_PREFIX}notion?${query}`, headers: apiHeaders(token) });
+    const first = await connectors.connect('notion');
+    nextSignIn(dashboard, '2');
+    expect((await connectors.connect('notion')).flowId).toBe('flow-new2');
+    dashboard.flows['flow-new2'] = { status: 'authorization_required', server_name: 'notion' };
+    // A page still polling the first sign-in hears it was approved...
+    dashboard.flows[first.flowId] = { status: 'approved', server_name: 'notion' };
+    expect(await connectors.flow(first.flowId)).toEqual({ status: 'connected' });
+    // ...which doesn't close the second one's window.
+    expect((await call('code=real&state=st-new2')).statusCode).toBe(200);
+    expect(seen).toEqual(['/api/mcp/oauth/callback/notion?code=real&state=st-new2']);
+    // Polling the second one's approval closes its window.
+    expect((await call('code=real&state=st-new2')).statusCode).toBe(400);
+    nextSignIn(dashboard, '3');
+    await connectors.connect('notion');
+    dashboard.flows['flow-new3'] = { status: 'approved', server_name: 'notion' };
+    expect(await connectors.flow('flow-new3')).toEqual({ status: 'connected' });
+    expect((await call('code=real&state=st-new3')).body).toContain('No sign-in is waiting');
+    expect(seen).toHaveLength(1);
+    await app.close();
+  });
+
+  it("refuses a stranger's made-up callbacks without using up the real sign-in's tries", async () => {
+    const { connectors } = make({ dashboardUrl: url });
+    const { app } = await makeApp(keys, { connectors });
+    const call = (query: string) => app.inject({ url: `${CALLBACK_PREFIX}notion?${query}`, headers: apiHeaders(token) });
+    await connectors.connect('notion');
+    // Many more than the tries a sign-in has, with no state, a wrong one, or several.
+    for (const query of ['code=g', 'code=g&state=', 'code=g&state=st-notio', 'code=g&state=st-notionx', 'code=g&state=nope&state=st-notion']) {
+      for (let i = 0; i < CALLBACK_TRIES; i++) {
+        const res = await call(query);
+        expect(res.statusCode, query).toBe(400);
+        expect(res.body).toContain('No sign-in is waiting');
+      }
+    }
+    expect(seen).toEqual([]);
+    // The service's real redirect still goes through.
+    expect((await call('code=real&state=st-notion')).statusCode).toBe(200);
+    expect(seen).toEqual(['/api/mcp/oauth/callback/notion?code=real&state=st-notion']);
   });
 });
 
@@ -487,6 +717,7 @@ describe('triggers', () => {
         every: 15,
         deliver: 'whatsapp',
         paused: false,
+        role: 'primary',
         tools: { level: 'none', toolsets: ['todo', 'no_mcp'], full: false },
       },
     ]);
@@ -501,7 +732,7 @@ describe('triggers', () => {
 
   it('gives a trigger full access only when asked, and then lets it open the mail', async () => {
     const { connectors, dashboard } = make();
-    await connectors.createTrigger({ name: 'Bills', query: 'from:bank.com', action: 'File it.', every: 60, deliver: 'whatsapp', tools: 'all' });
+    await connectors.createTrigger({ name: 'Bills', query: 'from:bank.example.com', action: 'File it.', every: 60, deliver: 'whatsapp', tools: 'all' });
     const job = dashboard.cron[0]!;
     expect(job).toMatchObject({ enabled_toolsets: [...TOOLSETS.all], skills: ['google-workspace'] });
     expect(job.prompt).toMatch(/Use the google-workspace skill/);
@@ -578,11 +809,11 @@ describe('connector routes', () => {
 
 describe('helper config', () => {
   const valid = { publicOrigin: ORIGIN, access: { teamDomain: ISSUER, aud: AUD, allowedEmails: [EMAIL] }, stateDir: '/tmp/x' };
-  it('is off by default, on port 8793, and may not share a port', () => {
-    expect(parseConfig(valid).helper).toEqual({ enabled: false, port: 8793 });
+  it('is off by default, on port 19013, and may not share a port', () => {
+    expect(parseConfig(valid).helper).toEqual({ enabled: false, port: 19013 });
     expect(parseConfig({ ...valid, helper: { enabled: true, port: 9100 } }).helper).toEqual({ enabled: true, port: 9100 });
-    expect(() => parseConfig({ ...valid, helper: { enabled: true, port: 8790 } })).toThrow();
-    expect(() => parseConfig({ ...valid, helper: { enabled: true, port: 8792 } })).toThrow();
+    expect(() => parseConfig({ ...valid, helper: { enabled: true, port: 19010 } })).toThrow();
+    expect(() => parseConfig({ ...valid, helper: { enabled: true, port: 19012 } })).toThrow();
     expect(() => parseConfig({ ...valid, helper: { enabled: true, host: '0.0.0.0' } })).toThrow();
   });
 });

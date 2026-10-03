@@ -32,7 +32,23 @@ import re
 import sys
 import time
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+_runtime_dir = Path(__file__).resolve().parent
+if not (_runtime_dir / "wayroost_runtime.py").is_file():
+    _runtime_dir = _runtime_dir.parent.parent / "helper"
+sys.path.insert(0, str(_runtime_dir))
+try:
+    if not (_runtime_dir / "wayroost_runtime.py").is_file():
+        raise ImportError("Wayroost runtime is missing")
+    from wayroost_runtime import BackgroundGate, env as runtime_env  # noqa: E402
+except ImportError:
+    BackgroundGate = None
+
+    def runtime_env(suffix, default=None, environ=None):
+        environ = os.environ if environ is None else environ
+        return environ.get(f"WAYROOST_{suffix}", environ.get(f"SIGNALBOX_{suffix}", default))
 
 TOOL_PREFIX = "mcp__signalbox__"
 CALLER_ARG = "_signalbox_caller"
@@ -62,8 +78,8 @@ def on_pre_tool_call(tool_name: Any = "", args: Any = None, session_id: Any = ""
 
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.ASCII)
-_LAUNCH_VARS = (b"SIGNALBOX_LAUNCHER", b"HERMES_SESSION_ID", b"PASEO_AGENT_ID")
-_BRIDGE_URL = "http://127.0.0.1:8792"
+_LAUNCH_VARS = (b"WAYROOST_LAUNCHER", b"SIGNALBOX_LAUNCHER", b"HERMES_SESSION_ID", b"PASEO_AGENT_ID")
+_BRIDGE_URL = "http://127.0.0.1:19012"
 _reported = False
 
 
@@ -85,7 +101,7 @@ def initial_environ(path: str = "/proc/self/environ") -> Dict[str, str]:
 def launch_candidates(env: Dict[str, str], own_id: str = "") -> List[Dict[str, str]]:
     """Launchers named in ``env``, well-formed ones only; the chat's own id is never its launcher."""
     found: List[Dict[str, str]] = []
-    launcher = env.get("SIGNALBOX_LAUNCHER", "")
+    launcher = runtime_env("LAUNCHER", "", env)
     if launcher.startswith("claude:") and _UUID.fullmatch(launcher[7:]):
         found.append({"kind": "claude", "id": launcher[7:]})
     session = env.get("HERMES_SESSION_ID", "")
@@ -103,7 +119,7 @@ def _is_acp() -> bool:
 
 
 def _bridge_token() -> Optional[str]:
-    path = os.environ.get("SIGNALBOX_BRIDGE_TOKEN_FILE") or os.path.expanduser("~/.config/signalbox/bridge-token")
+    path = runtime_env("BRIDGE_TOKEN_FILE") or os.path.expanduser("~/.config/signalbox/bridge-token")
     try:
         with open(path, encoding="ascii") as f:
             token = f.read().strip()
@@ -132,6 +148,8 @@ def on_session_start(session_id: Any = "", **_: Any) -> None:
     """``on_session_start`` hook: report which agent's shell started this Hermes process, once."""
     global _reported
     try:
+        if BackgroundGate is None or not BackgroundGate(default_config=Path(__file__).with_name("wayroost-role.json")).run(lambda: True):
+            return
         if _reported or not isinstance(session_id, str) or not _STORED_SESSION_ID.fullmatch(session_id) or _is_acp():
             return
         _reported = True  # the first chat only: later ones in this process are its own children

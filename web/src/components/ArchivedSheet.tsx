@@ -10,7 +10,7 @@ import { ConfirmDialog, SOURCE_NAMES, Sheet, SourceAvatar } from './common';
 const keyOf = (t: ArchivedThread) => `${t.source}:${t.id}`;
 
 /** What's archived in Hermes and Paseo, to restore or delete for good. */
-export function ArchivedSheet({ onClose }: { onClose: () => void }) {
+export function ArchivedSheet({ onClose, as = 'sheet' }: { onClose: () => void; as?: 'sheet' | 'page' }) {
   const [threads, setThreads] = useState<ArchivedThread[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -62,7 +62,7 @@ export function ArchivedSheet({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <Sheet title="Archived threads" onClose={onClose}>
+    <Sheet title="Archived threads" onClose={onClose} as={as}>
       {error ? (
         <p className="error-text">{error}</p>
       ) : !threads ? (

@@ -1,18 +1,19 @@
 import { useScheduleOverview } from '../scheduleData';
 import { ScheduledView } from './ScheduledView';
-import { CalendarClock, FolderTree, KeyRound, List, Plus, Search, Settings, ShieldAlert, Sparkles, WifiOff } from 'lucide-react';
-import { useCallback, useMemo, useState } from 'react';
+import { CalendarClock, FolderTree, KeyRound, List, Plus, Search, Settings, Sparkles, WifiOff } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ConversationSummary } from '../../../shared/protocol';
 import { oneLine } from '../format';
 import { chatIndex, groupByProject, parentOf } from '../projects';
-import { conversationPath, navigate } from '../router';
+import { conversationPath, navigate, type ChatsFilter } from '../router';
 import { convKey, useStore } from '../store';
+import { ApprovalBanner } from './Approvals';
 import { ConversationRow } from './ConversationRow';
 import { newCount, sortCards } from '../feed';
 import { Logo, SOURCE_NAMES, SourceAvatar, statusLabel, statusTone, useEnabledSources } from './common';
 import { ProjectList } from './ProjectList';
 
-type Filter = 'all' | 'attention' | 'hermes' | 'paseo';
+type Filter = ChatsFilter;
 type View = 'recent' | 'projects' | 'scheduled';
 
 const VIEW_KEY = 'signalbox:inbox-view';
@@ -29,6 +30,8 @@ function readView(): View {
 export function Inbox({
   activeKey,
   offline,
+  filter,
+  onFilter,
   onNew,
   onSettings,
   onForYou,
@@ -37,6 +40,9 @@ export function Inbox({
 }: {
   activeKey: string | null;
   offline: boolean;
+  /** Which chats to list; the address bar holds it, so a Home tile can open its own view. */
+  filter: Filter;
+  onFilter: (filter: Filter) => void;
   onNew: (cwd?: string) => void;
   onSettings: () => void;
   /** Open For you (Hermes' pulse cards). */
@@ -57,7 +63,6 @@ export function Inbox({
   const fresh = newCount(feed);
   const firstFresh = useMemo(() => sortCards(Object.values(feed ?? {})).find((c) => c.status === 'new'), [feed]);
   const enabled = useEnabledSources();
-  const [filter, setFilter] = useState<Filter>('all');
   const [view, setViewState] = useState<View>(readView);
   const [query, setQuery] = useState('');
 
@@ -69,6 +74,11 @@ export function Inbox({
       // convenience only
     }
   };
+
+  // A Home tile or a changed filter URL asks for chats, even if Scheduled was saved.
+  useEffect(() => {
+    if (filter !== 'all' && view === 'scheduled') setView('recent');
+  }, [filter]);
 
   const waiting = useMemo(
     () => Object.values(approvals).sort((a, b) => a.createdAt - b.createdAt),
@@ -88,6 +98,7 @@ export function Inbox({
     let items = all;
     if (filter === 'hermes' || filter === 'paseo') items = items.filter((c) => c.source === filter);
     if (filter === 'attention') items = items.filter((c) => needsYou(c) || c.status === 'error');
+    if (filter === 'working') items = items.filter((c) => c.status === 'running');
     const q = query.trim().toLowerCase();
     if (q) {
       items = items.filter((c) =>
@@ -107,17 +118,19 @@ export function Inbox({
   const groups = useMemo(() => groupByProject(filtered, needsYou), [filtered, needsYou]);
 
   const attentionCount = useMemo(() => all.filter(needsYou).length, [all, needsYou]);
+  const workingCount = useMemo(() => all.filter((c) => c.status === 'running').length, [all]);
 
   const chips: Array<{ id: Filter; label: string; count?: number }> = [
     { id: 'all', label: 'All' },
     { id: 'attention', label: 'Needs you', count: attentionCount },
+    { id: 'working', label: 'Working', count: workingCount },
     // Source filters only make sense when both are running.
     ...(enabled.length > 1 ? enabled.map((s) => ({ id: s as Filter, label: SOURCE_NAMES[s] })) : []),
   ];
 
   const openFirstWaiting = () => {
     const first = waiting[0];
-    if (first) navigate(conversationPath(first.source, first.conversationId));
+    if (first) navigate(conversationPath(first.source, first.conversationId, filter));
   };
 
   return (
@@ -125,7 +138,7 @@ export function Inbox({
       <header className="topbar">
         <div className="brand">
           <Logo />
-          <span>Signalbox</span>
+          <span>Wayroost</span>
         </div>
         <button type="button" className="status-dots" onClick={onSettings} aria-label="Connection status">
           {enabled.map((s) => (
@@ -221,7 +234,7 @@ export function Inbox({
                 type="button"
                 className="chip"
                 aria-pressed={filter === chip.id}
-                onClick={() => setFilter(chip.id)}
+                onClick={() => onFilter(chip.id)}
               >
                 {chip.label}
                 {chip.count ? <span className="count">{chip.count}</span> : null}
@@ -231,16 +244,7 @@ export function Inbox({
         )}
       </div>
 
-      {waiting.length > 0 && filter !== 'attention' && (
-        <button type="button" className="attention" onClick={openFirstWaiting}>
-          <ShieldAlert size={20} />
-          <span className="grow">
-            <strong>{waiting.length === 1 ? '1 request needs you' : `${waiting.length} requests need you`}</strong>
-            <br />
-            <span className="muted">{oneLine(waiting[0]!.title, 60)}</span>
-          </span>
-        </button>
-      )}
+      {waiting.length > 0 && filter !== 'attention' && <ApprovalBanner approvals={waiting} onOpen={openFirstWaiting} />}
 
       {firstFresh && filter !== 'attention' && (
         <button type="button" className="attention foryou-strip" onClick={onForYou}>

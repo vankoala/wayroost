@@ -1,6 +1,7 @@
-import { Feather, LoaderCircle, SquareTerminal, X } from 'lucide-react';
-import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { ChevronLeft, Feather, LoaderCircle, SquareTerminal, X } from 'lucide-react';
+import { useEffect, useId, useRef, useState, type AnchorHTMLAttributes, type ReactNode, type RefObject } from 'react';
 import type { Source, SourceState } from '../../../shared/protocol';
+import { navigate } from '../router';
 import { useStore } from '../store';
 
 const FOCUSABLE =
@@ -10,12 +11,17 @@ const FOCUSABLE =
  * Dialog focus: moves focus in (unless a child already took it), keeps Tab
  * inside, and hands focus back to where it was when the dialog closes.
  */
-export function useFocusTrap(ref: RefObject<HTMLElement | null>, initial?: RefObject<HTMLElement | null>): void {
+export function useFocusTrap(
+  ref: RefObject<HTMLElement | null>,
+  initial?: RefObject<HTMLElement | null>,
+  /** False for a page of the shell: all of it is reachable, nothing is trapped. */
+  enabled = true,
+): void {
   // Read while rendering, before any autoFocus inside the dialog moves it.
   const [previous] = useState(() => (document.activeElement instanceof HTMLElement ? document.activeElement : null));
   useEffect(() => {
     const root = ref.current;
-    if (!root) return;
+    if (!root || !enabled) return;
     if (!root.contains(document.activeElement)) (initial?.current ?? root).focus({ preventScroll: true });
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Tab' || e.defaultPrevented) return; // e.g. Tab picked a "/" command
@@ -41,7 +47,7 @@ export function useFocusTrap(ref: RefObject<HTMLElement | null>, initial?: RefOb
       document.removeEventListener('keydown', onKey);
       if (previous?.isConnected && previous !== document.body) previous.focus({ preventScroll: true });
     };
-  }, [ref, initial, previous]);
+  }, [ref, initial, previous, enabled]);
 }
 
 export const SOURCE_NAMES: Record<Source, string> = { hermes: 'Hermes', paseo: 'Paseo' };
@@ -50,6 +56,51 @@ export const SOURCE_NAMES: Record<Source, string> = { hermes: 'Hermes', paseo: '
 export function useEnabledSources(): Source[] {
   const statuses = useStore((s) => s.statuses);
   return (['hermes', 'paseo'] as const).filter((s) => statuses[s].state !== 'disabled');
+}
+
+/**
+ * A link to a page of this app. A real href (so open-in-a-tab and a copy of the
+ * address work) that stays inside the app on a plain click.
+ */
+export function Link({ to, children, ...rest }: { to: string } & AnchorHTMLAttributes<HTMLAnchorElement>) {
+  return (
+    <a
+      href={to}
+      {...rest}
+      onClick={(event) => {
+        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+          return;
+        }
+        event.preventDefault();
+        navigate(to);
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+/** A page of the shell: a title, actions on the right, and its body below. */
+export function Page({
+  className = '',
+  title,
+  actions,
+  children,
+}: {
+  className?: string;
+  title: string;
+  actions?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className={`page ${className}`.trim()} aria-label={title}>
+      <header className="page-head">
+        <h1>{title}</h1>
+        {actions ? <div className="page-actions">{actions}</div> : null}
+      </header>
+      <div className="page-body">{children}</div>
+    </section>
+  );
 }
 
 export function Logo({ size = 28 }: { size?: number }) {
@@ -153,6 +204,12 @@ export function Sheet({
   children,
   footer,
   wide = false,
+  /**
+   * Render as a page of the shell instead of a sheet over it. Every place in the app
+   * is a page with its own URL; sheets are left for quick actions only, so the
+   * screens that used to be sheets keep their markup and change only their container.
+   */
+  as = 'sheet',
 }: {
   title: string;
   onClose: () => void;
@@ -160,27 +217,43 @@ export function Sheet({
   footer?: ReactNode;
   /** Wider on a desktop screen, for a grid of cards. */
   wide?: boolean;
+  as?: 'sheet' | 'page';
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  useFocusTrap(ref);
+  useFocusTrap(ref, undefined, as !== 'page');
   useEffect(() => {
+    if (as === 'page') return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, [onClose, as]);
+
+  const head = (
+    <div className="sheet-head">
+      <h2>{title}</h2>
+      <button type="button" className="icon-btn" onClick={onClose} aria-label={as === 'page' ? 'Back' : 'Close'}>
+        {as === 'page' ? <ChevronLeft size={20} /> : <X size={20} />}
+      </button>
+    </div>
+  );
+
+  if (as === 'page') {
+    return (
+      <section ref={ref} className={`sheet sheet-page${wide ? ' sheet-wide' : ''}`} aria-label={title}>
+        {head}
+        <div className="sheet-body">{children}</div>
+        {footer && <div className="sheet-foot">{footer}</div>}
+      </section>
+    );
+  }
 
   return (
     <div className="backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div ref={ref} className={wide ? 'sheet sheet-wide' : 'sheet'} role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}>
         <div className="sheet-grip mobile-only" />
-        <div className="sheet-head">
-          <h2>{title}</h2>
-          <button type="button" className="icon-btn" onClick={onClose} aria-label="Close">
-            <X size={20} />
-          </button>
-        </div>
+        {head}
         <div className="sheet-body">{children}</div>
         {footer && <div className="sheet-foot">{footer}</div>}
       </div>

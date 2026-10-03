@@ -54,6 +54,8 @@ install -m 755 -o root -g root claude-hook/signalbox-claude-hook.py "$DEST/bin/s
 install -m 755 -o root -g root helper/signalbox-helper.py "$DEST/bin/signalbox-helper.py"
 install -m 644 -o root -g root helper/signalbox_mail_trigger.py "$DEST/bin/signalbox_mail_trigger.py"
 install -m 644 -o root -g root helper/signalbox_skills.py "$DEST/bin/signalbox_skills.py"
+install -m 644 -o root -g root helper/wayroost_runtime.py "$DEST/bin/wayroost_runtime.py"
+install -m 644 -o root -g root deploy/primary-role.json "$DEST/bin/wayroost-role.json"
 # The speech service voice mode uses (deploy/setup-speech.sh turns it on).
 speech_changed=0
 cmp -s speech/signalbox-speech.py "$DEST/bin/signalbox-speech.py" || speech_changed=1
@@ -64,6 +66,18 @@ chmod -R go-w "$DEST"
 echo "==> Installing systemd unit"
 sed "s#/usr/bin/node#$NODE#" deploy/signalbox.service > /etc/systemd/system/signalbox.service
 chmod 644 /etc/systemd/system/signalbox.service
+# Older helper units predate explicit roles. Add the primary default to the base
+# unit so existing operator drop-ins can still narrow it to shadow.
+if [[ -f /etc/systemd/system/signalbox-helper.service ]]; then
+  python3 - /etc/systemd/system/signalbox-helper.service <<'PY'
+from pathlib import Path
+import sys
+unit = Path(sys.argv[1])
+text = unit.read_text()
+if "WAYROOST_HELPER_ROLE_CONFIG=" not in text:
+    unit.write_text(text.replace("[Service]\n", "[Service]\nEnvironment=WAYROOST_HELPER_ROLE_CONFIG=/opt/signalbox/bin/wayroost-role.json\n", 1))
+PY
+fi
 install -d -m 755 "$ETC"
 systemctl daemon-reload
 systemctl enable signalbox.service >/dev/null
@@ -98,5 +112,5 @@ else
   if [[ ! -f "$ETC/config.json" ]]; then
     echo "First create $ETC/config.json from deploy/config.example.json (see docs/setup.md)."
   fi
-  echo "Next: sudo deploy/setup-tunnel.sh <hostname> — it fills in the Access values and starts Signalbox."
+  echo "Next: sudo deploy/setup-tunnel.sh <hostname> — it fills in the Access values and starts Wayroost."
 fi

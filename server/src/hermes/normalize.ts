@@ -398,7 +398,7 @@ export function permissionApproval(
     conversationId,
     kind: 'permission',
     title: description ? capitalize(description) : tool ? `Use ${tool}` : 'Run a command',
-    ...(command ? { detail: clip(command, MAX_APPROVAL_DETAIL) } : {}),
+    ...(command ? { detail: clip(command, MAX_APPROVAL_DETAIL), detailKind: 'command' as const } : {}),
     ...(command && command.length > MAX_APPROVAL_DETAIL ? { detailTruncated: true } : {}),
     options: permissionChoices(params).map((c) => ({ id: c, label: CHOICES[c]!.label, kind: CHOICES[c]!.kind })),
     createdAt,

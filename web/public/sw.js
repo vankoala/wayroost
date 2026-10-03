@@ -14,7 +14,7 @@ self.addEventListener('push', (event) => {
   } catch {
     data = {};
   }
-  const title = typeof data.title === 'string' && data.title ? data.title : 'Signalbox';
+  const title = typeof data.title === 'string' && data.title ? data.title : 'Wayroost';
   // Only a path on this site: not "//elsewhere" or "/\elsewhere".
   const url = typeof data.url === 'string' && /^\/(?![\/\\])/.test(data.url) ? data.url : '/';
   event.waitUntil(

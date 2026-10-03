@@ -1,6 +1,8 @@
+import { checkDeviceSignal, deviceSignal } from '../security/device-signal.js';
 import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 import type { HermesAuth } from './auth.js';
+import type { BackgroundGate } from '../background.js';
 
 // JSON-RPC 2.0 over the dashboard's /api/ws. Mirrors the reference client in
 // hermes-agent/apps/shared/src/json-rpc-channel.ts: fresh single-use ticket per
@@ -61,6 +63,7 @@ export class HermesGateway extends EventEmitter<HermesGatewayEvents> {
 
   private ws: WebSocket | undefined;
   private seq = 0;
+  private capabilities?: Promise<unknown>;
   private readonly pending = new Map<string, Pending>();
   private attempts = 0;
   private stopped = true;
@@ -72,8 +75,18 @@ export class HermesGateway extends EventEmitter<HermesGatewayEvents> {
   constructor(
     private readonly baseUrl: string,
     private readonly auth: HermesAuth,
+    private readonly background: BackgroundGate,
   ) {
     super();
+  }
+
+  /** An explicit chat action needs Hermes to send its approval requests here. */
+  async enableServerRequests(): Promise<void> {
+    this.capabilities ??= this.call('client.capabilities', { server_requests: true }, 10_000).catch((err) => {
+      this.capabilities = undefined;
+      throw err;
+    });
+    await this.capabilities;
   }
 
   start(): void {
@@ -97,24 +110,28 @@ export class HermesGateway extends EventEmitter<HermesGatewayEvents> {
     this.start();
   }
 
-  call<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<T> {
+  call<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs = 30_000, signal = deviceSignal()): Promise<T> {
+    checkDeviceSignal(signal);
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN || (this.state !== 'ready' && method !== 'client.capabilities')) {
       return Promise.reject(new RpcError(-1, 'Hermes is not connected'));
     }
     const id = `wc-${++this.seq}`;
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new RpcError(-2, `Hermes did not answer ${method} in time`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
-      ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', cancel); this.pending.delete(id); };
+      const fail = (err: Error) => { cleanup(); reject(err); };
+      const cancel = () => { try { checkDeviceSignal(signal); } catch (err) { fail(err as Error); } };
+      const timer = setTimeout(() => fail(new RpcError(-2, `Hermes did not answer ${method} in time`)), timeoutMs);
+      this.pending.set(id, { resolve: value => { cleanup(); resolve(value as T); }, reject: fail, timer });
+      signal?.addEventListener('abort', cancel, { once: true });
+      try { checkDeviceSignal(signal); ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); }
+      catch (err) { fail(err as Error); }
     });
   }
 
   /** Answer a server→client request, only on the connection it arrived on. */
-  respond(id: string, result: Record<string, unknown>, generation: number): boolean {
+  respond(id: string, result: Record<string, unknown>, generation: number, signal = deviceSignal()): boolean {
+    checkDeviceSignal(signal);
     if (generation !== this.generation || this.state !== 'ready' || this.ws?.readyState !== WebSocket.OPEN) {
       return false;
     }
@@ -213,7 +230,8 @@ export class HermesGateway extends EventEmitter<HermesGatewayEvents> {
 
   private async onReady(): Promise<void> {
     try {
-      await this.call('client.capabilities', { server_requests: true }, 10_000);
+      this.capabilities = undefined;
+      await this.background.run(() => this.enableServerRequests());
     } catch (err) {
       this.emit('failure', err as Error);
       this.ws?.terminate();

@@ -6,6 +6,7 @@ import { WS_CLOSE_REAUTH, WS_CLOSE_SESSION_EXPIRED, type ServerEvent } from '../
 import { createAccessVerifier } from '../src/security/access.js';
 import {
   AUD,
+  DESKTOP_COOKIE,
   EMAIL,
   ISSUER,
   ORIGIN,
@@ -132,7 +133,7 @@ describe('Cloudflare Access identity', () => {
       headers: { host, 'cf-access-jwt-assertion': token, accept: 'text/html' },
     });
     expect(res.statusCode).toBe(200);
-    expect(res.body).toContain('Signalbox');
+    expect(res.body).toContain('Wayroost');
   });
 
   it('lets install assets through without a token (Access still guards them at the edge)', async () => {
@@ -150,20 +151,20 @@ describe('browser protections', () => {
 
   it('requires the request marker header on API calls', async () => {
     const { app } = await setup();
-    const { 'x-signalbox-request': _omit, ...headers } = apiHeaders(token);
+    const { 'x-wayroost-request': _omit, ...headers } = apiHeaders(token);
     expect((await app.inject({ url: '/api/me', headers })).statusCode).toBe(403);
   });
 
   it('applies the API rules to percent-encoded and odd paths too', async () => {
     const { app, hermes } = await setup();
     for (const url of ['/%61pi/me', '/%61%70%69/conversations', '/api/me/']) {
-      const res = await app.inject({ url, headers: { host, 'cf-access-jwt-assertion': token } });
+      const res = await app.inject({ url, headers: { host, 'cf-access-jwt-assertion': token, cookie: DESKTOP_COOKIE } });
       expect(res.statusCode, url).not.toBe(200);
     }
     const post = await app.inject({
       method: 'POST',
       url: '/%61pi/conversations/hermes/h1/messages',
-      headers: { host, 'cf-access-jwt-assertion': token, 'content-type': 'application/json' },
+      headers: { host, 'cf-access-jwt-assertion': token, cookie: DESKTOP_COOKIE, 'content-type': 'application/json' },
       payload: JSON.stringify({ text: 'hi' }),
     });
     expect(post.statusCode).toBe(403);
@@ -279,16 +280,16 @@ describe('new Hermes chats', () => {
     const options = await app.inject({ url: '/api/hermes/options', headers: apiHeaders(token) });
     expect(options.statusCode).toBe(200);
     expect(options.json()).toEqual({
-      models: [{ id: '["local","flash-next"]', label: 'flash-next', group: 'Local' }],
-      defaultModel: '["local","flash-next"]',
+      models: [{ id: '["local","main-model"]', label: 'main-model', group: 'Local' }],
+      defaultModel: '["local","main-model"]',
     });
     const post = (body: unknown) =>
       app.inject({ method: 'POST', url: '/api/hermes/conversations', headers: postHeaders(token), payload: JSON.stringify(body) });
-    expect((await post({ text: 'hi', model: '["local","flash-next"]', confirmModel: true })).statusCode).toBe(200);
+    expect((await post({ text: 'hi', model: '["local","main-model"]', confirmModel: true })).statusCode).toBe(200);
     expect((await post({ text: 'hi', model: 5 })).statusCode).toBe(400);
     expect((await post({ text: 'hi', model: '' })).statusCode).toBe(400);
     expect((await post({ text: 'hi', confirmModel: 'yes' })).statusCode).toBe(400);
-    expect(hermes.calls).toEqual(['options', 'create:hi', 'create-model:["local","flash-next"]:confirmed']);
+    expect(hermes.calls).toEqual(['options', 'create:hi', 'create-model:["local","main-model"]:confirmed']);
   });
 });
 
@@ -310,7 +311,7 @@ describe('folders for new chats', () => {
     expect((await post({ path: 'notes' })).statusCode).toBe(400);
     expect((await post({ path: '/home/me/x', parents: true })).statusCode).toBe(400);
     // Same rules as the rest of the API.
-    expect((await post({ path: '/home/me/y' }, { 'x-signalbox-request': '' })).statusCode).toBe(403);
+    expect((await post({ path: '/home/me/y' }, { 'x-wayroost-request': '' })).statusCode).toBe(403);
     expect((await post({ path: '/home/me/y' }, { origin: 'https://evil.example' })).statusCode).toBe(403);
     expect(paseo.calls.filter((c) => c.startsWith('mkdir:'))).toEqual(['mkdir:/home/me/notes']);
   });
@@ -341,7 +342,7 @@ describe('"/" commands', () => {
     expect(hermes.calls).toEqual(['commands:h1', 'commands:new']);
 
     // Same rules as the rest of the API.
-    const noMarker = await app.inject({ url: '/api/hermes/commands', headers: { ...apiHeaders(token), 'x-signalbox-request': '' } });
+    const noMarker = await app.inject({ url: '/api/hermes/commands', headers: { ...apiHeaders(token), 'x-wayroost-request': '' } });
     expect(noMarker.statusCode).toBe(403);
   });
 
@@ -391,7 +392,7 @@ describe('live event socket', () => {
 
   it('refuses sockets from other origins (cross-site WebSocket hijacking)', async () => {
     const { url } = await listen();
-    const ws = connect(url, { origin: 'https://evil.example', 'cf-access-jwt-assertion': token });
+    const ws = connect(url, { origin: 'https://evil.example', 'cf-access-jwt-assertion': token, cookie: DESKTOP_COOKIE });
     expect(await rejectionStatus(ws)).toBe(403);
   });
 
@@ -403,7 +404,7 @@ describe('live event socket', () => {
   it('greets an authenticated socket and routes timeline events only to subscribers', async () => {
     const { url, hub } = await listen();
     const received: ServerEvent[] = [];
-    const ws = connect(url, { origin: ORIGIN, 'cf-access-jwt-assertion': token });
+    const ws = connect(url, { origin: ORIGIN, 'cf-access-jwt-assertion': token, cookie: DESKTOP_COOKIE });
     ws.on('message', (data) => received.push(JSON.parse(String(data))));
     await once(ws, 'open');
     await expect.poll(() => received[0]?.type).toBe('hello');
@@ -414,7 +415,8 @@ describe('live event socket', () => {
     hub.publish({ type: 'items_upsert', source: 'hermes', conversationId: 'h1', items: [] });
     hub.publish({ type: 'conversation_removed', source: 'paseo', id: 'p9' });
 
-    await expect.poll(() => received.map((e) => e.type)).toEqual(['hello', 'items_upsert', 'conversation_removed']);
+    // The greeting carries the status block's first snapshot along with the hello.
+    await expect.poll(() => received.map((e) => e.type)).toEqual(['hello', 'power_status', 'items_upsert', 'conversation_removed']);
   });
 
   it('recycles long-lived sockets so they re-authenticate through Access', async () => {
@@ -422,7 +424,7 @@ describe('live event socket', () => {
     await ctx.app.listen({ host: '127.0.0.1', port: 0 });
     const port = (ctx.app.server.address() as { port: number }).port;
     ctx.config.allowedHosts.add(`127.0.0.1:${port}`);
-    const ws = connect(`ws://127.0.0.1:${port}/ws`, { origin: ORIGIN, 'cf-access-jwt-assertion': token });
+    const ws = connect(`ws://127.0.0.1:${port}/ws`, { origin: ORIGIN, 'cf-access-jwt-assertion': token, cookie: DESKTOP_COOKIE });
     const [code] = (await once(ws, 'close')) as [number];
     expect(code).toBe(WS_CLOSE_REAUTH);
   });
@@ -430,7 +432,7 @@ describe('live event socket', () => {
   it('closes the socket when the Access session expires', async () => {
     const { url } = await listen();
     const shortLived = await makeToken(keys, { expiresIn: Math.floor(Date.now() / 1000) + 2 });
-    const ws = connect(url, { origin: ORIGIN, 'cf-access-jwt-assertion': shortLived });
+    const ws = connect(url, { origin: ORIGIN, 'cf-access-jwt-assertion': shortLived, cookie: DESKTOP_COOKIE });
     const [code] = (await once(ws, 'close')) as [number];
     expect(code).toBe(WS_CLOSE_SESSION_EXPIRED);
   });

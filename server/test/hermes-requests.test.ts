@@ -1,9 +1,11 @@
+import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerEvent } from '../../shared/protocol.js';
 import { HermesAdapter } from '../src/hermes/adapter.js';
+import { HermesGateway } from '../src/hermes/gateway.js';
 import { EventHub } from '../src/hub.js';
 import { SecretStore } from '../src/secrets.js';
 import { UserFacingError } from '../src/sources.js';
@@ -39,19 +41,20 @@ describe('hermes cards stay in step with what Hermes has open', () => {
     };
     stateDir = mkdtempSync(join(tmpdir(), 'sb-requests-'));
     new SecretStore(stateDir).writeHermes(FAKE_USER);
-    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog);
+    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { background: new BackgroundGate('primary') });
   });
 
   /** An adapter that asks which chats are live every 50 ms, with a browser connected. */
   function pollingAdapter(): void {
     adapter.stop();
-    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { activePollMs: 50 });
+    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { background: new BackgroundGate('primary'), activePollMs: 50 });
     hub.add({ readyState: 1, bufferedAmount: 0, send() {}, terminate() {} } as never, 'owner@example.com');
   }
 
   afterEach(async () => {
     adapter.stop();
     await fake.stop();
+    vi.restoreAllMocks();
   });
 
   async function connect(): Promise<void> {
@@ -169,6 +172,47 @@ describe('hermes cards stay in step with what Hermes has open', () => {
   });
 
   describe('reconnecting', () => {
+    it.each(['initial attachment', 'reconnect'])(
+      'keeps ordered stream and request frames immediately after a resume reply on %s', async (connection) => {
+        if (connection === 'reconnect') {
+          await connect();
+          adapter.setWatching(STORED, true);
+        }
+        const call = HermesGateway.prototype.call;
+        vi.spyOn(HermesGateway.prototype, 'call').mockImplementation(function<T>(
+          this: HermesGateway, method: string, params: Record<string, unknown> = {}, timeoutMs = 30_000, signal?: AbortSignal,
+        ): Promise<T> {
+          const reply = call.call(this, method, params, timeoutMs, signal) as Promise<T>;
+          if (method !== 'session.resume') return reply;
+          return reply.then((snapshot) => {
+            const runtime = (snapshot as { session_id: string }).session_id;
+            // A synchronous receiver batch runs before the awaiting adapter can bind.
+            this.emit('event', { type: 'message.start', session_id: runtime });
+            this.emit('event', { type: 'message.delta', session_id: runtime, payload: { text: 'Demo first. ' } });
+            this.emit('request', { id: 'demo-immediate-request', method: 'approval',
+              params: { session_id: runtime, ...SCAN }, generation: this.generation });
+            this.emit('event', { type: 'message.delta', session_id: runtime, payload: { text: 'Demo second.' } });
+            this.emit('event', { type: 'request.cancel', session_id: runtime, payload: { id: 'demo-immediate-request' } });
+            this.emit('event', { type: 'message.complete', session_id: runtime, payload: { text: '', status: 'ok' } });
+            return snapshot;
+          });
+        });
+        if (connection === 'reconnect') {
+          fake.disconnect();
+          await reconnected();
+          await adapter.getConversation(STORED);
+        } else await connect();
+        const items = published.flatMap((event) => event.type === 'items_upsert' && event.conversationId === STORED ? event.items : []);
+        expect(items).toContainEqual(expect.objectContaining({ kind: 'assistant', text: 'Demo first. Demo second.' }));
+        expect(published).toContainEqual(expect.objectContaining({ type: 'approval_upsert',
+          approval: expect.objectContaining({ id: 'demo-immediate-request', conversationId: STORED }) }));
+        expect(published).toContainEqual(removed('demo-immediate-request'));
+        expect(cards()).toEqual([]);
+        expect(fake.coldResumes).toBe(0);
+        expect(fake.reruns).toBe(0);
+      },
+    );
+
     it('drops cards Hermes lost in a restart, without resuming the chat', async () => {
       await connect();
       fake.event('message.start');
@@ -394,6 +438,8 @@ describe('hermes cards stay in step with what Hermes has open', () => {
       await reconnected();
       await expect.poll(() => calls('session.resume').length).toBe(2);
 
+      await adapter.getConversation(STORED); // joins the completed attachment, including runtime binding
+
       fake.event('message.start');
       fake.event('message.delta', { text: 'Still here after the blip.' });
       await expect.poll(streamed).toContain('Still here after the blip.');
@@ -412,6 +458,7 @@ describe('hermes cards stay in step with what Hermes has open', () => {
 
       fake.live = true; // another client resumed it
       await expect.poll(() => calls('session.resume').length).toBe(2);
+      await adapter.getConversation(STORED);
       fake.event('message.start');
       fake.event('message.delta', { text: 'Picked up on the desktop.' });
       await expect.poll(streamed).toContain('Picked up on the desktop.');

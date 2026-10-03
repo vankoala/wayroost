@@ -32,7 +32,7 @@ class DisabledSource {
   stop(): void {}
 
   protected off(): never {
-    throw new UserFacingError(`${NAMES[this.source]} isn't enabled in this Signalbox.`, 404);
+    throw new UserFacingError(`${NAMES[this.source]} isn't enabled in this Wayroost.`, 404);
   }
   async getConversation(): Promise<ConversationDetail> {
     return this.off();

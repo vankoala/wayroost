@@ -73,7 +73,7 @@ const EVENT_TEXT: Record<SkillEvent['kind'], string> = {
 
 const needsAttention = (s: SkillInfo) => Object.values(s.apps).includes('edited');
 
-export function SkillsSheet({ onClose }: { onClose: () => void }) {
+export function SkillsSheet({ onClose, as = 'sheet' }: { onClose: () => void; as?: 'sheet' | 'page' }) {
   const version = useStore((s) => s.skillsVersion);
   const [data, setData] = useState<SkillList | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -117,7 +117,7 @@ export function SkillsSheet({ onClose }: { onClose: () => void }) {
   const installing = data?.installs.filter((i) => i.state === 'installing' || i.state === 'sharing').length ?? 0;
 
   return (
-    <Sheet title="Skills" onClose={onClose} wide>
+    <Sheet title="Skills" onClose={onClose} wide as={as}>
       <p className="muted connector-note">
         Skills every agent on this PC can use: Hermes, pi, Claude Code, Codex and OpenCode, here and on Windows (Paseo's agents
         are these apps). Shared skills reach every app within seconds.
@@ -555,7 +555,7 @@ function ScanResult({
 
 function NewsView({ data }: { data: SkillList }) {
   const placeLabel = (id?: string) => (id ? (data.places.find((p) => p.id === id)?.label ?? id) : '');
-  if (data.events.length === 0) return <p className="muted">Nothing new since Signalbox started watching the skill folders.</p>;
+  if (data.events.length === 0) return <p className="muted">Nothing new since Wayroost started watching the skill folders.</p>;
   return (
     <div className="group skills-news">
       {data.events.map((e, i) => (

@@ -1,0 +1,42 @@
+{
+  "role": "shadow",
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 8881
+  },
+  "publicOrigin": "https://wayroost.example.com",
+  "origins": [
+    "https://127.0.0.1:8881"
+  ],
+  "devices": {
+    "enabled": true
+  },
+  "access": {
+    "teamDomain": "https://YOUR-TEAM.cloudflareaccess.com",
+    "aud": "YOUR-ACCESS-APPLICATION-AUD-TAG",
+    "allowedEmails": [
+      "you@example.com"
+    ]
+  },
+  "hermes": {
+    "enabled": true,
+    "url": "http://127.0.0.1:19006"
+  },
+  "paseo": {
+    "enabled": true,
+    "url": "ws://127.0.0.1:19007"
+  },
+  "bridge": {
+    "enabled": false
+  },
+  "helper": {
+    "enabled": false
+  },
+  "feed": {
+    "enabled": false
+  },
+  "stateDir": "/var/lib/wayroost",
+  "tls": {
+    "certFile": "/etc/wayroost/server-tls-cert.pem"
+  }
+}

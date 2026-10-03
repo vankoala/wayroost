@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import type {
   Approval,
+  DeviceInfo,
   FeedCard,
   AttachmentRef,
   CommandResult,
@@ -12,7 +13,15 @@ import type {
 } from '../../shared/protocol';
 import { moveDraft } from './drafts';
 import { movePreviews } from './previews';
-import { conversationPath, navigate, parseRoute } from './router';
+import { conversationPath, navigate, parseChatsFilter, parseRoute } from './router';
+
+declare global {
+  interface Window {
+    wayroostTray?: { update(event: unknown): void; anomaly?(): void; socketClosed?(code: number): void;
+      beginSpeech?(): Promise<string | undefined>; cancelSpeech?(id: string): Promise<boolean>; endSpeech?(id: string): void;
+      onAuthentication?(listener: (state: 'verified' | 'unverified' | 'unpaired') => void): void };
+  }
+}
 
 // A tiny global store (no dependencies). Selectors must return existing
 // references — derive sorted/filtered lists with useMemo in components.
@@ -22,6 +31,7 @@ export const approvalKey = (a: Pick<Approval, 'source' | 'conversationId' | 'id'
   `${a.source}:${a.conversationId}:${a.id}`;
 
 export interface DetailState {
+  needsOpen?: boolean;
   status: 'loading' | 'ready' | 'error';
   items: TimelineItem[];
   error?: string;
@@ -51,8 +61,13 @@ export interface AppState {
   feed: Record<string, FeedCard> | null;
   /** Bumped when a skill folder changes, so an open Skills page refetches. */
   skillsVersion: number;
+  /** The Cloudflare Access identity, when the app is reached through Access. */
   email?: string;
+  /** This browser's paired device, from /api/me or the socket greeting. */
+  device?: DeviceInfo;
   sessionExpired: boolean;
+  /** This browser isn't a paired device (or was revoked): only the pairing page can help. */
+  unpaired: boolean;
   socket: SocketState;
   statuses: Record<Source, SourceStatus>;
   listLoaded: boolean;
@@ -67,6 +82,7 @@ export interface AppState {
 
 const initialState: AppState = {
   sessionExpired: false,
+  unpaired: false,
   schedulesVersion: 0,
   feed: null,
   skillsVersion: 0,
@@ -85,7 +101,13 @@ const initialState: AppState = {
 };
 
 let state = initialState;
+let authenticationGeneration = 0;
+let nativeAuthentication = false;
+let applyingNativeAuthentication = false;
 const listeners = new Set<() => void>();
+
+export function getAuthenticationGeneration(): number { return authenticationGeneration; }
+export function authenticationBlocked(): boolean { return state.unpaired || state.sessionExpired; }
 
 export function getState(): AppState {
   return state;
@@ -93,7 +115,12 @@ export function getState(): AppState {
 
 export function setState(update: (s: AppState) => AppState): void {
   const next = update(state);
+  if (nativeAuthentication && !applyingNativeAuthentication && (next.unpaired !== state.unpaired || next.sessionExpired !== state.sessionExpired)) return;
   if (next === state) return;
+  const authenticationChanged = next.unpaired !== state.unpaired || next.sessionExpired !== state.sessionExpired;
+  // Late requests, socket events and UI callbacks cannot repopulate a suspended generation.
+  if (authenticationBlocked() && !authenticationChanged) return;
+  if (authenticationChanged) authenticationGeneration += 1;
   state = next;
   for (const listener of listeners) listener();
 }
@@ -117,8 +144,34 @@ export function useStore<T>(selector: (s: AppState) => T): T {
 
 // ---- Toasts ----------------------------------------------------------------
 
+function suspendAuthentication(): boolean {
+  if (state.sessionExpired || state.unpaired) return false;
+  pendingDeltas.clear(); early.clear(); moves.clear();
+  setState((s) => ({ ...initialState, socket: s.socket, sessionExpired: true }));
+  return true;
+}
+
+/** The sign-in died (an expired Access cookie): show "sign in again" once. */
+export function markSignedOut(): void {
+  if (nativeAuthentication) { window.wayroostTray?.anomaly?.(); return; }
+  suspendAuthentication();
+}
+
+/**
+ * The server doesn't know this browser as a paired device (never paired, or
+ * revoked): only the pairing page can help. Everything this device had loaded
+ * (chats, approvals, cards) goes with it.
+ */
+export function markUnpaired(): void {
+  if (nativeAuthentication) { window.wayroostTray?.anomaly?.(); return; }
+  if (state.unpaired) return;
+  pendingDeltas.clear(); early.clear(); moves.clear();
+  setState((s) => (s.unpaired ? s : { ...initialState, socket: s.socket, unpaired: true }));
+}
+
 let toastSeq = 0;
 export function toast(text: string, tone: Toast['tone'] = 'error'): void {
+  if (authenticationBlocked()) return;
   const id = ++toastSeq;
   setState((s) => ({ ...s, toasts: [...s.toasts.slice(-2), { id, text, tone }] }));
   setTimeout(() => setState((s) => ({ ...s, toasts: s.toasts.filter((t) => t.id !== id) })), 4500);
@@ -297,6 +350,7 @@ const early = new Map<string, TimelineItem[]>();
 
 /** Add items the server answered a request with (e.g. "/" command output) to a conversation. */
 export function upsertConversationItems(source: Source, id: string, items: TimelineItem[]): void {
+  if (authenticationBlocked()) return;
   if (!items.length) return;
   const conversationId = currentId(source, id);
   const key = convKey(source, conversationId);
@@ -363,18 +417,20 @@ function moveConversation(source: Source, fromId: string, toId: string): void {
   // Follow it without leaving the dead id in history.
   const route = parseRoute(location.pathname);
   if (route.name === 'conversation' && route.source === source && route.id === fromId) {
-    navigate(conversationPath(source, toId), { replace: true });
+    navigate(conversationPath(source, toId, parseChatsFilter(location.pathname + location.search)), { replace: true });
   }
 }
 
 // ---- Server events ---------------------------------------------------------
 
 export function applyEvent(event: ServerEvent): void {
+  if (authenticationBlocked()) return;
   switch (event.type) {
     case 'hello':
       setState((s) => ({
         ...s,
-        email: event.email,
+        ...(event.email ? { email: event.email } : {}),
+        device: event.device,
         statuses: Object.fromEntries(event.statuses.map((st) => [st.source, st])) as AppState['statuses'],
       }));
       return;
@@ -463,4 +519,17 @@ export function applyEvent(event: ServerEvent): void {
     case 'pong':
       return;
   }
+}
+
+if (typeof window !== 'undefined' && window.wayroostTray?.onAuthentication) {
+  nativeAuthentication = true;
+  window.wayroostTray.onAuthentication((authentication) => {
+    const unpaired = authentication === 'unpaired';
+    const sessionExpired = authentication === 'unverified';
+    if (state.unpaired === unpaired && state.sessionExpired === sessionExpired) return;
+    pendingDeltas.clear(); early.clear(); moves.clear();
+    applyingNativeAuthentication = true;
+    try { setState(() => ({ ...initialState, unpaired, sessionExpired })); }
+    finally { applyingNativeAuthentication = false; }
+  });
 }

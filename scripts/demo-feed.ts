@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../server/src/background.js';
 // Demo data for For you (the demo server and the UI check): a few cards like the
 // ones Hermes' 7am brief and daytime checks post, a stand-in for the pulse jobs
 // so the proactivity level can be changed, and phone notifications that go nowhere.
@@ -34,13 +35,13 @@ export class DemoPulseJobs {
 
 export function demoFeed(hub: EventHub, hermes: Pick<HermesSource, 'createConversation'>, stateDir: string): Feed {
   const store = new FeedStore(stateDir);
-  const feed = new Feed({
+  const feed = new Feed({ background: new BackgroundGate('primary'),
     store,
     hub,
     hermes,
     schedules: new DemoPulseJobs(),
     // Notifications "work" but never leave the machine.
-    push: new PushSender(stateDir, 'https://signalbox.example.com', quiet, (async () => new Response(null, { status: 201 })) as unknown as typeof fetch),
+    push: new PushSender(stateDir, 'https://wayroost.example.com', quiet, (async () => new Response(null, { status: 201 })) as unknown as typeof fetch, new BackgroundGate('primary')),
     log: quiet,
   });
   feed.ingest('brief', [

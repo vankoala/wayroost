@@ -1,3 +1,4 @@
+import { checkDeviceSignal, deviceSignal } from './security/device-signal.js';
 import type { Attachment } from './attachments.js';
 import type { MediaFile } from './media.js';
 import type {
@@ -27,13 +28,17 @@ export async function eachThread(
   source: Source,
   ids: readonly string[],
   act: (id: string) => Promise<unknown>,
+  signal = deviceSignal(),
 ): Promise<ThreadActionResult> {
   const result: ThreadActionResult = { done: 0, failed: [] };
   for (const id of ids) {
+    checkDeviceSignal(signal);
     try {
       await act(id);
       result.done += 1;
     } catch (err) {
+      // Loss of authorization ends the batch, including failures inside a thread's lineage.
+      checkDeviceSignal(signal);
       result.failed.push({ source, id, error: err instanceof Error ? err.message : String(err) });
     }
   }
@@ -50,12 +55,26 @@ export class UserFacingError extends Error {
   }
 }
 
+/** Only connection failures and explicit service unavailability leave retry budgets untouched. */
+export function transientFailure(err: unknown): boolean {
+  if (err instanceof UserFacingError) return err.status === 503;
+  let current = err;
+  for (let depth = 0; current && typeof current === 'object' && depth < 5; depth++) {
+    const { code, name, cause } = current as { code?: unknown; name?: unknown; cause?: unknown };
+    if (name === 'AbortError' || name === 'TimeoutError') return true;
+    if (typeof code === 'string' && ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EHOSTUNREACH', 'EPIPE', 'ETIMEDOUT',
+      'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET'].includes(code)) return true;
+    current = cause;
+  }
+  return false;
+}
+
 export interface ConversationSource {
   status(): SourceStatus;
   listConversations(): Promise<ConversationSummary[]>;
   /** Approvals currently waiting on the user, across all conversations. */
   listApprovals(): Approval[];
-  getConversation(id: string): Promise<ConversationDetail>;
+  getConversation(id: string, deliberateOpen?: boolean): Promise<ConversationDetail>;
   /**
    * Send a message. For Hermes, "/" text without attachments is run as a
    * command instead, and what it produced is returned.
@@ -79,11 +98,11 @@ export interface ConversationSource {
    * Archive threads in the backend itself, so its own app hides them too.
    * `folder`: also archive the older chats there that the inbox doesn't list.
    */
-  archiveThreads?(ids: string[], folder?: FolderScope): Promise<ThreadActionResult>;
+  archiveThreads?(ids: string[], folder?: FolderScope, signal?: AbortSignal): Promise<ThreadActionResult>;
   /** Bring archived threads back. */
-  restoreThreads?(ids: string[]): Promise<ThreadActionResult>;
+  restoreThreads?(ids: string[], signal?: AbortSignal): Promise<ThreadActionResult>;
   /** Delete threads for good. */
-  deleteThreads?(ids: string[]): Promise<ThreadActionResult>;
+  deleteThreads?(ids: string[], signal?: AbortSignal): Promise<ThreadActionResult>;
   /** Archived threads, most recently active first. */
   listArchived?(limit: number): Promise<ArchivedThread[]>;
   /**
@@ -91,6 +110,19 @@ export interface ConversationSource {
    * only those the inbox lists, and never one that's working or waiting on you.
    */
   idleThreads?(before: number): Promise<string[]>;
+  /**
+   * A chat's summary from what Signalbox already knows, also for one the recent
+   * list leaves out (an older chat). No network call.
+   */
+  summaryOf?(id: string): ConversationSummary | undefined;
+  /** Follow explicit backend move reports before checking readiness or sending. */
+  resolveChat?(id: string): string;
+  /** Reconcile contradictory listing aliases with authoritative backend identity. */
+  resolveListedChat?(id: string, list: readonly ConversationSummary[]): Promise<string>;
+  /** Establish live readiness before a queued delivery, including an attachment snapshot. */
+  deliverySummary?(id: string): Promise<ConversationSummary | undefined>;
+  /** Recheck identity, activity, approvals and the queue's guard before every submission, including retries. */
+  sendMessageWhenIdle?(id: string, text: string, beforeSubmit?: () => Promise<void>): Promise<void>;
 }
 
 export interface CreateResult {

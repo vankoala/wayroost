@@ -1,69 +1,35 @@
-/* Signalbox — mobile-first design system. Colors follow the OS light/dark setting. */
+/* Signalbox — mobile-first design system. Colours follow the Wayroost tokens in
+   tokens.css (warm paper light / warm brown-black dark, OS scheme by default). */
 
 :root {
-  color-scheme: dark;
-  --bg: #0c0e12;
-  --bg-elev: #13161c;
-  --bg-elev-2: #1a1e26;
-  --bg-hover: #1f242d;
-  --bg-glass: rgba(12, 14, 18, 0.82);
-  --border: #252a33;
-  --border-strong: #353b47;
-  --text: #e9ecf1;
-  --text-2: #a4acb9;
-  --text-3: #6f7886;
-  --accent: #7b8cff;
-  --accent-strong: #5f70f0;
-  --on-accent: #ffffff;
-  --hermes: #f2b54a;
-  --hermes-bg: rgba(242, 181, 74, 0.14);
-  --paseo: #35c9b0;
-  --paseo-bg: rgba(53, 201, 176, 0.14);
-  --warn: #f5b041;
-  --warn-bg: rgba(245, 176, 65, 0.1);
-  --warn-border: rgba(245, 176, 65, 0.45);
-  --danger: #f27272;
-  --danger-bg: rgba(242, 114, 114, 0.12);
-  --success: #4cc38a;
-  --code-bg: #0f1217;
-  --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
-  --radius: 14px;
-  --radius-sm: 10px;
-  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --bg-elev: var(--surface);
+  --bg-elev-2: var(--surface-2);
+  --bg-hover: var(--hover);
+  --bg-glass: var(--surface-glass);
+  --border: var(--line);
+  --border-strong: var(--btn-line);
+  --text: var(--ink);
+  --text-2: var(--ink-2);
+  --text-3: var(--ink-3);
+  --accent-strong: var(--accent);
+  --hermes: var(--source-hermes);
+  --hermes-bg: var(--source-hermes-bg);
+  --paseo: var(--source-paseo);
+  --paseo-bg: var(--source-paseo-bg);
+  --warn: var(--warning);
+  --warn-bg: var(--warning-bg);
+  --warn-border: var(--warning-border);
+  --danger: var(--bad);
+  --danger-bg: var(--error-bg);
+  --success: var(--ok);
+  --code-bg: var(--surface-2);
+  --radius: var(--radius-card);
+  --radius-sm: var(--radius-control);
+  --font: var(--font-body);
+  --mono: var(--font-code);
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --list-width: 360px;
-}
-
-@media (prefers-color-scheme: light) {
-  :root {
-    color-scheme: light;
-    --bg: #f6f7f9;
-    --bg-elev: #ffffff;
-    --bg-elev-2: #f0f2f5;
-    --bg-hover: #eaedf1;
-    --bg-glass: rgba(246, 247, 249, 0.86);
-    --border: #e2e5ea;
-    --border-strong: #cfd4dc;
-    --text: #14171c;
-    --text-2: #56606e;
-    --text-3: #8a93a0;
-    --accent: #4c5bd4;
-    --accent-strong: #3f4dc4;
-    --hermes: #b8780f;
-    --hermes-bg: rgba(212, 140, 20, 0.12);
-    --paseo: #0d8f7c;
-    --paseo-bg: rgba(13, 143, 124, 0.1);
-    --warn: #b36b00;
-    --warn-bg: rgba(245, 160, 40, 0.1);
-    --warn-border: rgba(200, 120, 0, 0.4);
-    --danger: #d23c3c;
-    --danger-bg: rgba(210, 60, 60, 0.08);
-    --success: #1f8a5b;
-    --code-bg: #f3f4f7;
-    --shadow: 0 10px 30px rgba(20, 23, 28, 0.14);
-  }
 }
 
 * {
@@ -397,11 +363,29 @@ a {
 }
 
 .row:active {
-  background: var(--bg-elev-2);
+  background: var(--nav-active);
 }
 
 .row[aria-current='page'] {
-  background: var(--bg-elev-2);
+  background: var(--nav-active);
+}
+
+/* Secondary and metadata text stay AA readable on hovered, pressed and selected rows, and on the
+   plum-tinted "this one" surfaces: the chosen folder, the current picker choice, the highlighted
+   "/" command and the For you strip. Plain --ink-2 measured 4.27-4.42:1 on the light tints and
+   --ink-3 (the folder path) 4.13:1 light, 3.94:1 dark. Hovered and pressed pickers and commands
+   sit on the same --hover as hovered rows, so they follow too. */
+.row:hover,
+.row:active,
+.row[aria-current='page'],
+.option[aria-checked='true'],
+.pick-option:hover:not(:disabled),
+.pick-option[aria-checked='true'],
+.slash-row[aria-selected='true'],
+.slash-row:active,
+.attention.foryou-strip {
+  --text-2: var(--ink-2-on-state);
+  --text-3: var(--ink-3-on-state);
 }
 
 .row-main {
@@ -753,9 +737,11 @@ a {
   color: #1b1300;
 }
 
+/* The label is pulled a little towards --ink: plain --accent on its own wash over a dark hovered
+   row (--hover) measured 4.44:1, below AA. */
 .pill.running {
   background: color-mix(in srgb, var(--accent) 16%, transparent);
-  color: var(--accent);
+  color: color-mix(in srgb, var(--accent) 80%, var(--ink));
 }
 
 .pill.error {
@@ -1154,8 +1140,7 @@ a {
   color: var(--text-3);
 }
 
-.io pre,
-.approval pre {
+.io pre {
   margin: 4px 0 0;
   padding: 10px;
   border-radius: 8px;
@@ -1226,115 +1211,9 @@ a {
   z-index: 2;
 }
 
-/* ---------- Approvals ---------- */
-
-/* Never more than about 58% of the visible screen, and it gives way first
-   when space runs out: the message box and Stop below always keep theirs. */
-.approval-dock {
-  flex: 0 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  padding: 10px 12px 0;
-  max-width: 820px;
-  width: 100%;
-  margin: 0 auto;
-  max-height: 58vh;
-  max-height: 58dvh;
-  max-height: calc(var(--app-height, 100dvh) * 0.58);
-}
-
-/* The card scrolls inside itself; its buttons stay pinned to its bottom. */
-.approval {
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  -webkit-overflow-scrolling: touch;
-  border: 1px solid var(--warn-border);
-  background: var(--warn-bg);
-  border-radius: var(--radius);
-  padding: 12px 12px 0;
-  animation: rise 180ms ease-out;
-}
-
-.approval-foot {
-  position: sticky;
-  bottom: 0;
-  z-index: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin: 12px -12px 0;
-  padding: 10px 12px 12px;
-  border-top: 1px solid color-mix(in srgb, var(--warn-border) 50%, transparent);
-  /* The card's tint over the page, opaque, so text scrolling under it is hidden. */
-  background: linear-gradient(var(--warn-bg), var(--warn-bg)), var(--bg);
-}
-
-.approval-foot .approval-actions {
-  margin-top: 0;
-}
-
-.approval-title.folded {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
-  overflow: hidden;
-}
-
-.approval-more {
-  margin-top: 2px;
-}
-
 /* The conversation keeps a strip it can scroll, however big the card. */
 .timeline-wrap {
   min-height: min(96px, 16vh);
-}
-
-.approval-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  font-weight: 650;
-  font-size: 15px;
-}
-
-.approval-head svg {
-  color: var(--warn);
-  flex-shrink: 0;
-  margin-top: 2px;
-}
-
-.approval-head .grow {
-  flex: 1;
-  min-width: 0;
-}
-
-.approval-head .of {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-2);
-}
-
-/* No scroller inside the scroller: the card itself scrolls. */
-.approval pre {
-  max-height: none;
-  margin-top: 10px;
-}
-
-.approval pre.collapsed {
-  max-height: none;
-}
-
-.approval-meta {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  font-size: 12.5px;
-  color: var(--text-2);
 }
 
 .link-btn {
@@ -1349,30 +1228,6 @@ a {
 
 .flip {
   transform: rotate(180deg);
-}
-
-.approval-warn,
-.approval-hint {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  margin: 8px 0 0;
-  font-size: 13px;
-  line-height: 1.4;
-}
-
-.approval-warn {
-  color: var(--warn);
-}
-
-.approval-hint {
-  color: var(--text-2);
-}
-
-.approval-warn svg,
-.approval-hint svg {
-  flex-shrink: 0;
-  margin-top: 2px;
 }
 
 .ack {
@@ -1404,18 +1259,6 @@ a {
 
 .chip .auto-mark {
   color: var(--warn);
-}
-
-.approval-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.approval-actions .btn {
-  flex: 1 1 0;
-  min-width: 96px;
 }
 
 /* ---------- Composer ---------- */
@@ -3004,7 +2847,8 @@ a {
   color: var(--danger);
 }
 
-.tidy-days select {
+.tidy-days select,
+.bridge-settings select {
   font: inherit;
   font-size: 16px; /* smaller makes iOS zoom in on tap */
   color: var(--text);
@@ -3034,88 +2878,13 @@ a {
   padding: 8px 4px;
 }
 
-/* ---------- Passwords and codes Hermes asks for ---------- */
-
-.secret-box input {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  outline: none;
-  background: transparent;
-  font-size: 16px; /* no zoom on focus in iOS */
-  padding: 7px 0;
-  letter-spacing: 0.08em;
-}
-
-.secret-box input::placeholder {
-  color: var(--text-3);
-  letter-spacing: normal;
-}
-
-.secret-confirm {
-  margin-top: 12px;
-  padding: 12px;
-  border-radius: 12px;
-  border: 1px solid var(--warn-border);
-  background: var(--bg-elev);
-  font-size: 15px;
-}
-
-.secret-confirm .approval-actions {
-  margin-top: 10px;
-}
-
-.secret-note {
-  color: var(--text-3);
-  font-size: 12.5px;
-}
-
-/* A login to save: two labelled fields. */
-.secret-fields {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-top: 12px;
-}
-
-.secret-field {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-2);
-}
-
-.secret-field input {
-  width: 100%;
-  border: 1px solid var(--border-strong);
-  border-radius: 12px;
-  background: var(--bg-elev);
-  padding: 10px 12px;
-  font-size: 16px; /* no zoom on focus in iOS */
-  font-weight: 400;
-  color: var(--text);
-  outline: none;
-}
-
-.secret-field input:focus {
-  border-color: var(--accent);
-}
-
-.approval-secret .secret-note {
-  margin-top: 10px;
-}
-
-.approval-foot .secret-confirm {
-  margin-top: 0;
-}
-
 /* ---------- Threads across backends, and sub-agents ---------- */
 
+/* The label is --text, not --text-2: with the wash blended over a plain phone row (--bg) or a
+   selected row, --text-2 measured 4.21:1 and 4.39:1 in light, below AA. */
 .tag-subagent {
   background: color-mix(in srgb, var(--text-3) 18%, transparent);
-  color: var(--text-2);
+  color: var(--text);
 }
 
 .lane-subs {
@@ -4216,4 +3985,23 @@ button.scheduled-item:hover {
 }
 .tools-full-text svg {
   vertical-align: -1px;
+}
+@media (max-width: 719px) {
+  .voice-settings .kv:has(select) {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+  }
+  .voice-settings .kv:has(select) > .grow {
+    grid-column: 2 / -1;
+  }
+  .voice-settings .kv > select {
+    grid-column: 2;
+    min-width: 0;
+    width: 100%;
+  }
+  .voice-settings .kv:has(> .grow + .muted) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
 }

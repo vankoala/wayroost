@@ -78,7 +78,7 @@ export function blockedReason(cmd: ParsedCommand, allowSafety = false): string |
   const rule = BLOCKED[cmd.name];
   if (!rule || (rule.args && !rule.args.test(cmd.arg))) return null;
   const shown = rule.args ? `/${cmd.name} ${cmd.arg.split(/\s/)[0]}` : `/${cmd.name}`;
-  return `For safety, ${shown} can't be run from Signalbox: ${rule.reason}. Turn on Settings → Security → Hermes safety commands, or use the Hermes desktop app or terminal.`;
+  return `For safety, ${shown} can't be run from Wayroost: ${rule.reason}. Turn on Settings → Security → Hermes safety commands, or use the Hermes desktop app or terminal.`;
 }
 
 export function canonicalName(name: string, catalog: HermesCatalog | undefined): string {

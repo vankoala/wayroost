@@ -1,0 +1,39 @@
+[Unit]
+Description=Wayroost Paseo Safety configuration helper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR-OWNER
+Group=wayroost
+ExecStart=/usr/bin/node /opt/wayroost/server/dist/server/safety-helper.js
+WorkingDirectory=/opt/wayroost/server
+Environment=NODE_ENV=production
+# It serves the shadow server: only deliberate setting writes apply policy.
+Environment=WAYROOST_ROLE=shadow
+Environment=WAYROOST_SAFETY_CONFIG=%d/safety-helper.json
+Environment=WAYROOST_SAFETY_SOCKET=/run/wayroost-paseo-safety/helper.sock
+LoadCredential=safety-helper.json:/etc/wayroost/safety-helper.json
+LoadCredential=safety-helper-key:/etc/wayroost/safety-helper-key
+Restart=on-failure
+RestartSec=3
+StateDirectory=wayroost-paseo-safety
+StateDirectoryMode=0700
+RuntimeDirectory=wayroost-paseo-safety
+RuntimeDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=YOUR-PASEO-DIRECTORY
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

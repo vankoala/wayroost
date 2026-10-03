@@ -1,11 +1,11 @@
-# How Signalbox talks to Hermes
+# How Wayroost talks to Hermes
 
-Signalbox connects to the Hermes dashboard on your machine
-(`http://127.0.0.1:9119` by default; `hermes.url` must be an http(s) loopback
+Wayroost connects to the Hermes dashboard on your machine
+(`http://127.0.0.1:19006` by default; `hermes.url` must be an http(s) loopback
 address). It signs in the way the dashboard's own clients do, reads chat lists
 and history over HTTP, and does everything live (streaming, approvals, sending,
 file uploads, "/" commands, stopping) over the dashboard's JSON-RPC WebSocket,
-`/api/ws`. The WebSocket client is Signalbox's own, modelled on the reference
+`/api/ws`. The WebSocket client is Wayroost's own, modelled on the reference
 client in Hermes Agent (`apps/shared/src/json-rpc-channel.ts`). Code:
 `server/src/hermes/`.
 
@@ -13,28 +13,28 @@ Tested Hermes versions are listed in [setup.md](setup.md#what-you-need).
 
 ## Signing in
 
-Signalbox needs your Hermes dashboard username and password (`auth.ts`):
+Wayroost needs your Hermes dashboard username and password (`auth.ts`):
 
-- You enter them under **Settings → Hermes sign-in**. Signalbox tries them with
+- You enter them under **Settings → Hermes sign-in**. Wayroost tries them with
   Hermes before saving, so a typo never replaces credentials that work. Then it
   keeps them in `hermes-credentials.json` in its state directory (mode 600). It
   accepts five attempts a minute.
 - Signing in is `POST /auth/password-login` with `provider: "basic"`. Hermes
   answers with two session cookies: `hermes_session_at` (access) and
-  `hermes_session_rt` (refresh). Signalbox sends the access value as a `Bearer`
+  `hermes_session_rt` (refresh). Wayroost sends the access value as a `Bearer`
   token. Both tokens stay in the server's memory. They're never written to disk
   or sent to your browser.
 - The access token's expiry comes from `GET /api/auth/me` after signing in, or
-  from the refresh response. If Hermes doesn't say, Signalbox assumes one hour.
-  Once less than two minutes are left, Signalbox gets a new pair from
+  from the refresh response. If Hermes doesn't say, Wayroost assumes one hour.
+  Once less than two minutes are left, Wayroost gets a new pair from
   `POST /auth/native/refresh` before its next request.
 - A request that gets a 401 is retried once with a renewed token.
 
 When your password is sent:
 
-| Situation | What Signalbox does |
+| Situation | What Wayroost does |
 | --- | --- |
-| Signalbox starts, or you sign in under Settings | signs in with the password, because tokens only live in memory |
+| Wayroost starts, or you sign in under Settings | signs in with the password, because tokens only live in memory |
 | The refresh gets a 401, for example because Hermes restarted with a new signing secret | signs in with the password again |
 | Hermes can't be reached, or the refresh fails in any other way | shows the error and retries the refresh later, without the password |
 | Hermes rejects the saved password (401 or 422) | stops retrying, so it doesn't trip Hermes' rate limiter, and asks you to sign in again |
@@ -52,8 +52,8 @@ Every connection (`gateway.ts`):
    `/api/ws?ticket=…`;
 2. waits for Hermes' `gateway.ready` event;
 3. calls `client.capabilities` with `server_requests: true`. This tells Hermes
-   that Signalbox answers its requests, such as approvals. Without it, Hermes
-   withdraws them. If the call fails, Signalbox drops the socket and starts
+   that Wayroost answers its requests, such as approvals. Without it, Hermes
+   withdraws them. If the call fails, Wayroost drops the socket and starts
    over;
 4. only then sends other calls.
 
@@ -61,13 +61,13 @@ Messages on the socket are JSON-RPC 2.0:
 
 | Frame | Meaning |
 | --- | --- |
-| a response | the answer to one of Signalbox's calls, matched by id. Calls time out after 30 s by default. |
+| a response | the answer to one of Wayroost's calls, matched by id. Calls time out after 30 s by default. |
 | an `event` notification | `{ type, session_id, payload }`: streamed text, tool calls, status, titles |
 | a request from Hermes | something Hermes needs a client to answer: `approval`, `clarify`, password prompts |
 
 To stay connected:
 
-- Signalbox calls `gateway.ping` every 15 s. If nothing arrives from Hermes for
+- Wayroost calls `gateway.ping` every 15 s. If nothing arrives from Hermes for
   45 s, it drops the socket.
 - It reconnects after a random delay of up to 300 ms × 2ⁿ, at least 300 ms and
   at most 15 s. The delay starts small again once a connection has stayed up
@@ -75,7 +75,7 @@ To stay connected:
 
 ## The inbox
 
-Signalbox lists chats (Hermes calls them sessions) over HTTP:
+Wayroost lists chats (Hermes calls them sessions) over HTTP:
 
 ```
 GET /api/sessions?limit=60&order=recent&archived=exclude&min_messages=1&exclude_sources=cron,acp
@@ -88,14 +88,14 @@ GET /api/sessions?limit=60&order=recent&archived=exclude&min_messages=1&exclude_
   Paseo agents with the **Hermes · in Paseo** badge. See
   [paseo.md](paseo.md#the-inbox).
 
-A chat Signalbox is attached to (see [Opening a chat](#opening-a-chat)) stays
+A chat Wayroost is attached to (see [Opening a chat](#opening-a-chat)) stays
 listed even when this query leaves it out, for example one you just started.
 The list is cached for 3 s. It's refreshed when Hermes announces
 `sessions.changed`, and shortly after each reply finishes.
 
 Each chat becomes a conversation:
 
-| Signalbox | From Hermes |
+| Wayroost | From Hermes |
 | --- | --- |
 | title | the chat's title, else its preview, else "New chat" |
 | subtitle | where the chat started (such as Desktop, Terminal, Telegram or Scheduled) and the model |
@@ -106,10 +106,10 @@ Each chat becomes a conversation:
 | aliases | a compressed chat's earlier ids (`_lineage_ids`), so what was started under an old id still finds it |
 | parent | for a chat an agent started through the [bridge](bridge.md), the chat that started it |
 
-Statuses come from `session.active_list`, which Signalbox polls every 5 s while
+Statuses come from `session.active_list`, which Wayroost polls every 5 s while
 a browser is connected, and from live events in between:
 
-| Hermes | Signalbox |
+| Hermes | Wayroost |
 | --- | --- |
 | `waiting` | needs you |
 | `starting`, `working`, `streaming`, `resuming` | working |
@@ -118,9 +118,9 @@ a browser is connected, and from live events in between:
 A waiting approval or question always makes the chat "needs you".
 
 **Chats started elsewhere.** When `session.active_list` shows a chat as
-`waiting` and Signalbox isn't attached to it, for example a chat in the Hermes
-desktop app or terminal, Signalbox attaches to it. The request then reaches
-your phone too. The same list tells Signalbox which cards are leftovers; see
+`waiting` and Wayroost isn't attached to it, for example a chat in the Hermes
+desktop app or terminal, Wayroost attaches to it. The request then reaches
+your phone too. The same list tells Wayroost which cards are leftovers; see
 [When cards go away](#when-cards-go-away). It also ends the "working" state of
 a chat Hermes shows idle or no longer lists, such as one whose turn was killed
 with Hermes: no `message.complete` would ever come.
@@ -130,7 +130,7 @@ with Hermes: no `message.complete` would ever come.
 A chat's `delegate_task` runs (sub-agents, including work handed to another
 model) are listed under the chat that ran them, and open read-only. Hermes
 lists them only with `sessions.show_subagents` on in its config, and only
-versions whose `GET /api/config/defaults` include that setting know it; Signalbox
+versions whose `GET /api/config/defaults` include that setting know it; Wayroost
 checks once per connection. A second list asks for them without touching the
 chats' 60 places:
 
@@ -139,7 +139,7 @@ GET /api/sessions?limit=100&order=recent&archived=exclude&min_messages=1&exclude
 ```
 
 Excluding `subagent` is how a list asks for the runs. It's cached for 10 s,
-and fetched again when Hermes announces `sessions.changed` or a chat Signalbox
+and fetched again when Hermes announces `sessions.changed` or a chat Wayroost
 is attached to sends `subagent.start` or `subagent.complete`.
 
 A run is a row with a `parent_session_id` that isn't a `/branch` or `/new`
@@ -148,7 +148,7 @@ with the same id count once; Hermes can list a compressed run twice. Its parent
 is the first of:
 
 1. a listed chat;
-2. a listed chat under an earlier id (its `_lineage_ids`), or a chat Signalbox
+2. a listed chat under an earlier id (its `_lineage_ids`), or a chat Wayroost
    saw move to a new id;
 3. another run, or an earlier id of one. A run that ended in compression is
    the child's own earlier segment: it's hidden, and its parent used instead;
@@ -162,7 +162,7 @@ is the first of:
 
 At most 20 runs are kept per parent, the newest. Each shows as:
 
-| Signalbox | From Hermes |
+| Wayroost | From Hermes |
 | --- | --- |
 | title | the title without its `Subagent: ` prefix, else the preview, else "Sub-agent" |
 | subtitle | "Sub-agent · " and the model |
@@ -171,7 +171,7 @@ At most 20 runs are kept per parent, the newest. Each shows as:
 
 Opening one loads its history from the REST API and never attaches to it.
 Sending, a "/" command, Stop, changing its model or reasoning, its "/" menu
-and answering are refused. A run Signalbox hasn't listed is recognized by its
+and answering are refused. A run Wayroost hasn't listed is recognized by its
 detail row, whose `model_config` carries `_delegate_from`.
 
 ## Opening a chat
@@ -179,7 +179,7 @@ detail row, whose `model_config` carries `_delegate_from`.
 Hermes has two ids for a chat:
 
 - the **stored id**, the id Hermes saves the chat under, such as
-  `20260101_120000_abc123`. Signalbox uses it for everything you see: links,
+  `20260101_120000_abc123`. Wayroost uses it for everything you see: links,
   the inbox, approvals.
 - the **runtime id** of the live session on the gateway. Events, requests and
   calls such as `prompt.submit` use it. It belongs to one WebSocket connection.
@@ -200,12 +200,12 @@ Opening a chat does two things at once:
 **Why only live chats.** When Hermes is killed mid-turn, the turn leaves a
 crash marker. The first `session.resume` of that chat while it isn't live (a
 "cold" resume), within 15 minutes, makes Hermes re-run the lost turn by itself.
-So Signalbox never cold-resumes a chat on its own: not to show it, not after a
+So Wayroost never cold-resumes a chat on its own: not to show it, not after a
 reconnect, not for its model and reasoning chips or its "/" menu (those use
 Hermes' general options instead), and not for Stop (nothing runs in a chat that
 isn't live). Resuming a live chat changes nothing.
 
-Signalbox maps the two ids both ways. Apart from title changes, it ignores
+Wayroost maps the two ids both ways. Apart from title changes, it ignores
 events and requests for chats it isn't attached to. It attaches:
 
 - to a live chat you open, and to chats you have open once they become live,
@@ -218,13 +218,13 @@ events and requests for chats it isn't attached to. It attaches:
   its agent is built. A message you send claims the chat first (`prompt.submit`
   marks it running at once), so Hermes drops the re-run. For anything else,
   and for a message with files (the uploads come first, and the re-run could
-  take them), Signalbox cancels the re-run with `session.interrupt` right
+  take them), Wayroost cancels the re-run with `session.interrupt` right
   after the resume, which also clears Hermes' crash marker, and says so in the
   chat;
 - again after Hermes reclaims one (`session.reclaimed`), if it's live.
 
 When Hermes does re-run a lost turn, for example because another app resumed
-the chat, the chat says "Hermes is resuming the interrupted turn." Signalbox
+the chat, the chat says "Hermes is resuming the interrupted turn." Wayroost
 knows it from `status.update` (`kind: "process"`, which background processes
 use too, so its text decides), or, if it attaches mid-way, from the
 snapshot's `inflight.display_kind: "auto_continue"`. In the history, Hermes'
@@ -234,7 +234,7 @@ way.
 
 **When a chat moves.** After compressing a chat's context, Hermes continues it
 under a new stored id and says so in `session.info` (`stored_session_id`).
-Signalbox follows the chat: its live session, status, command output and
+Wayroost follows the chat: its live session, status, command output and
 waiting cards move to the new id, and every browser gets
 `conversation_moved`. If you have the chat open, the view switches to the new
 id without adding a step to your browser history, and your unsent text and
@@ -244,7 +244,7 @@ photo thumbnails come along.
 
 History, from the messages API:
 
-| Hermes message | Signalbox |
+| Hermes message | Wayroost |
 | --- | --- |
 | `user` | your message. `@image:` and `@file:` lines at its start or end become file chips (see [Files and photos](#files-and-photos)). A skill invocation shows as what you typed, such as `/plan fix login`, instead of the whole expanded skill. |
 | `assistant` with `reasoning` | thinking |
@@ -256,7 +256,7 @@ History, from the messages API:
 
 Live events, while attached:
 
-| Hermes event | Signalbox |
+| Hermes event | Wayroost |
 | --- | --- |
 | `message.start` | a new turn; the chat shows as working |
 | `reasoning.delta` | thinking, streamed |
@@ -288,7 +288,7 @@ and any other inline base64 image in a tool's input or output becomes
 When a reply or a tool call points at an image on your machine, the timeline
 can show it; see [Images Hermes agents show](#images-hermes-agents-show).
 
-The output of "/" commands isn't part of Hermes' history. Signalbox adds it
+The output of "/" commands isn't part of Hermes' history. Wayroost adds it
 itself; see ["/" commands](#-commands).
 
 ## Approvals and questions
@@ -312,7 +312,7 @@ Each `approval` becomes a card:
 | `always` | Always allow |
 | `deny` | Deny |
 
-If the request carries a `choices` list, Signalbox keeps the choices above and
+If the request carries a `choices` list, Wayroost keeps the choices above and
 drops anything else. It uses the list if `deny` and at least one other choice
 remain. Otherwise it offers Allow once and Deny, plus Allow for this chat unless
 `allow_session` is `false` or `smart_denied` is set, plus Always allow unless
@@ -327,7 +327,7 @@ Hermes gets your pick as `{ "choice": "once" }` (or whichever you tapped).
   and **Skip**.
 - **A batch** (`questions`, each with a `qid`): one card per question, labelled
   like "Question 2 of 3". Questions Hermes already has an answer for
-  (`answers`) are left out. Signalbox collects your answers and sends them
+  (`answers`) are left out. Wayroost collects your answers and sends them
   together when you answer the last one, as
   `{ "answers": { "<qid>": "…" } }`.
 
@@ -346,7 +346,7 @@ A single question's answer goes back as `{ "answer": "…" }`.
   offered, for that request, in that chat. Anything else is refused.
 - The answer goes back as the JSON-RPC response, and **only on the connection
   the request arrived on**. If that connection has closed, or the request came
-  from a resume snapshot, Signalbox sends it with `request.answer` instead. If
+  from a resume snapshot, Wayroost sends it with `request.answer` instead. If
   Hermes says the request `expired`, the card goes away and you see "That
   request already expired."
 - The card disappears on every device once the answer is sent, or when Hermes
@@ -356,15 +356,15 @@ A single question's answer goes back as `{ "answer": "…" }`.
 ### When cards go away
 
 Hermes keeps its open requests in memory only. When it's killed, or a
-`request.cancel` is lost while the socket is down, nothing tells Signalbox, so
-Signalbox checks its cards against Hermes:
+`request.cancel` is lost while the socket is down, nothing tells Wayroost, so
+Wayroost checks its cards against Hermes:
 
 - **Snapshots.** A snapshot's open requests become cards only while a turn is
   running or Hermes says the chat is `waiting`: a background task can ask after
-  a turn ends. Cards Signalbox had before the snapshot, and that the snapshot
+  a turn ends. Cards Wayroost had before the snapshot, and that the snapshot
   doesn't list, go away.
 - **`session.active_list`.** Cards of a chat that Hermes shows as `idle`, or
-  doesn't list at all, go away: nothing is open there. Signalbox asks after
+  doesn't list at all, go away: nothing is open there. Wayroost asks after
   every reconnect, every 5 s while a browser is connected, and shortly after a
   turn ends (`message.complete`), a chat stops running (`session.info` with
   `running: false`) or you tap Stop.
@@ -394,7 +394,7 @@ Some requests ask for a password or secret. Each takes one string back,
 When time runs out, Hermes carries on without it (sudo fails for lack of a
 password, the vault stays locked, and so on) and cancels the request.
 
-**By default**, Signalbox answers none of them. If you have the chat open, it
+**By default**, Wayroost answers none of them. If you have the chat open, it
 shows a notice instead: "Hermes is asking for a password or secret. For
 safety, answer it in the Hermes desktop app or terminal."
 
@@ -445,7 +445,7 @@ in that chat's folder and the text you typed after it.
 1. `session.create` starts the chat, with the folder as `cwd` if you gave one.
    Without a folder, Hermes uses its usual one. Hermes returns the runtime id
    and the stored id.
-2. If the message is a "/" command and you attached no files, Signalbox runs it
+2. If the message is a "/" command and you attached no files, Wayroost runs it
    in the new chat instead of sending a prompt, and the chat opens on its
    output. Otherwise it uploads any files and sends your message with
    `prompt.submit`.
@@ -462,9 +462,9 @@ in an open chat (`/new`, `/reset`, `/clear` and `/stop`).
 - Text that starts with a "/" command, sent without files, runs as a command
   instead; see ["/" commands](#-commands). Files are uploaded first; see
   [Files and photos](#files-and-photos).
-- If Hermes answers 4001 (chat closed) or 4007 (chat not found), Signalbox
+- If Hermes answers 4001 (chat closed) or 4007 (chat not found), Wayroost
   attaches again and retries once.
-- Signalbox doesn't stop a running turn before sending a follow-up. Hermes
+- Wayroost doesn't stop a running turn before sending a follow-up. Hermes
   decides what to do with it. If Hermes answers that the chat is busy, you see
   "Hermes is busy with this chat. Try again shortly." Files are refused while a
   turn is running.
@@ -519,16 +519,16 @@ The paperclip adds up to four photos, PDFs, text files or documents to a
 message, 10 MB each. The server checks every file before Hermes sees it: the
 type comes from the bytes, and anything that isn't a PNG, JPEG, GIF or WebP
 image, a PDF, UTF-8 text or one of the documents listed in
-[how-it-works.md](how-it-works.md#attachments) is refused (see [SECURITY.md](../SECURITY.md)). Then Signalbox
+[how-it-works.md](how-it-works.md#attachments) is refused (see [SECURITY.md](../SECURITY.md)). Then Wayroost
 uploads the files one at a time, before the prompt, the way the desktop app
 does:
 
 | File | How it reaches Hermes |
 | --- | --- |
 | image | `image.attach_bytes`, as base64 with a file name whose extension matches the real type, because Hermes picks the image type from the extension. Hermes keeps it for the next prompt. |
-| PDF, text or document | `file.attach`, as an inline `data:` URL. Hermes saves it and returns an `@file:` reference, which Signalbox puts before your text. Hermes inlines text; for a binary file such as a spreadsheet it gives the agent the saved path ("binary file, not inlined as text"). |
+| PDF, text or document | `file.attach`, as an inline `data:` URL. Hermes saves it and returns an `@file:` reference, which Wayroost puts before your text. Hermes inlines text; for a binary file such as a spreadsheet it gives the agent the saved path ("binary file, not inlined as text"). |
 
-- File contents always travel inline. Signalbox never gives Hermes a path to
+- File contents always travel inline. Wayroost never gives Hermes a path to
   read on your machine.
 - A message with only images, no text and no other files, asks "What do you see
   in this image?", as the desktop app does.
@@ -549,13 +549,13 @@ message stays part of the text.
 
 ## Images Hermes agents show
 
-When a reply or a tool call points at an image on your machine, Signalbox can
+When a reply or a tool call points at an image on your machine, Wayroost can
 show it (see [how-it-works.md](how-it-works.md#images-from-your-machine)).
-Hermes agents often deliver files with a `MEDIA:` tag; Signalbox replaces the
+Hermes agents often deliver files with a `MEDIA:` tag; Wayroost replaces the
 tag with the file name and shows the image under the reply, as the Hermes apps
 do.
 
-Signalbox can't read your files itself. It asks the Hermes dashboard, with
+Wayroost can't read your files itself. It asks the Hermes dashboard, with
 `GET /api/fs/download?path=…&session_id=<stored id>`, the same call the
 desktop app uses. The dashboard runs as you and applies its own rules for
 sensitive files; when it refuses, you see "Hermes won't share that file."
@@ -578,24 +578,24 @@ the same list the desktop app's composer uses (`commands.ts`):
 - after a command's name, the menu offers its known argument values (the
   catalog's `sub`), and aliases find their command.
 
-Signalbox caches the catalog for five minutes, and drops it after every
+Wayroost caches the catalog for five minutes, and drops it after every
 reconnect and whenever a `skill_manage` tool call finishes, because a skill was
 created or changed. Your browser also keeps its copy for up to five minutes.
 
 ### Running a command
 
-Signalbox runs a command the way the desktop app does: `slash.exec` first, and
+Wayroost runs a command the way the desktop app does: `slash.exec` first, and
 `command.dispatch` if Hermes answers that with an error (anything but a lost
 connection or a timeout). The result is one of:
 
 | Result | What you see |
 | --- | --- |
 | output | a command block in the timeline, as plain text |
-| a prompt (skills, and some commands) | Signalbox sends the expanded prompt with `prompt.submit`. The chat shows what you typed (Hermes' `display`, such as `/plan fix login`), not the expanded skill. |
+| a prompt (skills, and some commands) | Wayroost sends the expanded prompt with `prompt.submit`. The chat shows what you typed (Hermes' `display`, such as `/plan fix login`), not the expanded skill. |
 | text to edit | it goes back into your message box. For example, `/undo` hands back your last message. |
-| an alias | Signalbox follows it (up to four hops) and checks the target against the blocked list again |
+| an alias | Wayroost follows it (up to four hops) and checks the target against the blocked list again |
 
-A few commands are handled by Signalbox itself:
+A few commands are handled by Wayroost itself:
 
 | Command | What happens |
 | --- | --- |
@@ -609,11 +609,11 @@ Output:
 - Terminal colour codes and control characters are stripped. Output is never
   rendered as markdown. Long output shows its first 12 lines, with **Show all**
   for the rest.
-- Hermes doesn't store command output, so Signalbox keeps the last 20 per chat
+- Hermes doesn't store command output, so Wayroost keeps the last 20 per chat
   in memory, until it restarts, and merges them into the timeline by time.
   Each is cut at 16,000 characters.
 - A command still running after 15 s shows as running; its output arrives live
-  when it finishes. Signalbox waits up to 11 minutes for long commands such as
+  when it finishes. Wayroost waits up to 11 minutes for long commands such as
   `/compress` and `/update`, and up to 3 minutes for the others.
 - `/undo`, `/retry` and `/compress` rewrite the stored history, so the open
   timeline is reloaded after them.
@@ -621,7 +621,7 @@ Output:
 
 ### Blocked commands
 
-These never run from Signalbox:
+These never run from Wayroost:
 
 | Command | Why |
 | --- | --- |
@@ -633,7 +633,7 @@ These never run from Signalbox:
 | `/debug` | it uploads your logs to a shareable link |
 
 You get an error line instead, such as "For safety, /yolo can't be run from
-Signalbox: it turns off approval prompts. Use the Hermes desktop app or
+Wayroost: it turns off approval prompts. Use the Hermes desktop app or
 terminal." `/yolo`, `/approve`, `/debug`, `/approvals`, `/memory` and `/skills`
 are also left out of the menu; typed by hand, only the forms above are
 refused. The same rule is behind Paseo's blocked modes; see
@@ -642,29 +642,35 @@ refused. The same rule is behind Paseo's blocked modes; see
 ## Connectors
 
 Settings → Connectors lists the services Hermes can use on your behalf. The page
-drives Hermes' own dashboard; Signalbox never holds a service's tokens.
+drives Hermes' own dashboard; Wayroost never holds a service's tokens.
 
 - **Sign-in apps** (Notion, Todoist, Dropbox and the rest) are entries in
   Hermes' approved MCP catalog (`optional-mcps/`).
   - **Connect** installs the entry (`POST /api/mcp/catalog/install`) and sets
-    its `oauth.redirect_uri` to `https://<your Signalbox>/connect/callback/<name>`.
+    its `oauth.redirect_uri` to `https://<your Wayroost>/connect/callback/<name>`.
     Then it starts Hermes' OAuth flow (`POST /api/mcp/servers/<name>/auth`).
-  - You sign in on the service's page. It sends your browser back to Signalbox,
-    through Cloudflare Access. Signalbox hands the code to the dashboard's own
-    callback on loopback, which checks it belongs to the open sign-in.
+  - You sign in on the service's page. It sends your browser back to Wayroost
+    (through Cloudflare Access, when that's configured). Wayroost hands the
+    code to the dashboard's own callback on loopback, which checks it belongs
+    to the open sign-in. Wayroost forwards a callback only within 10 minutes
+    of Connect (3 tries), and only one carrying the sign-in's OAuth `state`,
+    so if the page says "No sign-in is waiting", press Connect again. A
+    sign-in Hermes still holds from before Wayroost restarted can't be
+    finished; Connect says so, and works again once it expires.
   - A new connector starts on **Ask before changes** (`trust: untrusted`):
     read-only tools run by themselves, and anything else asks you first.
     **Automatic** is `trust: full`.
   - **Disconnect** removes the server from Hermes. To revoke fully, also remove
     the app in the service's own settings.
-  - After a change, Signalbox asks Hermes to reload its MCP tools
+  - After a change, Wayroost asks Hermes to reload its MCP tools
     (`reload.mcp`). WhatsApp and scheduled jobs run in Hermes' gateway and
     pick a new connector up when the gateway restarts.
 - **Google** goes through the Hermes Google Workspace skill's own setup script,
-  run by the Signalbox helper. Google only allows a `localhost` redirect for
+  run by the Wayroost helper. Google only allows a `localhost` redirect for
   this kind of sign-in. So after you approve, the page fails to load: copy its
-  address and paste it into Signalbox.
-- **Mail triggers** are Hermes scheduled jobs named "Signalbox: …".
+  address and paste it into Wayroost.
+- **Mail triggers** are Hermes scheduled jobs named "Signalbox: …". This job-name
+  prefix keeps the old name for compatibility; Wayroost hides it in the UI.
   - Each job runs `signalbox_mail_trigger.py` from Hermes' `scripts` folder in
     its own folder under `~/.hermes/signalbox-triggers/`.
   - The script searches Gmail. With no new match it prints
@@ -676,9 +682,9 @@ drives Hermes' own dashboard; Signalbox never holds a service's tokens.
     and starts at **Nothing**: Hermes then works only from the details the
     script passes in. Mail is other people's words, so only **Everything** lets
     it run the google-workspace skill to open the message itself.
-- **The Signalbox helper** (`deploy/setup-helper.sh <user>`) is a small service.
-  It runs as the Hermes user, listens on 127.0.0.1:8793, and shares a secret
-  with Signalbox through systemd `LoadCredential`. Without it, Google and
+- **The Wayroost helper** (`deploy/setup-helper.sh <user>`) is a small service.
+  It runs as the Hermes user, listens on 127.0.0.1:19013, and shares a secret
+  with Wayroost through systemd `LoadCredential`. Without it, Google and
   triggers say so, and the sign-in apps still work.
 
 ## WhatsApp
@@ -686,7 +692,7 @@ drives Hermes' own dashboard; Signalbox never holds a service's tokens.
 Settings → WhatsApp controls the `whatsapp-routing` Hermes plugin
 (`~/.hermes/plugins/whatsapp-routing`), which decides which Hermes chat each of
 your WhatsApp messages goes to. The section shows only when the plugin is
-installed and the Signalbox helper is running.
+installed and the Wayroost helper is running.
 
 | Setting | What it does |
 | --- | --- |
@@ -727,7 +733,7 @@ The switch pauses or resumes the job.
 digest"; the pulse jobs use For you's labels, "Morning brief" and "Daytime check") with the
 original name in the details. Each job also gets a one-sentence **idea**: what it does and
 why. The local model writes it from the instructions (127.0.0.1, nothing leaves the PC), once
-per set of instructions, cached in Signalbox's state folder as `schedule-ideas.json`. The
+per set of instructions, cached in Wayroost's state folder as `schedule-ideas.json`. The
 details show the idea, the status, when it runs (schedule and next run), when it was created,
 where results go, the run count, its skills, and the full instructions under a fold.
 
@@ -764,7 +770,7 @@ by itself. So every Hermes job made or edited here carries an explicit tool list
 - **Edit changes only what you change.** A job whose list isn't one of the four shows "Keep as
   it is: Custom: …".
 - **Unpinned jobs.** A job with no list (made in a Hermes chat, say) shows "Hermes decides":
-  `platform_toolsets.cron` in Hermes' `config.yaml` sets it, and Signalbox can't see that.
+  `platform_toolsets.cron` in Hermes' `config.yaml` sets it, and Wayroost can't see that.
 - **Warnings.** Jobs with full access, or Hermes' setting, carry a warning, and full-access
   jobs show a **Full access** badge.
 - **Never touched.** Script-only jobs (no agent) and Paseo jobs have no choice. For you's
@@ -792,7 +798,7 @@ pulse job paused by For you's level is not treated as a problem.
 - Run now starts the job in the background (Hermes' trigger route waits for the run to end);
   the job shows "Running now" until it finishes.
 - The page updates live: Hermes sends `cron.changed` when a job is claimed, finishes or
-  changes, and Signalbox passes that to open pages. A 30-second poll backs it up.
+  changes, and Wayroost passes that to open pages. A 30-second poll backs it up.
 - Mail triggers (Connectors) appear here too and can be paused or run. They're edited and
   deleted under Connectors, because their search lives in the helper.
 - Logs record the action, never a job's instructions.
@@ -813,13 +819,13 @@ PC) is running, and holds the PIN that lets calls from the owner's cell reach th
 ## Archiving and deleting
 
 A chat's ⋯ menu archives or deletes it, and so do **Archive folder** in the
-Projects view and **Settings → Tidy up**. Signalbox asks Hermes to do it
+Projects view and **Settings → Tidy up**. Wayroost asks Hermes to do it
 (`PATCH` and `DELETE /api/sessions/<id>` on the dashboard), so the Hermes
 desktop app and dashboard hide an archived chat too.
 
 - **Archive** hides the chat with its whole compression lineage (the earlier
   ids a long chat continued from); nothing is lost. Its delegate_task runs
-  leave the inbox with it, since Signalbox only folds runs under listed chats.
+  leave the inbox with it, since Wayroost only folds runs under listed chats.
   The chats it started through the bridge are archived along with it.
 - **Restore** (Settings → Tidy up → Archived threads) un-archives it. Hermes
   also un-archives a chat it closed by accident when you resume it.
@@ -836,7 +842,7 @@ desktop app and dashboard hide an archived chat too.
 ## Reconnecting
 
 While the connection is down, **Settings → Connections** shows the reason, such
-as Hermes being unreachable. Signalbox keeps retrying with the delays above,
+as Hermes being unreachable. Wayroost keeps retrying with the delays above,
 unless Hermes rejected the saved password (see [Signing in](#signing-in)).
 Each new connection:
 
@@ -850,11 +856,11 @@ Each new connection:
 Cards that were waiting stay. Answers to requests from an older connection go
 through `request.answer`, never to the new connection as a response.
 
-Your browser reconnects to Signalbox on its own and catches up; see
+Your browser reconnects to Wayroost on its own and catches up; see
 [how-it-works.md](how-it-works.md#live-updates).
 
 ## Turning Hermes off
 
-Set `"hermes": { "enabled": false }` in the config. Signalbox then never
+Set `"hermes": { "enabled": false }` in the config. Wayroost then never
 contacts the dashboard, and Hermes disappears from the interface. At least one
 of Hermes and Paseo must stay enabled.

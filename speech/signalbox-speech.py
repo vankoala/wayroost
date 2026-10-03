@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Signalbox speech service: speech-to-text and text-to-speech on the CPU.
+"""Wayroost speech service: speech-to-text and text-to-speech on the CPU.
 
 Voice mode in Signalbox sends what you say here to be written down, and sends
 agents' replies here to be read aloud. Everything stays on this PC:

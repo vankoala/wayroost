@@ -1,5 +1,5 @@
 [Unit]
-Description=Signalbox helper (Google sign-in and mail triggers for Signalbox Connectors)
+Description=Wayroost helper (Google sign-in and mail triggers for Wayroost Connectors)
 Documentation=file:///opt/signalbox/README.md
 After=network-online.target
 Wants=network-online.target
@@ -8,6 +8,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+Environment=WAYROOST_HELPER_ROLE_CONFIG=/opt/signalbox/bin/wayroost-role.json
 # Filled in by deploy/setup-helper.sh: the user Hermes runs as, and its home.
 User=@USER@
 Environment=HERMES_HOME=@HERMES_HOME@

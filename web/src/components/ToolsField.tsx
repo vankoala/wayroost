@@ -81,7 +81,7 @@ export function ToolsField({
       {suggestion && <p className="muted tools-hint">Suggested because: {suggestion}</p>}
       {value === 'keep' && current?.level === 'default' ? (
         <p className="tools-warning">
-          <TriangleAlert size={14} /> Hermes' own setting decides, and Signalbox can't see it. If Hermes sets no limit, that's
+          <TriangleAlert size={14} /> Hermes' own setting decides, and Wayroost can't see it. If Hermes sets no limit, that's
           everything. Pick one above to be sure.
         </p>
       ) : (

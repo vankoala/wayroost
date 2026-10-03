@@ -1,7 +1,9 @@
+import { checkDeviceSignal } from './security/device-signal.js';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { shadowBackground, type BackgroundGate } from './background.js';
 
 // Credentials entered in the UI live only on this machine, in the service's
 // private state directory, readable by the service user alone.
@@ -35,6 +37,7 @@ export class SecretStore {
   }
 
   writeHermes(credentials: HermesCredentials): void {
+    checkDeviceSignal();
     const value = HermesCredentialsSchema.parse(credentials);
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     const tmp = `${this.hermesPath}.${process.pid}.tmp`;
@@ -43,12 +46,13 @@ export class SecretStore {
   }
 
   clearHermes(): void {
+    checkDeviceSignal();
     rmSync(this.hermesPath, { force: true });
   }
 }
 
 /** A stable id for this app's Paseo session (Paseo groups sockets by client id). */
-export function readOrCreateClientId(dir: string): string {
+export function readOrCreateClientId(dir: string, background: BackgroundGate = shadowBackground): string {
   const path = join(dir, 'paseo-client-id');
   try {
     const existing = readFileSync(path, 'utf8').trim();
@@ -57,7 +61,9 @@ export function readOrCreateClientId(dir: string): string {
     // create below
   }
   const id = `cid_signalbox_${randomBytes(8).toString('hex')}`;
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(path, id, { mode: 0o600 });
+  background.run(() => {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(path, id, { mode: 0o600 });
+  });
   return id;
 }

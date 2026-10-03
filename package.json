@@ -37,13 +37,20 @@
     "test": "vitest run",
     "demo": "tsx scripts/demo.ts",
     "check:ui": "npm run build:web && tsx scripts/ui-check.ts ui-shots",
-    "check:paseo": "tsx scripts/paseo-compat/run.ts"
+    "check:paseo": "tsx scripts/paseo-compat/run.ts",
+    "check:paseo-tools": "tsx scripts/paseo-compat/tool-policy.ts",
+    "supervisor:dev": "node --import tsx supervisor/src/dev.ts",
+    "build:supervisor": "tsc -p tsconfig.supervisor.json",
+    "desktop:dev": "npm --prefix desktop start"
   },
   "dependencies": {
     "@fastify/static": "10.1.5",
     "@fastify/websocket": "11.3.1",
-    "@getpaseo/client": "0.5.1",
-    "@getpaseo/protocol": "0.5.1",
+    "@fontsource/figtree": "5.3.0",
+    "@fontsource/outfit": "5.3.0",
+    "@fontsource/young-serif": "5.3.0",
+    "@getpaseo/client": "0.9.2",
+    "@getpaseo/protocol": "0.9.2",
     "fastify": "5.12.5",
     "jose": "6.2.12",
     "ws": "8.22.0",

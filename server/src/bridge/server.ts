@@ -7,6 +7,7 @@ import { CardInput } from '../feed/store.js';
 import type { Logger } from '../hermes/adapter.js';
 import { UserFacingError } from '../sources.js';
 import { isBridgeTool, isReportTool, type Bridge, type BridgeIdentity } from './service.js';
+import { shadowBackground, type BackgroundGate } from '../background.js';
 
 // The bridge listener: a second Fastify instance bound to 127.0.0.1 only.
 // Cloudflare never routes here (the tunnel targets the web app's port), so
@@ -30,6 +31,7 @@ export const BRIDGE_BODY_LIMIT = 64 * 1024;
 const CHAT_ID = /^[A-Za-z0-9][\w.:@+-]{0,199}$/;
 
 export interface BridgeServerOptions {
+  background?: BackgroundGate;
   bridge: Pick<Bridge, 'call'>;
   token: string;
   port: number;
@@ -67,6 +69,7 @@ export function headerFolder(value: string | undefined): string | undefined {
 }
 
 export async function buildBridgeServer(options: BridgeServerOptions): Promise<FastifyInstance> {
+  (options.background ?? shadowBackground).require();
   const { bridge, port, log } = options;
   const expected = digest(options.token);
   const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
@@ -93,14 +96,14 @@ export async function buildBridgeServer(options: BridgeServerOptions): Promise<F
 
     // Browsers always send Origin on cross-site and POST requests; nothing legitimate here does.
     if (req.headers.origin !== undefined) {
-      return deny(req, reply, 403, 'browser request', "Browsers can't use the Signalbox bridge.");
+      return deny(req, reply, 403, 'browser request', "Browsers can't use the Wayroost bridge.");
     }
 
     // Compare fixed-length digests in constant time.
     const auth = header(req, 'authorization') ?? '';
     const presented = /^Bearer\s+(\S+)\s*$/i.exec(auth)?.[1];
     if (!presented || !timingSafeEqual(digest(presented), expected)) {
-      return deny(req, reply, 401, presented ? 'wrong token' : 'missing token', "Signalbox didn't accept the bridge token.");
+      return deny(req, reply, 401, presented ? 'wrong token' : 'missing token', "Wayroost didn't accept the bridge token.");
     }
   });
 
@@ -153,7 +156,7 @@ export async function buildBridgeServer(options: BridgeServerOptions): Promise<F
       return reply.code(status).send({ ok: false, error });
     }
     log.error({ err: err instanceof Error ? err.message : String(err) }, 'bridge request failed');
-    return reply.code(500).send({ ok: false, error: 'Something went wrong in Signalbox.' });
+    return reply.code(500).send({ ok: false, error: 'Something went wrong in Wayroost.' });
   });
 
   return app;

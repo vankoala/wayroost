@@ -41,7 +41,7 @@ export interface ComponentStatus {
   /** Plain name for people: "Main model", "Phone line", "Remote access". */
   name: string;
   state: ComponentState;
-  /** One plain sentence: "Flash-Next is answering." / "Loading the 27B, about 4 min left." */
+  /** One plain sentence: "Main model is answering." / "Loading Balanced model, about 4 min left." */
   sentence: string;
   /** Epoch ms when it entered this state, when known. */
   since?: number;
@@ -56,7 +56,7 @@ export interface ComponentStatus {
 }
 
 export interface ModelProfile {
-  /** "flash-next", "qwen27b", … the same names launch.sh takes. */
+  /** "main-model", "balanced", … the same names launch.sh takes. */
   id: string;
   name: string;
   /** Rough cold-start time, for "about 7 min" in the confirm sheet. */
@@ -70,6 +70,16 @@ export interface SupervisorStatus {
   overall: 'ok' | 'attention' | 'down';
   sentence: string;
   components: ComponentStatus[];
+  /**
+   * Components whose commands come from config (launch/coder scripts, hold dir)
+   * while that config is unset. They are not probed and take no actions.
+   */
+  notSetUp?: { id: ComponentId; name: string; sentence: string }[];
+  /**
+   * Whole-PC busy from the counts the server pushes to POST /v1/busy.
+   * "unknown" means no fresh push (<60 s old); "when idle" treats it as busy.
+   */
+  busy?: 'idle' | 'busy' | 'unknown';
   /** The lifecycle action that's running, if any (only one runs at a time). */
   running?: ActionSummary;
   /** Epoch ms of this snapshot. */
@@ -102,9 +112,9 @@ export interface ActionSummary {
 }
 
 export interface ActionDetail extends ActionSummary {
-  /** Progress lines as the action prints them ("Flash-Next loading…"). Infra output only. */
+  /** Progress lines as the action prints them ("Main model loading…"). Infra output only. */
   lines: string[];
-  /** Plain result: "Switched to the 27B." / "The 27B didn't answer within 10 min." */
+  /** Plain result: "Switched to the balanced model." / "The model didn't answer within 10 min." */
   result?: string;
 }
 
@@ -127,6 +137,8 @@ export const SUPERVISOR_ROUTES = {
   events: '/v1/events',
   actions: '/v1/actions',
   action: (id: string) => `/v1/actions/${encodeURIComponent(id)}`,
+  /** Server key only: { paseoRunning, hermesRunning, calls }, pushed every ~10 s. */
+  busy: '/v1/busy',
 } as const;
 
 /** Default places; the live install may override them in /etc/wayroost/supervisor.json. */

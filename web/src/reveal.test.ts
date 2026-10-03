@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { preview, revealDetail } from './reveal';
+import { preview, revealDetail } from '../../shared/reveal';
 
 describe('revealDetail', () => {
   it('makes bidi and zero-width tricks visible', () => {
-    const r = revealDetail('echo safe‮; rm -rf ~ #‬​');
+    const r = revealDetail('echo safe\u202e; rm -rf ~ #\u202c\u200b');
     expect(r.text).toBe('echo safe⟨U+202E⟩; rm -rf ~ #⟨U+202C⟩⟨U+200B⟩');
     expect(r.unusual).toBe(true);
   });

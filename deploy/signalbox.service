@@ -1,5 +1,5 @@
 [Unit]
-Description=Signalbox web app (remote control for Hermes and Paseo)
+Description=Wayroost web app (remote control for Hermes and Paseo)
 Documentation=file:///opt/signalbox/README.md
 After=network-online.target
 Wants=network-online.target

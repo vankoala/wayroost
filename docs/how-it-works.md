@@ -1,6 +1,6 @@
-# How Signalbox works
+# How Wayroost works
 
-Signalbox is a small web server that runs next to your agents, plus a web app
+Wayroost is a small web server that runs next to your agents, plus a web app
 you open on your phone. The server talks to Hermes and Paseo on your machine and
 turns both into one stream of conversations, timelines and approvals. Cloudflare
 carries the connection from your phone to the server, and checks who you are
@@ -14,11 +14,11 @@ before anything reaches your machine.
         │
         ▼  Cloudflare Tunnel (outbound connection from your machine; no open ports)
  cloudflared ─────── checks the Access token again (access.required)
-        │  http://127.0.0.1:8790
+        │  http://127.0.0.1:19010
         ▼
- Signalbox server ── checks the token a third time, then CSRF/Origin/Host rules
-   ├── Hermes adapter ── HTTP + JSON-RPC WebSocket ──▶ Hermes dashboard  :9119
-   └── Paseo adapter ─── Paseo client (WebSocket) ───▶ Paseo daemon      :6777
+ Wayroost server ── checks the token a third time, then CSRF/Origin/Host rules
+   ├── Hermes adapter ── HTTP + JSON-RPC WebSocket ──▶ Hermes dashboard  :19006
+   └── Paseo adapter ─── Paseo client (WebSocket) ───▶ Paseo daemon      :19007
 ```
 
 ## The pieces
@@ -35,14 +35,14 @@ before anything reaches your machine.
 
 ## A request, step by step
 
-1. Your phone opens `https://signalbox.example.com`. **Cloudflare Access** sees
+1. Your phone opens `https://wayroost.example.com`. **Cloudflare Access** sees
    no session and sends you to its login page; after you sign in with your email
    code, it sets a cookie for this hostname.
 2. Every later request carries that cookie. Access validates it and forwards the
    request through the **tunnel** with a signed token
    (`Cf-Access-Jwt-Assertion`). cloudflared rejects the request if the token is
    missing or invalid.
-3. The **Signalbox server** checks, in order:
+3. The **Wayroost server** checks, in order:
    - the **Host** header is your hostname (blocks DNS rebinding);
    - the **token**: signature against your team's keys, issuer, audience,
      expiry, and your email on the allowlist;
@@ -56,7 +56,7 @@ before anything reaches your machine.
 
 Nothing is served, not even the page itself, without passing these checks, with
 one exception. Six files that a browser fetches when you add the app to your
-home screen skip Signalbox's own token check: `/manifest.webmanifest`,
+home screen skip Wayroost's own token check: `/manifest.webmanifest`,
 `/favicon.svg`, `/apple-touch-icon.png`, `/icons/icon-192.png`,
 `/icons/icon-512.png` and `/icons/maskable-512.png`. They hold nothing
 sensitive, only `GET` is exempt, and they still get the Host check. Cloudflare
@@ -126,7 +126,7 @@ Approvals are the most security-sensitive part of the app:
    backend.
 5. The backend confirms, and the card disappears on every device.
 
-Signalbox never answers anything on its own. Password and secret prompts from
+Wayroost never answers anything on its own. Password and secret prompts from
 Hermes are never answered from the web.
 
 ## "/" commands and skills
@@ -136,19 +136,19 @@ conversation offers. You can pick with a tap, the arrow keys, Enter or Tab, and
 after a command's name the menu offers its known argument values. Text such as
 `/home/you/notes.txt` is a path, not a command.
 
-- **Hermes:** Signalbox runs the command itself, the way the Hermes desktop app
+- **Hermes:** Wayroost runs the command itself, the way the Hermes desktop app
   does. The menu is the gateway's own catalog (`commands.catalog`), without the
   commands the desktop app hides or that only make sense in a terminal. Sending
   `/name args` calls `slash.exec`, falling back to `command.dispatch`. A skill
   expands into a prompt, and the chat shows `/name args` instead of the whole
   skill. Other output appears as a command block in the timeline; Hermes
-  doesn't store it, so Signalbox keeps the last 20 per chat in memory. A
+  doesn't store it, so Wayroost keeps the last 20 per chat in memory. A
   command still running after 15 s shows as running and finishes live. `/new`
   opens the New sheet instead. Details are in [hermes.md](hermes.md#-commands).
 - **Paseo:** the agent's own commands and skills (for example Claude Code's),
   from Paseo's `listCommands`, for agents that are running. A stored agent
   isn't woken to ask, so its commands appear once you open the conversation.
-  Signalbox sends the text to the agent as an ordinary message, and the agent
+  Wayroost sends the text to the agent as an ordinary message, and the agent
   runs it itself. Details are in [paseo.md](paseo.md#-commands).
 
 A few Hermes commands are refused because they switch safeguards off, answer
@@ -202,7 +202,7 @@ and the chips show what the backend reports back.
 ## Images from your machine
 
 Agents often make or look at images on your machine: a chart they drew, a
-screenshot a tool took. Signalbox shows them without the browser ever asking
+screenshot a tool took. Wayroost shows them without the browser ever asking
 for a file by its path (`server/src/media.ts`).
 
 **Finding them.** The server checks every reply and tool card before it goes to
@@ -241,7 +241,7 @@ any other file.
 
 These checks run when a link is made and again when it's used.
 
-**Reading.** The Signalbox service can't read your files: it has no access to
+**Reading.** The Wayroost service can't read your files: it has no access to
 `/home`. It asks the backend that runs the agent instead: the Hermes dashboard
 (`/api/fs/download`, with the chat's session id, as the Hermes desktop app
 does), or Paseo (`readFile`, against the folder the Paseo app would use).
@@ -268,7 +268,7 @@ together, across Hermes and Paseo. It's off unless you turn it on.
 ```
  agent (Claude Code, OpenCode, pi, Hermes, a Paseo agent…)
    └─ node /opt/signalbox/bin/signalbox-bridge.mjs     stdio MCP server, token from ~/.config/signalbox
-        └─ HTTP, Bearer token ──▶ bridge listener 127.0.0.1:8792 (inside the Signalbox server)
+        └─ HTTP, Bearer token ──▶ bridge listener 127.0.0.1:19012 (inside the Wayroost server)
                                     └─ the same Hermes and Paseo adapters the app uses
 ```
 
@@ -277,11 +277,11 @@ together, across Hermes and Paseo. It's off unless you turn it on.
   it.
 - **Who is calling:** a Paseo agent by the id Paseo gives it, and a Hermes chat
   by its session id, which the `signalbox-identity` Hermes plugin adds to each
-  call. Signalbox checks both against the chats it lists; anyone else is
+  call. Wayroost checks both against the chats it lists; anyone else is
   unverified.
 - **Messages** arrive labelled as coming from another agent, not from you,
-  with the sender's reply address when Signalbox knows the sender. The phone
-  shows them as "From <sender> · via Signalbox" bubbles. They're delivered once
+  with the sender's reply address when Wayroost knows the sender. The phone
+  shows them as "From <sender> · via Wayroost" bubbles. They're delivered once
   the chat is idle with no approvals waiting, so a working chat is never
   interrupted; an answer to a chat that's waiting for it with `wait_for_reply`
   goes to the wait instead.
@@ -295,7 +295,7 @@ together, across Hermes and Paseo. It's off unless you turn it on.
 
 | A message from another agent | Pausing the bridge |
 | --- | --- |
-| <img src="images/29-phone-bridged-message.png" width="220" alt="A Hermes chat started by a Paseo agent, with its messages shown as From Fix flaky login test (Claude Code) via Signalbox"> | <img src="images/30-phone-bridge-settings.png" width="220" alt="The Project bridge section of Settings, paused, with the last hour's activity"> |
+| <img src="images/29-phone-bridged-message.png" width="220" alt="A Hermes chat started by a Paseo agent, with its messages shown as From Fix flaky login test (Claude Code) via Wayroost"> | <img src="images/30-phone-bridge-settings.png" width="220" alt="The Project bridge section of Settings, paused, with the last hour's activity"> |
 
 ## Starting agents safely
 

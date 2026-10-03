@@ -26,7 +26,7 @@ import { CLOUD_AGENT_IDS, type CloudAgent } from '../../../shared/protocol.js';
 import { readableBridgeText } from '../bridge/envelope.js';
 import { MAX_APPROVAL_DETAIL, capitalize, clip, homeRelative, oneLine, pretty, str } from '../text.js';
 
-// Pure mappings from Paseo 0.5.1 shapes to the shared protocol.
+// Pure mappings from Paseo 0.9.2 shapes to the shared protocol.
 
 const PROVIDER_LABELS: Record<string, string> = {
   claude: 'Claude Code',
@@ -79,14 +79,18 @@ export function cloudAgentList(
  * - asks:    the agent waits for your approval before risky actions (offered normally)
  * - auto:    the agent acts on its own for some or all actions (needs an explicit OK)
  * - blocked: every safeguard is off (never started from the phone)
- * Known modes come from each provider's definitions in Paseo 0.5.1.
+ * Known modes come from each provider's definitions in Paseo 0.9.2 (a test checks that
+ * every built-in mode of the installed client is here), plus ids older daemons used.
  */
 export type ModeTier = 'asks' | 'auto' | 'blocked';
 
-const KNOWN_MODES: Record<string, Record<string, ModeTier>> = {
+/** Copilot's ACP mode ids in Paseo 0.9.2 are the protocol's own URLs. */
+const ACP_MODE = 'https://agentclientprotocol.com/protocol/session-modes#';
+
+export const KNOWN_MODES: Record<string, Record<string, ModeTier>> = {
   claude: { default: 'asks', plan: 'asks', acceptEdits: 'auto', auto: 'auto', bypassPermissions: 'blocked' },
   codex: { auto: 'asks', 'read-only': 'asks', 'auto-review': 'auto', 'full-access': 'blocked' },
-  copilot: { agent: 'asks', plan: 'asks', 'allow-all': 'blocked' },
+  copilot: { agent: 'asks', plan: 'asks', [`${ACP_MODE}agent`]: 'asks', [`${ACP_MODE}plan`]: 'asks', 'allow-all': 'blocked' },
   opencode: { plan: 'asks', build: 'auto' },
   omp: { ask: 'asks', write: 'auto', full: 'blocked', yolo: 'blocked' },
   hermes: { default: 'asks', accept_edits: 'auto', dont_ask: 'blocked' },
@@ -145,6 +149,40 @@ export function labelledParent(labels: Record<string, string> | undefined): Pare
   const hermes = str(labels?.[HERMES_PARENT_LABEL])?.trim();
   if (hermes) return { source: 'hermes', id: hermes };
   return undefined;
+}
+
+/** What the task log needs to know about an agent: a plain copy, nothing it could change. */
+export interface WorkerSnapshot {
+  id: string;
+  provider: string;
+  cwd: string;
+  title?: string;
+  /** Epoch ms; unset when Paseo's time doesn't parse. */
+  createdAt?: number;
+  status: AgentSnapshotPayload['status'];
+  /** Paseo has it running, not just stored: only then does a `running` status mean it is. */
+  loaded: boolean;
+  pendingPermissions: number;
+  lastError?: string;
+  labels: Readonly<Record<string, string>>;
+}
+
+export function workerSnapshotOf(agent: AgentSnapshotPayload): WorkerSnapshot {
+  const created = Date.parse(agent.createdAt);
+  const title = str(agent.title)?.trim();
+  const lastError = str(agent.lastError)?.trim();
+  return {
+    id: agent.id,
+    provider: agent.provider,
+    cwd: agent.cwd,
+    ...(title ? { title } : {}),
+    ...(Number.isFinite(created) ? { createdAt: created } : {}),
+    status: agent.status,
+    loaded: agentLoaded(agent),
+    pendingPermissions: agent.pendingPermissions?.length ?? 0,
+    ...(lastError ? { lastError } : {}),
+    labels: { ...(agent.labels ?? {}) },
+  };
 }
 
 type Placement = {
@@ -599,32 +637,68 @@ function optionKind(action: { id: string; label: string; behavior: 'allow' | 'de
   return 'allow';
 }
 
-function permissionDetail(request: AgentPermissionRequest): string | undefined {
-  const d = request.detail as LooseDetail | undefined;
-  const s = (key: string) => (d && typeof d[key] === 'string' ? (d[key] as string) : undefined);
-  if (d) {
-    switch (d.type) {
-      case 'shell':
-        return s('command');
-      case 'edit':
-        return [s('filePath') && homeRelative(s('filePath')!), s('unifiedDiff')].filter(Boolean).join('\n\n') || undefined;
-      case 'write':
-        return [s('filePath') && homeRelative(s('filePath')!), s('content')].filter(Boolean).join('\n\n') || undefined;
-      case 'read':
-        return s('filePath') && homeRelative(s('filePath')!);
-      case 'fetch':
-        return s('url');
-      case 'search':
-        return s('query');
-      case 'plain_text':
-        return s('text') ?? s('label');
-      case 'plan':
-        return s('text');
-    }
+type DetailKind = NonNullable<Approval['detailKind']>;
+
+/** Paseo's structured tool details, by what they are. */
+const DETAIL_KINDS: Record<string, DetailKind> = {
+  shell: 'command',
+  edit: 'edit',
+  write: 'write',
+  read: 'read',
+  fetch: 'fetch',
+  search: 'other',
+  plain_text: 'other',
+  plan: 'other',
+};
+
+/**
+ * The text of a structured detail. File paths stay exactly as Paseo gives them:
+ * "~" for /home/<anyone> would hide whose file it is, and the card checks the
+ * real path against the project's folder.
+ */
+function structuredDetail(d: LooseDetail): string | undefined {
+  const s = (key: string) => (typeof d[key] === 'string' ? (d[key] as string) : undefined);
+  switch (d.type) {
+    case 'shell':
+      return s('command');
+    case 'edit':
+      return [s('filePath'), s('unifiedDiff')].filter(Boolean).join('\n\n') || undefined;
+    case 'write':
+      return [s('filePath'), s('content')].filter(Boolean).join('\n\n') || undefined;
+    case 'read':
+      return s('filePath');
+    case 'fetch':
+      return s('url');
+    case 'search':
+      return s('query');
+    case 'plain_text':
+      return s('text') ?? s('label');
+    case 'plan':
+      return s('text');
   }
-  if (str(request.description)) return request.description;
-  if (request.input && Object.keys(request.input).length > 0) return pretty(request.input);
   return undefined;
+}
+
+/**
+ * A request's detail, and what it is when Paseo's structured detail says so, so
+ * the card never has to guess a command from its title (a shell command whose
+ * title says "Read file" is still a command). Without a structured detail the
+ * tool's own input is what runs, so it comes before the request's description:
+ * a description is only words about the call (it could say "https://example.com"
+ * while the input runs "rm -rf"), and either way the kind is left unsaid.
+ */
+function permissionDetail(request: AgentPermissionRequest): { text?: string; kind?: DetailKind; filePath?: string } {
+  const d = request.detail as LooseDetail | undefined;
+  if (d && d.type in DETAIL_KINDS) {
+    const text = structuredDetail(d);
+    // The path on its own as well: it can hold a line break, so the card
+    // can't tell where it ends in the detail.
+    const filePath = /^(?:edit|write|read)$/.test(d.type) && typeof d.filePath === 'string' ? d.filePath : undefined;
+    if (text) return { text, kind: DETAIL_KINDS[d.type]!, ...(filePath ? { filePath } : {}) };
+  }
+  if (request.input && Object.keys(request.input).length > 0) return { text: pretty(request.input) };
+  if (str(request.description)) return { text: request.description! };
+  return {};
 }
 
 export function requestApprovals(
@@ -665,7 +739,7 @@ export function requestApprovals(
         { id: 'allow', label: 'Allow', kind: 'allow' },
         { id: 'deny', label: 'Deny', kind: 'deny' },
       ];
-  const detail = permissionDetail(request);
+  const { text: detail, kind: detailKind, filePath } = permissionDetail(request);
   return {
     approvals: [
       {
@@ -676,6 +750,10 @@ export function requestApprovals(
         title: str(request.title) ? oneLine(request.title!, 200) : `Allow ${request.name}?`,
         ...(detail ? { detail: clip(detail, MAX_APPROVAL_DETAIL) } : {}),
         ...(detail && detail.length > MAX_APPROVAL_DETAIL ? { detailTruncated: true } : {}),
+        ...(detail && detailKind ? { detailKind } : {}),
+        // A path too long to send whole isn't sent cut: a cut path could look
+        // like it's inside the project when the rest of it climbs out.
+        ...(filePath && filePath.length <= MAX_APPROVAL_DETAIL ? { filePath } : {}),
         options,
         createdAt,
       },
@@ -691,7 +769,7 @@ export function permissionResponse(request: AgentPermissionRequest, optionId: st
     return action ? { behavior: action.behavior, selectedActionId: action.id } : null;
   }
   if (optionId === 'allow') return { behavior: 'allow' };
-  if (optionId === 'deny') return { behavior: 'deny', message: 'Denied from Signalbox' };
+  if (optionId === 'deny') return { behavior: 'deny', message: 'Denied from Wayroost' };
   return null;
 }
 

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Signalbox are documented in this file.
+All notable changes to Wayroost are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -11,6 +11,30 @@ The first public release, to be tagged 0.1.0.
 
 ### Added
 
+- **Worker updates** (see docs/bridge.md#worker-updates): when a Paseo worker
+  that a Hermes chat started stops running, waits on your approval, or runs
+  past its time box, Wayroost tells that chat
+  through the bridge's queue, signed "Signalbox task log" (kept for compatibility).
+  - Only workers the chat provably launched count: started by the bridge, or
+    named by the chat's own `paseo run` result. The worker's words are quoted
+    after Wayroost's own lines.
+  - A durable task log (`tasks.json`) carries the state across restarts: a
+    worker that stopped while Wayroost was down is reported once, and an
+    undelivered update is queued again. Terminal updates are deduplicated by
+    worker id and run number. A chat that already waited on its worker may
+    also receive the update; this duplicate is intended to prevent missed completions.
+  - Late workers get one "[Worker overdue]" in the chat, and you get a
+    For-you card 15 minutes later, which closes itself when the worker stops.
+  - Launch proofs are bound to the run table's own row (never JSON or text a
+    worker can write). Vanished or stale workers are reconciled with Paseo,
+    and per-recipient budgets limit updates.
+  - Settings → Project bridge → Worker updates: a switch (on by default) and
+    the time box for workers that don't set `signalbox.due-minutes`.
+  - The bridge has a queue for Wayroost's own messages (idle chats only,
+    held while paused, never handed to a `wait_for_reply`). New submissions,
+    activity events and polls invalidate older readings for each chat, so stale
+    idle polls cannot deliver an update into an active turn. The feed can
+    close a card whose subject is over.
 - **For you** (optional; see docs/for-you.md): Hermes' morning brief and
   daytime checks put what needs you on cards, opened from a sparkles button
   with a badge and a strip in the inbox.
@@ -21,7 +45,7 @@ The first public release, to be tagged 0.1.0.
   - Settings → For you sets how often Hermes speaks up (off, brief only, normal,
     often), which pauses, resumes or reschedules its pulse jobs. It also sets
     quiet hours and lists the turned-down topics.
-  - Phone notifications (Web Push, implemented in Signalbox with no library)
+  - Phone notifications (Web Push, implemented in Wayroost with no library)
     when an agent needs you (never showing the command), and, if you like, for
     new cards. They're turned on per device, with a test button. On iPhone they
     need the Home Screen app.
@@ -35,7 +59,7 @@ The first public release, to be tagged 0.1.0.
   - Edit only changes tools when asked.
   - Job details and Connectors show what each job can use, and full access gets a badge and a
     warning.
-- Paseo daemon password: Signalbox sends it from the systemd credential `paseo-password`,
+- Paseo daemon password: Wayroost sends it from the systemd credential `paseo-password`,
   rejects passwords Paseo can't carry, and logs once when the daemon refuses it.
 - Home: **Recent | Projects | Scheduled** tabs with search below them. Scheduled jobs moved
   from a block on Recent to their own tab (failure badge, sections, all jobs, search); New
@@ -74,7 +98,7 @@ The first public release, to be tagged 0.1.0.
   - Speech is turned into text and back on your PC, on the CPU, by a new
     speech service (NVIDIA Parakeet TDT 0.6B v2 and Kokoro-82M through
     sherpa-onnx). It has no network, sees only its program, models and the
-    system libraries, listens on a Unix socket only Signalbox may open, and runs
+    system libraries, listens on a Unix socket only Wayroost may open, and runs
     from root-owned, hash-checked packages and models.
     `deploy/setup-speech.sh` sets it up; nothing is stored or logged.
   - Audio streams over the live WebSocket as 16 kHz PCM frames; the microphone
@@ -84,7 +108,7 @@ The first public release, to be tagged 0.1.0.
   - One-tap sign-in for Notion, Todoist, Dropbox, Canva, Calendly, Strava,
     Craft, Miro, Gamma, Fireflies, WordPress.com, Cloudflare, Hugging Face and
     Comfy Cloud. These are entries in Hermes' own approved MCP catalog, signed
-    in on each service's own page. The sign-in comes back to Signalbox, so it
+    in on each service's own page. The sign-in comes back to Wayroost, so it
     works from a phone. Hermes keeps every token.
   - Access for each app: "Ask before changes" (Hermes' untrusted tier, the
     default) or "Automatic". Check and Disconnect buttons.
@@ -95,7 +119,7 @@ The first public release, to be tagged 0.1.0.
     you asked and tells you. It's a Hermes scheduled job with a gate script, so
     the model only wakes when matching mail arrives. Sign-in codes and password
     resets are never passed on.
-  - The optional **Signalbox helper** (deploy/setup-helper.sh) runs Google's
+  - The optional **Wayroost helper** (deploy/setup-helper.sh) runs Google's
     sign-in and the trigger folders as the Hermes user, on 127.0.0.1.
 - **Inbox** for Hermes Agent chats and Paseo agents in one list, with anything
   waiting on you pinned to the top, filters (Needs you, Hermes, Paseo) and
@@ -118,7 +142,7 @@ The first public release, to be tagged 0.1.0.
   wherever they ran. The signalbox-identity Hermes plugin (0.2.0) and a Claude
   Code hook (`claude-hook/`, registered by `deploy/setup-bridge.sh`) report the
   launchers named in the new run's environment (`PASEO_AGENT_ID`,
-  `HERMES_SESSION_ID`, `SIGNALBOX_LAUNCHER`) through the bridge; Signalbox picks
+  `HERMES_SESSION_ID`, `SIGNALBOX_LAUNCHER`) through the bridge; Wayroost picks
   the nearest. Claude runs show as read-only rows with their task and final
   answer (the answer Claude Code hands the Stop hook, else the transcript's, read
   again at session end), once they have either: a launch that failed before its
@@ -134,7 +158,7 @@ The first public release, to be tagged 0.1.0.
   chat starts, one level below an existing folder, through Paseo (which also
   lists it as a project). A path whose parent is missing, or that names a file,
   is flagged before anything starts. Hermes keeps only a folder that exists; if
-  it still starts the chat somewhere else, Signalbox says where.
+  it still starts the chat somewhere else, Wayroost says where.
 - **Live timelines**: streaming replies and reasoning, and tool calls with
   their input, output and status. Agent output is rendered as sanitized
   markdown.
@@ -153,7 +177,7 @@ The first public release, to be tagged 0.1.0.
   the open chat's next message, or to the new chat while its sheet is open. A
   file the server would refuse (a .docx, a folder) is flagged when it's
   dropped, not when the message is sent. A stray drop never makes the browser
-  open the file in place of Signalbox.
+  open the file in place of Wayroost.
 - **"/" commands and skills**: a "/" menu in the message box and the New sheet.
   Hermes commands run the way the Hermes desktop app runs them (`slash.exec`,
   then `command.dispatch`); skills show as you typed them; output stays in the
@@ -174,26 +198,26 @@ The first public release, to be tagged 0.1.0.
   Hermes and Paseo, get five MCP tools (`list_chats`, `read_chat`,
   `send_message`, `start_chat`, `wait_for_reply`) through a stdio server,
   `bridge/signalbox-bridge.mjs`, that talks to a loopback listener in
-  Signalbox. Messages arrive labelled as coming from another agent, and wait
+  Wayroost. Messages arrive labelled as coming from another agent, and wait
   until the chat is idle with no approvals waiting. Rate limits and a loop
   breaker hold agents back. New chats start only in the project folder, only in
   modes that ask you, and only a few per hour. Chats show who started them,
   and Settings shows the last hour's activity with a Pause switch.
 - **Replies on the bridge**: a bridged message carries the sender's chat as a
-  reply address, when Signalbox knows the sender, and says how to answer with
+  reply address, when Wayroost knows the sender, and says how to answer with
   `send_message`. `wait_for_reply` waits up to 120 seconds (45 by default) for
   the other chat to answer or finish its turn, and gives its status when time
   runs out. An answer to a chat that's waiting for it goes to the wait instead
   of into the chat.
 - **Hermes chats identified on the bridge** by the `signalbox-identity` Hermes
-  plugin, which adds the calling chat's session id to its Signalbox tool calls.
-  Signalbox takes the id only for a chat it lists. Identified Hermes chats sign
+  plugin, which adds the calling chat's session id to its Wayroost tool calls.
+  Wayroost takes the id only for a chat it lists. Identified Hermes chats sign
   their messages with their title, get replies and `wait_for_reply`, are left
   out of their own `list_chats`, show as "started by" on the chats they start,
   and count for the loop breaker.
 - **Paseo agents ordered by real activity**: the inbox, the Projects view and
   the bridge's `list_chats` order Paseo agents by their last user message or a
-  run Signalbox saw start or stop, not by Paseo's `updatedAt`, which also moves
+  run Wayroost saw start or stop, not by Paseo's `updatedAt`, which also moves
   when Paseo reloads or resumes an agent.
 - **Hermes password prompts on your phone** (optional, off by default): with
   `hermes.secretPrompts` on, Hermes' sudo, secret, vault master password, 2FA
@@ -209,11 +233,11 @@ The first public release, to be tagged 0.1.0.
   terminal; waiting cards checked against what Hermes still has open, so a
   restart, a stopped chat or a lost cancel doesn't leave a card stuck; new
   chats with an optional folder; follow-ups and Stop; following a chat that
-  Hermes continues under a new id after compressing its context. Signalbox
+  Hermes continues under a new id after compressing its context. Wayroost
   resumes a chat only when it's live in Hermes or you act in it, so opening a
   chat that was killed mid-turn never makes Hermes re-run that turn, and a
   re-run that a command or model change would start is cancelled.
-- **Paseo connection** through the pinned `@getpaseo/client` 0.5.1, with the
+- **Paseo connection** through the pinned `@getpaseo/client` 0.9.2, with the
   Paseo app's timeline reconciliation rules; launching agents in a recent or
   custom folder with vetted permission-mode tiers; follow-ups that steer a
   working agent as the Paseo app does; Stop.
@@ -226,7 +250,7 @@ The first public release, to be tagged 0.1.0.
     installs to `/opt/signalbox`, and installs and enables `signalbox.service`.
     It starts the service only once the config has no placeholders left.
   - `deploy/setup-tunnel.sh` checks for a root-owned checkout, a root-owned and
-    signed-in cloudflared, an existing config, an installed Signalbox, and a
+    signed-in cloudflared, an existing config, an installed Wayroost, and a
     valid hostname and tunnel name. It creates a dedicated Cloudflare Tunnel or
     reuses the live one, including tunnels cloudflared lists with a zero
     `deleted_at` (`0001-01-01…`), and installs its credential again if the
@@ -253,7 +277,7 @@ The first public release, to be tagged 0.1.0.
   stand-in for Cloudflare Access; a headless-Chrome UI check that fails on page
   errors and CSP violations; a read-only end-to-end run against your own Hermes
   and Paseo; a protocol-faithful fake Hermes dashboard for tests; a Paseo
-  compatibility harness that CI runs against Paseo 0.5.1 and the latest
+  compatibility harness that CI runs against Paseo 0.9.2 and the latest
   release, where a failure against the latest release is reported without
   failing the build.
 - **Documentation**: setup, configuration, architecture, Hermes and Paseo
@@ -280,11 +304,11 @@ The first public release, to be tagged 0.1.0.
 ### Security
 
 - The Cloudflare Access token is checked three times: at Cloudflare's edge, by
-  cloudflared (`access.required`), and by Signalbox on every request and
+  cloudflared (`access.required`), and by Wayroost on every request and
   WebSocket upgrade (RS256 signature, issuer, audience, expiry, and an email
   allowlist compared as plain ASCII; service tokens are rejected). The one
   exception is a `GET` for the six files a browser needs to add the app to the
-  home screen (the web manifest and icons). They skip Signalbox's own token
+  home screen (the web manifest and icons). They skip Wayroost's own token
   check but stay behind Access and cloudflared.
 - CSRF protection for API calls (a custom request header, `Sec-Fetch-Site`, an
   exact `Origin` and JSON-only bodies), exact-origin checks on WebSocket
@@ -325,7 +349,7 @@ The first public release, to be tagged 0.1.0.
   anything but JSON up to 64 KB. It offers no way to reach approvals, modes or
   models, refuses "/" commands, and never interrupts a working chat. A caller's
   Paseo agent id or Hermes session id counts only if it matches a chat
-  Signalbox lists, and the bridge passes a Hermes session id on only when
+  Wayroost lists, and the bridge passes a Hermes session id on only when
   Hermes started it.
 - Live WebSockets close when the Access token expires and re-authenticate
   through Cloudflare every 30 minutes.
@@ -339,7 +363,7 @@ The first public release, to be tagged 0.1.0.
   owned code with a root-owned `node` and `npm`, and the tunnel setup only runs
   a root-owned `cloudflared`.
 - The Hermes password is stored only on the host (mode 600). Hermes' session
-  tokens stay in memory, so Signalbox signs in with the password when the
+  tokens stay in memory, so Wayroost signs in with the password when the
   service starts and when you save it in Settings. After that it's re-sent only
   when Hermes explicitly reports an expired session, never on connection
   errors.

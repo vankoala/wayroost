@@ -37,21 +37,23 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import signalbox_skills  # noqa: E402
+from wayroost_runtime import BackgroundGate, env  # noqa: E402
 
 HOST = "127.0.0.1"
-PORT = int(os.environ.get("SIGNALBOX_HELPER_PORT", "8793"))
+PORT = int(env("HELPER_PORT", "19013"))
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 SKILL_SCRIPTS = HERMES_HOME / "skills" / "productivity" / "google-workspace" / "scripts"
 TRIGGERS_DIR = HERMES_HOME / "signalbox-triggers"
-GATE_NAME = "signalbox_mail_trigger.py"
-GATE_SOURCE = Path(__file__).resolve().parent / GATE_NAME
+GATE_NAME = "wayroost_mail_trigger.py"
+GATE_SOURCE = Path(__file__).resolve().parent / "signalbox_mail_trigger.py"
 MAX_BODY = 16 * 1024
+SHADOW_API_PREFIX = "/v1/shadow/"
 TRIGGER_ID = re.compile(r"^[a-z0-9]{8,32}$")
 # What Google redirects to after sign-in (the skill's fixed "paste it back" address).
 GOOGLE_REDIRECT = re.compile(r"^http://localhost:1/?\?[\x21-\x7e]{1,4000}$")
 PROFILE_TTL = 600
 # The shopping Chrome's DevTools endpoint (optional): only /json/version is ever asked, to see it's up.
-SHOP_CDP = os.environ.get("SIGNALBOX_SHOP_CDP", "").rstrip("/")
+SHOP_CDP = env("SHOP_CDP", "").rstrip("/")
 
 
 def log(msg: str, **fields) -> None:
@@ -217,6 +219,13 @@ def install_gate() -> None:
     """Keep Hermes' copy of the gate script identical to ours."""
     scripts = HERMES_HOME / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
+    runtime = GATE_SOURCE.with_name("wayroost_runtime.py")
+    runtime_target = scripts / runtime.name
+    if not runtime_target.exists() or runtime_target.read_bytes() != runtime.read_bytes():
+        tmp_runtime = runtime_target.with_suffix(".tmp")
+        shutil.copyfile(runtime, tmp_runtime)
+        os.chmod(tmp_runtime, 0o644)
+        os.replace(tmp_runtime, runtime_target)
     target = scripts / GATE_NAME
     if not target.exists() or target.read_bytes() != GATE_SOURCE.read_bytes():
         tmp = target.with_suffix(".tmp")
@@ -239,24 +248,33 @@ def list_triggers() -> dict:
             try:
                 data = json.loads(spec.read_text())
                 if TRIGGER_ID.match(spec.parent.name) and isinstance(data.get("query"), str):
-                    specs[spec.parent.name] = {"query": data["query"]}
+                    specs[spec.parent.name] = {"query": data["query"], "role": "primary" if data.get("role") == "primary" else "shadow"}
             except Exception:
                 continue
     return {"triggers": specs, "gate": GATE_NAME}
 
 
-def put_trigger(trigger_id: str, body: dict) -> dict:
+def process_background():
+    return BackgroundGate(default_config=env("HELPER_ROLE_CONFIG", Path(__file__).with_name("wayroost-role.json")))
+
+
+def put_trigger(trigger_id: str, body: dict, background=None) -> dict:
     query = str(body.get("query") or "").strip()
     if not query or len(query) > 500 or any(ord(c) < 32 for c in query):
         raise HelperError(400, "The Gmail search must be one line of up to 500 characters.")
+    requested_role = body.get("role")
+    if requested_role is not None and requested_role not in {"shadow", "primary"}:
+        raise HelperError(400, "Invalid trigger role.")
+    gate = background or process_background()
+    role = "primary" if gate.role == "primary" and requested_role != "shadow" else "shadow"
     folder = trigger_dir(trigger_id)
     folder.mkdir(parents=True, exist_ok=True)
     os.chmod(folder, 0o700)
     tmp = folder / "spec.json.tmp"
-    tmp.write_text(json.dumps({"query": query}))
+    tmp.write_text(json.dumps({"query": query, "role": role}))
     os.replace(tmp, folder / "spec.json")
     install_gate()
-    return {"workdir": str(folder), "script": GATE_NAME}
+    return {"workdir": str(folder), "script": GATE_NAME, "role": role}
 
 
 def delete_trigger(trigger_id: str) -> dict:
@@ -333,9 +351,9 @@ def wa_put(body: dict) -> dict:
 
 # ---- Phone (Hermes Phone) -------------------------------------------------------------
 
-PHONE_URL = os.environ.get("SIGNALBOX_PHONE_URL", "http://127.0.0.1:8781")
+PHONE_URL = env("PHONE_URL", "http://127.0.0.1:19014")
 # The vault: `<command> get <name>` prints the secret as "pass=<value>". SIGNALBOX_VAULT_CMD sets the command.
-VAULT_CMD = Path(os.environ.get("SIGNALBOX_VAULT_CMD") or (Path.home() / ".config" / "signalbox" / "vault"))
+VAULT_CMD = Path(env("VAULT_CMD") or (Path.home() / ".config" / "signalbox" / "vault"))
 PIN_RE = re.compile(r"^\d{4,12}$")
 
 
@@ -349,6 +367,10 @@ def _phone_token() -> str:
     if out.returncode != 0 or len(token) < 16:
         raise HelperError(503, "The phone admin token isn't in the vault.")
     return token
+
+
+class PhoneOff(HelperError):
+    """Nothing listens on the phone server's port: the line is off, so no call can be up."""
 
 
 def _phone(method: str, path: str, body: dict | None = None, auth: bool = True, timeout: float = 10) -> dict:
@@ -366,14 +388,24 @@ def _phone(method: str, path: str, body: dict | None = None, auth: bool = True, 
         if err.code in (503,) and path == "/health":
             return json.loads(err.read(65536))
         raise HelperError(502, f"The phone server refused that ({err.code}).")
-    except (urllib.error.URLError, TimeoutError):
-        raise HelperError(503, "Hermes Phone isn't running (it runs as the hermes-phone services: sudo systemctl restart hermes-phone.target).")
+    except (urllib.error.URLError, TimeoutError) as err:
+        down = "Hermes Phone isn't running. Start its service and try again."
+        if isinstance(getattr(err, "reason", None), ConnectionRefusedError):
+            raise PhoneOff(503, down)
+        raise HelperError(503, down)
 
 
 def phone_status() -> dict:
-    """Line status for Settings; never the PIN itself."""
+    """Line status for Settings and the busy counts; never the PIN itself.
+
+    "off" says the line is known to be off (its port refused us). A timeout or an
+    error says nothing about calls, so it isn't "off", and the server then counts
+    the calls as unknown rather than none.
+    """
     try:
         health = _phone("GET", "/health", auth=False, timeout=8)
+    except PhoneOff:
+        return {"running": False, "ok": False, "pinSet": False, "off": True}
     except HelperError:
         return {"running": False, "ok": False, "pinSet": False}
     try:
@@ -381,9 +413,13 @@ def phone_status() -> dict:
         pin_set, owner = bool(pin.get("set")), pin.get("owner_number")
     except HelperError:
         pin_set, owner = False, None
-    return {"running": True, "ok": bool(health.get("ok")), "pinSet": pin_set, "ownerNumber": owner,
-            "activeCalls": health.get("active_calls", 0), "totalCalls": health.get("total_calls", 0),
-            "publicHost": health.get("public_host")}
+    status = {"running": True, "ok": bool(health.get("ok")), "pinSet": pin_set, "ownerNumber": owner,
+              "totalCalls": health.get("total_calls", 0), "publicHost": health.get("public_host")}
+    calls = health.get("active_calls")
+    # Only a count the phone server gave: a missing one isn't zero calls.
+    if isinstance(calls, int) and not isinstance(calls, bool) and calls >= 0:
+        status["activeCalls"] = calls
+    return status
 
 
 def phone_pin() -> dict:
@@ -477,8 +513,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(401, {"error": "unauthorized"})
         path = self.path.split("?")[0]
         try:
+            background = self._background()
+            if path.startswith(SHADOW_API_PREFIX):
+                path = "/" + path.removeprefix(SHADOW_API_PREFIX)
             if method == "GET" and path == "/health":
-                return self._send(200, {"ok": True})
+                return self._send(200, {"ok": True, "role": background.role, "roleAware": True})
             if method == "GET" and path == "/google":
                 return self._send(200, google_status())
             if method == "POST" and path == "/google/start":
@@ -507,7 +546,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, list_triggers())
             match = re.fullmatch(r"/triggers/([^/]+)", path)
             if match and method == "PUT":
-                return self._send(200, put_trigger(match.group(1), self._body()))
+                return self._send(200, put_trigger(match.group(1), self._body(), background))
             if match and method == "DELETE":
                 return self._send(200, delete_trigger(match.group(1)))
             return self._send(404, {"error": "not found"})
@@ -515,14 +554,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(err.status, {"error": str(err)})
         except Exception as err:  # never echo internals
             log("request failed", path=path, err=type(err).__name__)
-            return self._send(500, {"error": "Something went wrong in the Signalbox helper."})
+            return self._send(500, {"error": "Something went wrong in the Wayroost helper."})
+
+    def _background(self):
+        requested = self.headers.get("x-wayroost-role")
+        if requested is not None and requested not in {"shadow", "primary"}:
+            raise HelperError(400, "Invalid x-wayroost-role header.")
+        process_role = process_background().role
+        # The versioned namespace cannot be widened by a missing or primary header.
+        shadow = process_role == "shadow" or requested == "shadow" or self.path.startswith(SHADOW_API_PREFIX)
+        return BackgroundGate("shadow" if shadow else "primary")
 
     def _skills(self, method: str, path: str) -> None:
         query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
         if SKILLS is None:
-            raise HelperError(503, "Skills aren't set up in the Signalbox helper.")
+            raise HelperError(503, "Skills aren't set up in the Wayroost helper.")
+        if method in {"POST", "PUT"} and path != "/skills/scan" and not process_background().run(lambda: True):
+            raise HelperError(409, "Skills are read-only in shadow mode. Use the primary helper to change them.")
         if method == "GET" and path == "/skills":
-            return self._send(200, SKILLS.listing())
+            background = self._background()
+            return self._send(200, {**SKILLS.listing(background=background), "role": background.role})
         if method == "GET" and path == "/skills/version":
             return self._send(200, {"version": SKILLS.version})
         if method == "GET" and path == "/skills/content":
@@ -561,12 +612,12 @@ def main() -> None:
     global TOKEN
     TOKEN = read_token()
     try:
-        install_gate()
+        process_background().run(install_gate)
     except Exception as err:
         log("could not install the gate script", err=type(err).__name__)
     global SKILLS
     try:
-        SKILLS = signalbox_skills.from_env(HERMES_HOME)
+        SKILLS = signalbox_skills.from_env(HERMES_HOME, background=process_background())
         SKILLS.watch(lambda err: log("skills watch failed", err=err))
     except Exception as err:
         log("skills are off", err=type(err).__name__)

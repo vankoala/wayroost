@@ -1,5 +1,5 @@
 [Unit]
-Description=Cloudflare Tunnel for Signalbox (only exposes the Signalbox web app)
+Description=Cloudflare Tunnel for Wayroost (only exposes the Wayroost web app)
 After=network-online.target signalbox.service
 Wants=network-online.target
 

@@ -1,5 +1,6 @@
-import { readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { checkDeviceSignal } from '../security/device-signal.js';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 // Settings → Security → "Hermes safety commands": whether Signalbox lets
 // /approve, /approvals, /yolo, /memory approval, /skills approval and /debug
@@ -31,6 +32,8 @@ export class SafetyCommandsSetting {
   }
 
   setEnabled(enabled: boolean): boolean {
+    checkDeviceSignal();
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;
     writeFileSync(tmp, `${JSON.stringify({ enabled }, null, 2)}\n`, { mode: 0o600 });
     renameSync(tmp, this.path);

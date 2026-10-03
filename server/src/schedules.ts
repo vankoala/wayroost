@@ -1,3 +1,4 @@
+import { checkDeviceSignal, actionSignal } from './security/device-signal.js';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -18,6 +19,7 @@ import {
 import { parseJsonObject, type AssistApi } from './assist.js';
 import type { Dashboard } from './connectors/service.js';
 import { UserFacingError } from './sources.js';
+import { shadowBackground, type BackgroundGate, type ServerRole } from './background.js';
 
 // Settings → Scheduled jobs: Hermes' cron jobs, through the Hermes dashboard's own
 // /api/cron routes (the same ones the dashboard UI uses). Hermes keeps the jobs and runs
@@ -63,6 +65,8 @@ export interface PaseoRun {
 }
 
 export interface SchedulesDeps {
+  triggerRoles?: () => Promise<Record<string, 'shadow' | 'primary'>>;
+  background?: BackgroundGate;
   dashboard: () => Dashboard | undefined;
   /** The local model, for each job's one-line "idea" and the AI job builder. */
   assist?: AssistApi;
@@ -193,7 +197,7 @@ async function hermesError(res: Response, fallback: string): Promise<string> {
 function stateOf(job: Record<string, unknown>): ScheduleState {
   const claim = (job.run_claim ?? job.fire_claim) as unknown;
   const latest = job.latest_execution as { status?: unknown } | undefined;
-  if (claim || latest?.status === 'running' || latest?.status === 'claimed') return 'running';
+  if (claim || job.state === 'running' || latest?.status === 'running' || latest?.status === 'claimed') return 'running';
   if (job.state === 'completed') return 'done';
   if (job.enabled === false || job.state === 'paused') return 'paused';
   if (job.state === 'error' || job.last_status === 'error') return 'error';
@@ -248,10 +252,11 @@ export class Schedules {
     const dashboard = this.deps.dashboard();
     if (!dashboard) throw new UserFacingError('Sign in to Hermes in Settings first.', 409);
     try {
+      checkDeviceSignal();
       return await dashboard.fetch(path, {
         method,
         ...(body === undefined ? {} : { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: actionSignal(AbortSignal.timeout(timeoutMs)),
       });
     } catch {
       throw new UserFacingError("Can't reach the Hermes dashboard.", 503);
@@ -372,7 +377,19 @@ export class Schedules {
     }
     const labels = new Map(targets.map((t) => [t.id, t.label]));
     const ages = raw.map((j) => num(j.scheduler_heartbeat_age_s)).filter((n): n is number => n !== undefined);
-    return { jobs: raw.map((j) => this.toJob(j, labels)), targets, ...(ages.length ? { schedulerAgeS: Math.min(...ages) } : {}) };
+    const hasTriggers = raw.some((j) => str(j.name)?.startsWith(TRIGGER_NAME_PREFIX));
+    const roles: Record<string, ServerRole> = hasTriggers ? await this.deps.triggerRoles?.().catch(() => ({})) ?? {} : {};
+    const jobs = raw.map((j) => {
+      const job = this.toJob(j, labels);
+      const folder = str(j.workdir)?.split('/').filter(Boolean).pop();
+      if (job.trigger && (!folder || roles[folder] !== 'primary')) {
+        job.inactiveReason = folder && roles[folder] === 'shadow'
+          ? job.state === 'paused' ? 'Created in shadow, inactive' : 'Created in shadow. Pause this trigger and recreate it from primary.'
+          : 'Trigger role is unknown. Pause it until its role is confirmed.';
+      }
+      return job;
+    });
+    return { jobs, targets, ...(ages.length ? { schedulerAgeS: Math.min(...ages) } : {}) };
   }
 
   private async paseoList(): Promise<ScheduleJob[]> {
@@ -493,6 +510,10 @@ export class Schedules {
 
   /** Queue jobs without an idea; one background worker writes them one at a time. */
   private fillIdeas(jobs: ScheduleJob[]): void {
+    (this.deps.background ?? shadowBackground).run(() => this.queueIdeas(jobs));
+  }
+
+  private queueIdeas(jobs: ScheduleJob[]): void {
     if (!this.deps.assist) return;
     const pending = new Map<string, ScheduleJob>();
     for (const job of jobs) {
@@ -720,7 +741,24 @@ export class Schedules {
     this.deps.log.info({ fields: Object.keys(changes), ...(tools ? { tools } : {}) }, 'schedule updated');
   }
 
+  private async requireActiveTrigger(source: ScheduleSource, id: string): Promise<void> {
+    if (source !== 'hermes') return;
+    const data = await this.json<Record<string, unknown>[] | { jobs?: Record<string, unknown>[] }>('GET', '/api/cron/jobs');
+    const job = (Array.isArray(data) ? data : data.jobs ?? []).find((j) => j.id === id);
+    if (!job) throw new UserFacingError('That scheduled job is gone.', 404);
+    if (!str(job.name)?.startsWith(TRIGGER_NAME_PREFIX)) return;
+    if (!this.deps.triggerRoles) {
+      throw new UserFacingError('Mail trigger role is unknown. Use a role-aware primary helper to run or resume it.', 409);
+    }
+    const folder = str(job.workdir)?.split('/').filter(Boolean).pop();
+    const roles = await this.deps.triggerRoles().catch((): Record<string, ServerRole> => ({}));
+    if (!folder || roles[folder] !== 'primary') {
+      throw new UserFacingError('Mail trigger is inactive or its role is unknown. Delete it and recreate it from primary.', 409);
+    }
+  }
+
   async setPaused(source: ScheduleSource, id: string, paused: boolean): Promise<void> {
+    if (!paused) await this.requireActiveTrigger(source, id);
     this.invalidate();
     if (source === 'paseo') {
       await this.requirePaseo().schedulePaused(id, paused);
@@ -732,6 +770,7 @@ export class Schedules {
 
   /** Run now. Hermes' trigger route blocks until the run ends, so it runs in the background. */
   async runNow(source: ScheduleSource, id: string): Promise<void> {
+    await this.requireActiveTrigger(source, id);
     this.invalidate();
     if (source === 'paseo') {
       await this.requirePaseo().scheduleRunOnce(id);   // Paseo returns at once; the run shows in its logs

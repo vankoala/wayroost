@@ -1,13 +1,13 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { VOICE_MAX_SECONDS, type TimelineItem, type VoiceStatus } from '../../../shared/protocol';
-import { api, speakAudio } from '../api';
+import { api, speakAudio, streamSpeech } from '../api';
 import { onVoiceEvent, sendVoiceAudio, sendVoiceControl, socketOpen } from '../events';
 import { getState, onStoreChange, toast } from '../store';
 import { audioContext, MicCapture, micSupported, Player } from './audio';
 import { ReplyReader, type ReaderOutput } from './reader';
 
 // Voice mode: hold the mic (or tap it) to speak a message, and hear the reply.
-// What you say streams to Signalbox over the live socket and comes back as
+// What you say streams to Wayroost over the live socket and comes back as
 // text for the message box; replies are read aloud by the speech service on
 // your PC. One recording or one reading at a time, for one conversation.
 
@@ -259,7 +259,7 @@ export function startListening(key: string, mode: VoiceUi['mode'], onText: (text
   stopReading();
   const ctx = audioContext();
   if (!socketOpen()) {
-    toast('Not connected to Signalbox yet. Try again in a moment.');
+    toast('Not connected to Wayroost yet. Try again in a moment.');
     return;
   }
   reset();
@@ -352,8 +352,12 @@ player.onChange = () => {
 const output: ReaderOutput = {
   // The voice is the shared one (Settings → Voice applies everywhere): the server picks it.
   speak: (text) => speakAudio(text, undefined, settings.speed),
-  play: (audio) => player.play(audio),
+  stream: (text, signal, fallback) => streamSpeech(text, settings.speed, signal, fallback),
+  fallback: () => toast('ElevenLabs is unavailable. Reading in the local voice.'),
+  reset: (piece) => player.stopPiece(piece),
+  play: (audio, piece) => player.play(audio, piece),
   pending: () => player.pending(),
+  bufferedSeconds: () => player.bufferedSeconds(),
   changed: () => player.changed(),
 };
 
@@ -361,9 +365,9 @@ let reader: ReplyReader | null = null;
 let unfollow: (() => void) | null = null;
 let safety: ReturnType<typeof setTimeout> | undefined;
 
-function startReader(key: string, message: string | null = null): ReplyReader {
+function startReader(key: string, message: string | null = null, localVoice?: string): ReplyReader {
   stopReading();
-  const current = new ReplyReader(output, (error) => {
+  const current = new ReplyReader(localVoice ? { ...output, stream: undefined, speak: text => speakAudio(text, localVoice, settings.speed) } : output, (error) => {
     if (reader !== current) return;
     stopReading();
     if (error) toast(error);
@@ -397,10 +401,10 @@ export function readReplies(key: string, before: readonly TimelineItem[] = []): 
 }
 
 /** Read one message aloud (its Listen button); `id` names it while it's read. */
-export function readMessage(key: string, text: string, id = 'listen'): void {
+export function readMessage(key: string, text: string, id = 'listen', localVoice?: string): void {
   if (recording()) return;
   audioContext();
-  startReader(key, id).update([{ kind: 'assistant', id, text }], false);
+  startReader(key, id, localVoice).update([{ kind: 'assistant', id, text }], false);
 }
 
 export function stopReading(): void {

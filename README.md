@@ -2,7 +2,7 @@
 
 Your own AI team, on your own PC: one open-source home for your personal and coding agents, reachable from your phone.
 
-**Status: early development.** Wayroost starts from Signalbox, a self-hosted web app that puts [Hermes Agent](https://github.com/NousResearch/hermes-agent) chats and [Paseo](https://github.com/getpaseo/paseo) coding agents into one phone-friendly interface. The code here is that app today. Its guide is in [docs/signalbox.md](docs/signalbox.md). This page describes where Wayroost is going.
+**Status: early development.** The current Wayroost app is a self-hosted web app that puts [Hermes Agent](https://github.com/NousResearch/hermes-agent) chats and [Paseo](https://github.com/getpaseo/paseo) coding agents into one phone-friendly interface. The code here is that app today. Its guide is in [docs/signalbox.md](docs/signalbox.md). This page describes where Wayroost is going. Wayroost was previously called Signalbox; service, path, variable and label names that start with signalbox keep that name so existing installs keep working.
 
 <p>
   <img src="docs/images/01-phone-inbox-dark.png" alt="The inbox on a phone: Hermes chats and Paseo agents in one list" width="260">

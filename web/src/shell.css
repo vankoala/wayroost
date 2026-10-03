@@ -1,0 +1,1150 @@
+/* Wayroost shell: the sidebar, the phone bar, the role tiles, the status block,
+   Home and Status & power. Everything here takes colour, radius, font, space and shadow
+   from tokens.css — no literals. */
+
+/* ---------- Inside the shell, the old palette names mean the tokens ----------
+   The shell's subtree uses the same aliases, so the screens below read as one
+   warm palette while older screens keep their own variables. */
+
+.sidebar,
+.app-page,
+.page-main,
+.tabbar,
+.sheet-page {
+  --bg-elev: var(--surface);
+  --bg-elev-2: var(--surface-2);
+  --bg-hover: var(--surface-2);
+  /* A backdrop that dims the page behind it instead of hiding it: ink,
+     partly transparent, so it reads right in either theme. */
+  --bg-glass: color-mix(in srgb, var(--ink) 45%, transparent);
+  --border: var(--line);
+  --border-strong: var(--btn-line);
+  --text: var(--ink);
+  --text-2: var(--ink-2);
+  --text-3: var(--ink-3);
+  --accent-strong: var(--accent);
+  --success: var(--ok);
+  --danger: var(--bad);
+  --warn: var(--need);
+  --warn-bg: color-mix(in srgb, var(--need) 12%, var(--surface));
+  --warn-border: color-mix(in srgb, var(--need) 45%, var(--surface));
+  --danger-bg: color-mix(in srgb, var(--bad) 12%, var(--surface));
+  --code-bg: var(--surface-2);
+  --shadow: var(--shadow-card);
+  --radius: var(--radius-card);
+  --radius-sm: var(--radius-control);
+  --font: var(--font-ui);
+  --mono: var(--font-mono);
+  --tile-ring: var(--surface);
+}
+
+/* ---------- The sidebar (desktop) ---------- */
+
+.sidebar {
+  position: fixed;
+  left: 0;
+  top: var(--app-top, 0px);
+  height: var(--app-height, 100dvh);
+  width: var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4) 10px var(--space-4) var(--space-4);
+  background: var(--sidebar);
+  border-right: var(--border-width) solid var(--line);
+  overflow: hidden;
+  z-index: 5;
+}
+
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-left: 2px;
+  color: var(--ink);
+  text-decoration: none;
+  font-family: var(--font-wordmark);
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: 0.01em;
+}
+
+.side-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px var(--space-3);
+  margin-left: calc(var(--space-3) * -1);
+  border-radius: var(--radius-control);
+  color: var(--ink-2);
+  font-size: var(--text-body-lg);
+  font-weight: 500;
+  text-decoration: none;
+  transition: background var(--motion-fast) var(--motion-ease), color var(--motion-fast) var(--motion-ease);
+}
+
+.nav-row:hover {
+  background: color-mix(in srgb, var(--ink) 6%, var(--sidebar));
+  color: var(--ink);
+}
+
+.nav-row.active {
+  background: var(--nav-active);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.nav-label {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The one full pill in the sidebar: how many things are waiting. */
+.nav-count {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background: var(--need);
+  color: var(--bg);
+  font-size: var(--text-meta);
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.side-rule {
+  display: block;
+  height: var(--border-width);
+  background: var(--line);
+  margin: var(--space-2) 0;
+}
+
+.side-label {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-meta);
+  font-weight: 700;
+  letter-spacing: var(--label-tracking);
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.side-team {
+  min-height: 0;
+}
+
+.side-foot {
+  margin-top: auto;
+}
+
+/* ---------- The bottom bar (phone) ---------- */
+
+.tabbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: calc(var(--tabbar-height) + var(--safe-bottom));
+  padding-bottom: var(--safe-bottom);
+  display: flex;
+  align-items: stretch;
+  background: var(--sidebar);
+  border-top: var(--border-width) solid var(--line);
+  /* A sheet or a dialog covers the bar; the bar covers the page. */
+  z-index: 15;
+}
+
+.tabbar .nav-row {
+  flex: 1;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  margin: 0;
+  padding: 6px 2px;
+  border-radius: 0;
+  font-size: 11px;
+  font-weight: 500;
+  text-align: center;
+  color: var(--ink-2);
+}
+
+.tabbar .nav-row.active {
+  background: transparent;
+  color: var(--accent);
+}
+
+.tabbar .nav-label {
+  flex: none;
+}
+
+.tabbar .nav-count {
+  position: absolute;
+  transform: translate(14px, -10px);
+}
+
+.tabbar .tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 6px 2px;
+  color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* New task: the one filled thing on the bar. */
+.tabbar .tab-new {
+  color: var(--on-accent);
+  background: var(--accent);
+  border-radius: var(--radius-control);
+  margin: 8px 6px;
+  max-width: 76px;
+}
+
+/* ---------- Pages ---------- */
+
+/* A page of the shell: one column, no master-detail grid. */
+.app-page {
+  display: flex;
+}
+
+.page-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.page {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-5) var(--space-6) var(--space-6);
+  background: var(--bg);
+}
+
+.page-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  max-width: 1100px;
+  margin: 0 auto var(--space-5);
+  width: 100%;
+}
+
+.page-head h1,
+.page-home h1 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: var(--text-page-title);
+  line-height: 1.15;
+  color: var(--ink);
+  text-wrap: balance;
+  margin: 0;
+}
+
+.page-actions {
+  margin-left: auto;
+  display: flex;
+  gap: var(--space-2);
+}
+
+.page-body {
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-card);
+}
+
+.page-lead {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: var(--text-body-lg);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.page-note {
+  margin: 0;
+  color: var(--ink-3);
+  font-size: var(--text-body);
+  max-width: 60ch;
+}
+
+.page a:not(.role-tile) {
+  color: var(--accent);
+}
+
+/* A screen that used to be a sheet, opened as a page. */
+.sheet-page {
+  position: static;
+  animation: none;
+  border-radius: 0;
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  max-height: none;
+  width: auto;
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-6) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border: 0;
+  box-shadow: none;
+}
+
+.sheet.sheet-page {
+  width: 100%;
+}
+
+.sheet-page .sheet-head {
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0;
+  border-bottom: 0;
+}
+
+.sheet-page .sheet-head h2 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: var(--text-page-title);
+}
+
+.sheet-page .sheet-body {
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0;
+  gap: var(--gap-card);
+}
+
+.sheet-page .sheet-foot {
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+/* ---------- Home ---------- */
+
+.page-home {
+  gap: var(--space-5);
+}
+
+.home-head {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.home-date {
+  margin: 0;
+  font-size: var(--text-meta);
+  color: var(--ink-3);
+}
+
+.home-summary {
+  margin: 0;
+  font-size: var(--text-body-lg);
+  color: var(--ink-2);
+  max-width: 52ch;
+}
+
+.home-new {
+  position: absolute;
+  right: 0;
+  top: var(--space-5);
+}
+
+.home-tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--gap-card);
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.home-tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-height: 128px;
+  padding: var(--space-4);
+  border-radius: var(--radius-card);
+  border: var(--border-width) solid var(--line);
+  text-decoration: none;
+  color: var(--ink);
+  transition: transform var(--motion-fast) var(--motion-ease),
+    border-color var(--motion-fast) var(--motion-ease);
+}
+
+.home-tile:hover {
+  border-color: var(--btn-line);
+}
+
+.home-tile:active {
+  transform: scale(0.99);
+}
+
+.tile-needs {
+  background: var(--tile-needs);
+}
+.tile-working {
+  background: var(--tile-working);
+}
+.tile-done {
+  background: var(--tile-done);
+}
+.tile-coming {
+  background: var(--tile-coming);
+}
+
+.tile-top {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--ink-2);
+  font-size: var(--text-meta);
+  font-weight: 700;
+  letter-spacing: var(--label-tracking);
+  text-transform: uppercase;
+}
+
+.tile-label {
+  flex: 1;
+}
+
+.tile-count {
+  font-family: var(--font-display);
+  font-size: var(--text-tile-number);
+  line-height: 1.1;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.tile-caption {
+  font-size: var(--text-body);
+  color: var(--ink-2);
+}
+
+.home-mobile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.trust-banner {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+  padding: var(--space-4);
+  border-radius: var(--radius-card);
+  background: var(--banner-bg);
+  color: var(--ink-2);
+  font-size: var(--text-body);
+  line-height: 1.5;
+}
+
+.trust-banner svg {
+  color: var(--ink-3);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.trust-banner strong {
+  color: var(--ink);
+}
+
+/* ---------- Role tiles ---------- */
+
+.role-tile {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-tile);
+  color: var(--role-glyph);
+  flex-shrink: 0;
+  text-decoration: none;
+}
+
+.role-manager {
+  background: var(--role-manager);
+}
+.role-agent {
+  background: var(--role-agent);
+}
+.role-coder {
+  background: var(--role-coder);
+}
+.role-reviewer {
+  background: var(--role-reviewer);
+}
+.role-scout {
+  background: var(--role-scout);
+}
+.role-voice {
+  background: var(--role-voice);
+}
+
+.role-size-28 {
+  width: 28px;
+  height: 28px;
+}
+.role-size-32 {
+  width: 32px;
+  height: 32px;
+}
+.role-size-44 {
+  width: 44px;
+  height: 44px;
+}
+.role-size-64 {
+  width: 64px;
+  height: 64px;
+}
+
+.role-size-28 > svg:first-child {
+  width: 15px;
+  height: 15px;
+}
+.role-size-32 > svg:first-child {
+  width: 18px;
+  height: 18px;
+}
+.role-size-44 > svg:first-child {
+  width: 24px;
+  height: 24px;
+}
+.role-size-64 > svg:first-child {
+  width: 34px;
+  height: 34px;
+}
+
+.team-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* Six 28 px tiles fit the 210 px rail only with a tight gap and a little give. */
+.sidebar .team-row {
+  gap: 2px;
+  margin-right: -4px;
+}
+
+/* Badges: the state sits on a corner, with a ring of whatever is behind it. */
+.role-badge {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-badge);
+  color: var(--bg);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.role-size-44 .role-badge,
+.role-size-64 .role-badge {
+  min-width: 15px;
+  min-height: 15px;
+  font-size: 10px;
+}
+
+.role-badge.working {
+  width: 9px;
+  height: 9px;
+  right: -2px;
+  bottom: -2px;
+  background: var(--ok);
+  animation: role-pulse 2s var(--motion-ease) infinite;
+}
+
+.role-badge.needs {
+  width: 13px;
+  height: 13px;
+  top: -4px;
+  right: -4px;
+  background: var(--need);
+}
+
+.role-badge.stuck {
+  width: 13px;
+  height: 13px;
+  top: -4px;
+  right: -4px;
+  background: var(--bad);
+}
+
+.role-badge.finished {
+  width: 13px;
+  height: 13px;
+  right: -3px;
+  bottom: -3px;
+  background: var(--ok);
+}
+
+@keyframes role-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* Nothing loops except the working badge. */
+@media (prefers-reduced-motion: reduce) {
+  .role-badge.working {
+    animation: none;
+  }
+  .home-tile,
+  .nav-row {
+    transition: none;
+  }
+}
+
+/* ---------- The status block ---------- */
+
+.status-block {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px var(--space-3);
+  border-radius: var(--radius-inset);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: var(--text-body);
+  line-height: 1.35;
+  text-decoration: none;
+  border: var(--border-width) solid transparent;
+}
+
+.status-block:hover {
+  border-color: var(--line);
+}
+
+.status-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.status-lines strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.status-detail {
+  font-size: var(--text-meta);
+  color: var(--ink-3);
+}
+
+.pip {
+  width: 10px;
+  height: 10px;
+  margin-top: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--ink-3);
+  flex-shrink: 0;
+}
+
+.pip.ok {
+  background: var(--ok);
+}
+.pip.need {
+  background: var(--need);
+}
+.pip.bad {
+  background: var(--bad);
+}
+
+.status-block[data-tone='need'] {
+  border-color: color-mix(in srgb, var(--need) 40%, transparent);
+}
+.status-block[data-tone='bad'] {
+  border-color: color-mix(in srgb, var(--bad) 40%, transparent);
+}
+
+/* ---------- Team page ---------- */
+
+.team-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--gap-card);
+}
+
+.team-card {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-4);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  border: var(--border-width) solid var(--line);
+  box-shadow: var(--shadow-card);
+}
+
+.team-card.asked {
+  border-color: var(--accent);
+}
+
+.team-card-text h2 {
+  margin: 0 0 2px;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: var(--text-card-title);
+  color: var(--ink);
+}
+
+.team-card-text p {
+  margin: 0;
+  font-size: var(--text-body);
+  color: var(--ink-2);
+}
+
+.team-card-state {
+  margin-top: var(--space-2) !important;
+  font-size: var(--text-meta) !important;
+  color: var(--ink-3) !important;
+  text-transform: capitalize;
+}
+
+/* ---------- Status & power page ---------- */
+
+.page-power .page-body {
+  gap: var(--space-3);
+}
+
+.power-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  border: var(--border-width) solid var(--line);
+  box-shadow: var(--shadow-card);
+}
+
+.power-card.tone-need {
+  border-color: color-mix(in srgb, var(--need) 35%, var(--line));
+}
+.power-card.tone-bad {
+  border-color: color-mix(in srgb, var(--bad) 40%, var(--line));
+}
+
+.power-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.power-head h2 {
+  flex: 1;
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: var(--text-card-title);
+  color: var(--ink);
+  text-wrap: balance;
+}
+
+/* Square-ish chips in lists: a long row of pills reads as noise. */
+.state-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-chip);
+  font-size: var(--text-meta);
+  font-weight: 700;
+  white-space: nowrap;
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
+
+.state-chip.ok {
+  color: var(--ok-ink);
+}
+.state-chip.need {
+  color: var(--need);
+}
+.state-chip.bad {
+  color: var(--bad);
+}
+
+.power-sentence {
+  margin: 0;
+  font-size: var(--text-body-lg);
+  color: var(--ink-2);
+  max-width: 68ch;
+}
+
+.power-busy {
+  color: var(--ink-3);
+  font-size: var(--text-body);
+}
+
+.power-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.power-actions .btn {
+  height: 40px;
+  font-size: var(--text-body);
+  border-radius: var(--radius-control);
+}
+
+.power-menu {
+  position: absolute;
+  right: var(--space-4);
+  top: calc(100% - var(--space-4));
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 240px;
+  padding: var(--space-2);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  border: var(--border-width) solid var(--btn-line);
+  box-shadow: var(--shadow-card);
+}
+
+.power-menu > button {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-2) 10px;
+  border-radius: var(--radius-chip);
+  text-align: left;
+  color: var(--ink);
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+
+.power-menu > button:hover {
+  background: var(--surface-2);
+}
+
+.power-menu-label {
+  margin: var(--space-1) 10px 2px;
+  font-size: var(--text-meta);
+  font-weight: 700;
+  color: var(--ink-3);
+}
+
+.power-menu .muted {
+  font-weight: 400;
+  font-size: var(--text-meta);
+}
+
+.power-menu-cancel {
+  margin: 0 10px;
+}
+
+.power-banner {
+  width: 100%;
+  margin: 0;
+  border-radius: var(--radius-inset);
+}
+
+.power-lines {
+  padding: var(--space-3);
+  border-radius: var(--radius-inset);
+  background: var(--surface-2);
+  max-height: 240px;
+  overflow: auto;
+}
+
+.power-lines pre {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-body);
+  color: var(--ink-2);
+  white-space: pre-wrap;
+}
+
+.power-details {
+  margin-top: var(--space-1);
+  border-top: var(--border-width) solid var(--line);
+  padding-top: var(--space-2);
+}
+
+.power-details summary {
+  color: var(--accent);
+  font-size: var(--text-body);
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+
+.power-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.power-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-body);
+}
+
+.power-fact {
+  display: contents;
+}
+
+.power-facts dt {
+  color: var(--ink-3);
+}
+
+.power-facts dd {
+  margin: 0;
+  color: var(--ink-2);
+  word-break: break-word;
+}
+
+.power-facts code {
+  font-family: var(--font-mono);
+  font-size: var(--text-body);
+  color: var(--ink-2);
+}
+
+.power-none .power-sentence {
+  margin-bottom: var(--space-2);
+}
+
+/* A component this PC hasn't configured: shown, never acted on. */
+.power-not-set-up .power-sentence {
+  color: var(--ink-3);
+}
+
+.power-presence ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  color: var(--ink-2);
+  font-size: var(--text-body);
+}
+
+/* ---------- Tasks: the worker ledger ---------- */
+
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.task-row,
+.task-card {
+  padding: var(--space-4);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  border: var(--border-width) solid var(--line);
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.task-card {
+  overflow-wrap: anywhere;
+}
+
+.task-card p {
+  margin: var(--space-2) 0;
+}
+
+.task-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.task-heading h2 {
+  margin: 0;
+  font-size: var(--text-body-lg);
+}
+
+.task-deliveries {
+  margin: var(--space-2) 0 0;
+  padding-left: 22px;
+}
+
+.task-deliveries li + li {
+  margin-top: var(--space-2);
+}
+
+.task-held {
+  color: var(--ink-2);
+}
+
+/* ---------- Settings pages ---------- */
+
+.settings-search {
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto var(--space-2);
+}
+
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.settings-group + .settings-group {
+  margin-top: var(--space-4);
+}
+
+.settings-group[hidden] {
+  display: none;
+}
+
+.page-settings .group,
+.page-settings .group-title {
+  max-width: 1100px;
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.page-settings .group {
+  background: var(--surface);
+  border: var(--border-width) solid var(--line);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+}
+
+.page-settings .group-title {
+  margin: var(--space-4) 0 0;
+}
+
+.settings-empty {
+  max-width: 1100px;
+  width: 100%;
+  margin: var(--space-4) auto 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-body);
+}
+
+.setting-timing {
+  display: block;
+  color: var(--ink-3);
+  font-size: var(--text-meta);
+  margin-top: var(--space-1);
+}
+
+/* ---------- Where the shell gives way to a phone ---------- */
+
+@media (max-width: 959px) {
+  .home-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .home-new {
+    position: static;
+    align-self: flex-start;
+    margin-top: var(--space-2);
+  }
+}
+
+/* The sidebar takes 210px off the content column; the phone bar takes its height. */
+@media (min-width: 720px) {
+  .app {
+    padding-left: var(--sidebar-width);
+  }
+}
+
+@media (max-width: 719px) {
+  .app {
+    padding-bottom: calc(var(--tabbar-height) + var(--safe-bottom));
+  }
+  .page,
+  .sheet-page,
+  .sheet-page .sheet-head,
+  .sheet-page .sheet-body,
+  .page-head,
+  .page-body,
+  .home-head,
+  .home-tiles,
+  .settings-group,
+  .settings-search,
+  .trust-banner,
+  .home-mobile,
+  .page-settings .group,
+  .page-settings .group-title,
+  .settings-empty {
+    padding-left: var(--space-4);
+    padding-right: var(--space-4);
+    max-width: none;
+  }
+  .page-head h1,
+  .page-home h1,
+  .sheet-page .sheet-head h2 {
+    font-size: var(--text-page-title-phone);
+  }
+  .power-menu {
+    right: var(--space-3);
+  }
+}
+
+/* ---------- Scrolling a page ---------- */
+
+/* A form that scrolls itself to the top shouldn't sit flush against the edge: a
+   sub-pixel overshoot reads as "off screen" to a check and to a person alike. */
+.sheet .form-group,
+.page-main .form-group {
+  scroll-margin-top: var(--space-4);
+}

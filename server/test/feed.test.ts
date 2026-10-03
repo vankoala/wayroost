@@ -1,5 +1,6 @@
+import { BackgroundGate } from '../src/background.js';
 import { createDecipheriv, createECDH, createHmac, createPublicKey, verify } from 'node:crypto';
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -30,6 +31,27 @@ afterEach(async () => {
 // ---- Store ------------------------------------------------------------------------
 
 describe('FeedStore', () => {
+  it.each(['new', 'seen', 'later'] as const)('retries a failed close of a %s card without losing its saved decision', (status) => {
+    const state = dir();
+    const store = new FeedStore(state, () => 10_000);
+    const key = 'task:demo_worker';
+    const [created] = store.ingest('agent', [card(key)]).created;
+    store.setStatus(created!.id, status, status === 'later' ? { laterUntil: 20_000 } : {});
+    const before = { ...store.get(created!.id)! };
+    const blocker = join(state, 'feed.json.tmp');
+    mkdirSync(blocker);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(() => store.close(key)).toThrow();
+      expect(store.get(created!.id)).toEqual(before);
+      expect(new FeedStore(state).get(created!.id)).toEqual(before);
+    }
+    rmSync(blocker, { recursive: true });
+    expect(store.close(key)?.status).toBe('done');
+    expect(new FeedStore(state).get(created!.id)?.status).toBe('done');
+    expect(store.get(created!.id)?.laterUntil).toBeUndefined();
+    expect(store.close(key)).toBeUndefined();
+  });
+
   it('adds cards once per key, updates them, and keeps your decisions', () => {
     let now = 1_000;
     const store = new FeedStore(dir(), () => now);
@@ -183,6 +205,7 @@ const b64 = (s: string) => Buffer.from(s, 'base64url');
 
 describe('Web Push', () => {
   it('encrypts exactly like RFC 8291 Appendix A', () => {
+    // RFC 8291 Appendix A public test vectors: https://www.rfc-editor.org/rfc/rfc8291.html#appendix-A.
     const body = encryptPayload(
       Buffer.from('When I grow up, I want to be a watermelon'),
       b64('BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4'),
@@ -200,7 +223,7 @@ describe('Web Push', () => {
     expect(endpointProblem('https://updates.push.services.mozilla.com/wpush/v2/x')).toBeNull();
     expect(endpointProblem('https://wns2-par02p.notify.windows.com/w/?token=x')).toBeNull();
     expect(endpointProblem('http://fcm.googleapis.com/x')).toBe('not https');
-    expect(endpointProblem('https://127.0.0.1:9119/api')).toBe('unexpected port');
+    expect(endpointProblem('https://127.0.0.1:19006/api')).toBe('unexpected port');
     expect(endpointProblem('https://fcm.googleapis.com.evil.example/x')).toBe('not a known push service');
     expect(endpointProblem('https://user:pw@fcm.googleapis.com/x')).toBe('credentials in the URL');
     expect(endpointProblem('not a url')).toBe('not a URL');
@@ -224,7 +247,7 @@ describe('Web Push', () => {
     const state = dir();
     writeFileSync(join(state, 'push.json'), JSON.stringify({ vapid: { d: 'bad', x: 'bad', y: 'bad' }, devices: [] }));
     const warnings: string[] = [];
-    const push = new PushSender(state, 'https://signalbox.example.com', { warn: (_o, msg) => warnings.push(msg) });
+    const push = new PushSender(state, 'https://wayroost.example.com', { warn: (_o, msg) => warnings.push(msg) }, undefined, new BackgroundGate('primary'));
     expect(Buffer.from(push.publicKey(), 'base64url')).toHaveLength(65);
     expect(warnings).toEqual(['push.json unusable: made a new notifications key']);
     expect(JSON.parse(readFileSync(join(state, 'push.json'), 'utf8')).vapid.d).not.toBe('bad');
@@ -239,7 +262,7 @@ describe('Web Push', () => {
       calls.push({ url, headers: init.headers as Record<string, string>, body: Buffer.from(init.body as Buffer) });
       return new Response(null, { status });
     }) as unknown as typeof fetch;
-    const push = new PushSender(state, 'https://signalbox.example.com', quietLog, fetchStub);
+    const push = new PushSender(state, 'https://wayroost.example.com', quietLog, fetchStub, new BackgroundGate('primary'));
     const phone = browser();
     expect(push.add(phone.subscription())).toBe(1);
     expect(() => push.add({ ...phone.subscription('https://evil.example/x') })).toThrow('not a known push service');
@@ -264,7 +287,7 @@ describe('Web Push', () => {
     const auth = /^vapid t=([^,]+), k=(.+)$/.exec(call.headers.authorization!)!;
     expect(auth[2]).toBe(push.publicKey());
     const [h, c, sig] = auth[1]!.split('.');
-    expect(JSON.parse(b64(c!).toString())).toEqual({ aud: 'https://fcm.googleapis.com', exp: now / 1000 + 43_200, sub: 'https://signalbox.example.com' });
+    expect(JSON.parse(b64(c!).toString())).toEqual({ aud: 'https://fcm.googleapis.com', exp: now / 1000 + 43_200, sub: 'https://wayroost.example.com' });
     const point = b64(push.publicKey());
     const key = createPublicKey({
       key: { kty: 'EC', crv: 'P-256', x: point.subarray(1, 33).toString('base64url'), y: point.subarray(33).toString('base64url') },
@@ -273,7 +296,7 @@ describe('Web Push', () => {
     expect(verify('sha256', Buffer.from(`${h}.${c}`), { key, dsaEncoding: 'ieee-p1363' }, b64(sig!))).toBe(true);
 
     // The same key after a restart; a device the service says is gone is dropped.
-    const reloaded = new PushSender(state, 'https://signalbox.example.com', quietLog, fetchStub);
+    const reloaded = new PushSender(state, 'https://wayroost.example.com', quietLog, fetchStub, new BackgroundGate('primary'));
     expect(reloaded.publicKey()).toBe(push.publicKey());
     status = 410;
     expect(await reloaded.send(message, now)).toEqual({ sent: 0, failed: 0, removed: 1 });
@@ -317,7 +340,7 @@ function service(options: { now?: () => number; push?: PushSender; schedules?: F
   hub.observe((e) => events.push(e));
   const created: string[] = [];
   const store = new FeedStore(dir(), options.now);
-  const feed = new Feed({
+  const feed = new Feed({ background: new BackgroundGate('primary'),
     store,
     hub,
     hermes: {
@@ -383,6 +406,30 @@ describe('Feed service', () => {
     expect(feed.preferences().done).toEqual([]);
     await feed.act(loop.id, 'done');
     expect(feed.preferences().done).toEqual(['loop:abc123']);
+  });
+
+  it('closes an open card once its subject is over, and never one you finished or turned down', async () => {
+    const { feed, events, store } = service();
+    feed.ingest('agent', [
+      card('task:w1', { kind: 'warning', action: undefined }),
+      card('task:w2', { kind: 'warning' }),
+      card('task:w3', { kind: 'warning' }),
+      card('task:w4', { kind: 'warning' }),
+    ]);
+    const byKey = (key: string) => store.all().find((c) => c.key === key)!;
+    await feed.act(byKey('task:w2').id, 'dismiss');
+    await feed.act(byKey('task:w3').id, 'later');
+    await feed.act(byKey('task:w4').id, 'done');
+    events.length = 0;
+    for (const key of ['task:w1', 'task:w1', 'task:w2', 'task:w3', 'task:w4', 'task:none']) feed.close(key);
+    // Published once each, only for the open ones (a put-off card is still open).
+    expect(events.map((e) => (e.type === 'feed_upsert' ? `${e.card.key} ${e.card.status}` : e.type))).toEqual([
+      'task:w1 done',
+      'task:w3 done',
+    ]);
+    expect(byKey('task:w2').status).toBe('dismissed');
+    expect(byKey('task:w3').laterUntil).toBeUndefined();
+    expect((await feed.list()).cards).toEqual([]);
   });
 
   it('forgets old cards every minute too, and says so', () => {
@@ -541,7 +588,7 @@ describe('For you routes', () => {
       ...(withFeed
         ? {
             feed: ({ hub, hermes, stateDir }) =>
-              new Feed({ store: new FeedStore(stateDir), hub, hermes, log: quietLog, timeZone: 'UTC' }),
+              new Feed({ background: new BackgroundGate('primary'), store: new FeedStore(stateDir), hub, hermes, log: quietLog, timeZone: 'UTC' }),
           }
         : {}),
     });
@@ -562,7 +609,7 @@ describe('For you routes', () => {
     expect((await act({ action: 'launch' })).statusCode).toBe(400);
     expect((await act({ action: 'do' }, '0123456789abcdef')).statusCode).toBe(404);
     expect((await act({ action: 'do' }, 'not-a-card')).statusCode).toBe(400);
-    expect((await act({ action: 'do' }, id, { ...postHeaders(token), 'x-signalbox-request': '' })).statusCode).toBe(403);
+    expect((await act({ action: 'do' }, id, { ...postHeaders(token), 'x-wayroost-request': '' })).statusCode).toBe(403);
     const done = await act({ action: 'do' });
     expect(done.json()).toMatchObject({ card: { status: 'done' }, chat: { source: 'hermes', id: 'new-hermes' } });
     expect(hermes.calls.some((c) => c.startsWith('create:From my For-you feed'))).toBe(true);
@@ -590,16 +637,16 @@ describe('For you routes', () => {
 
   it('takes the pulse cards on the bridge listener, with its token', async () => {
     const hub = new EventHub();
-    const feed = new Feed({
+    const feed = new Feed({ background: new BackgroundGate('primary'),
       store: new FeedStore(dir()),
       hub,
       hermes: { createConversation: async () => ({ id: 'x' }) },
       log: quietLog,
     });
-    const server = await buildBridgeServer({
+    const server = await buildBridgeServer({ background: new BackgroundGate('primary'),
       bridge: { call: async () => ({}) } as never,
       token: 'pulse-token-0123456789abcdef0123456789',
-      port: 8792,
+      port: 19012,
       log: quietLog,
       feed,
     });
@@ -608,7 +655,7 @@ describe('For you routes', () => {
       server.inject({
         method,
         url,
-        headers: { host: '127.0.0.1:8792', authorization: auth, ...(body ? { 'content-type': 'application/json' } : {}) },
+        headers: { host: '127.0.0.1:19012', authorization: auth, ...(body ? { 'content-type': 'application/json' } : {}) },
         ...(body ? { payload: JSON.stringify(body) } : {}),
       });
     expect((await call('GET', '/pulse/v1/preferences', undefined, 'Bearer wrong')).statusCode).toBe(401);

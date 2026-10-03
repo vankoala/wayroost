@@ -26,7 +26,7 @@ source "$REPO/deploy/lib.sh"
 ETC=/etc/signalbox
 TOKEN_SRC=/var/lib/private/signalbox/bridge-token
 WRAPPER=/opt/signalbox/bin/signalbox-bridge.mjs
-DEFAULT_PORT=8792
+DEFAULT_PORT=19012
 
 usage() {
   echo "Usage: $0 <user> [--dry-run] [--remove] [--no-hermes-plugin]" >&2
@@ -441,7 +441,7 @@ def token(mode, path, stamp, dry):
         return CHANGED
     value = sys.stdin.read().strip()
     if not TOKEN_RE.fullmatch(value):
-        raise SystemExit("The bridge token Signalbox wrote doesn't look right; restart Signalbox and try again.")
+        raise SystemExit("The bridge token Wayroost wrote doesn't look right; restart Wayroost and try again.")
     folder = os.path.dirname(path)
     private = lambda p: (os.stat(p).st_mode & 0o077) == 0
     if exists and read_text(path).strip() == value and private(path) and private(folder):
@@ -483,7 +483,17 @@ def files_in(root):
 
 def plugin(src, dest, stamp, dry):
     """Put the plugin in ~/.hermes/plugins/<name>; an older copy moves to ~/.hermes/plugins-backup."""
-    if os.path.isdir(dest) and not os.path.islink(dest) and files_in(dest) == files_in(src):
+    runtime = os.path.join(os.path.dirname(os.path.dirname(src)), "helper", "wayroost_runtime.py")
+    if not os.path.isfile(runtime):
+        raise RuntimeError("wayroost_runtime.py is missing; the bridge plugin was not installed")
+    wanted = files_in(src)
+    if os.path.isfile(runtime):
+        with open(runtime, "rb") as f:
+            wanted["wayroost_runtime.py"] = f.read()
+    role_config = os.path.join(os.path.dirname(os.path.dirname(src)), "deploy", "primary-role.json")
+    with open(role_config, "rb") as f:
+        wanted["wayroost-role.json"] = f.read()
+    if os.path.isdir(dest) and not os.path.islink(dest) and files_in(dest) == wanted:
         say(f"{dest} is up to date.")
         return NOTHING
     if dry:
@@ -498,6 +508,9 @@ def plugin(src, dest, stamp, dry):
     try:
         staged = os.path.join(staging, os.path.basename(dest))
         shutil.copytree(src, staged, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        if os.path.isfile(runtime):
+            shutil.copy2(runtime, os.path.join(staged, "wayroost_runtime.py"))
+        shutil.copy2(role_config, os.path.join(staged, "wayroost-role.json"))
         if os.path.lexists(dest):
             backup = os.path.join(backups, f"{os.path.basename(dest)}.bak-signalbox-{stamp}")
             os.rename(dest, backup)
@@ -531,7 +544,7 @@ CLAUDE_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")
 
 
 def claude_hook(mode, path, command, stamp, dry):
-    """Register (or remove) Signalbox's launch hook for the four session events in ~/.claude/settings.json."""
+    """Register (or remove) Wayroost's launch hook for the four session events in ~/.claude/settings.json."""
     exists = os.path.exists(path)
     if not exists and mode == "remove":
         say(f"{path} doesn't exist; nothing to remove.")
@@ -570,7 +583,7 @@ def claude_hook(mode, path, command, stamp, dry):
                 del hooks[event]
             changed.append(event)
     if not changed:
-        say(f"{path}: the Signalbox hook is {'already registered' if mode == 'add' else 'not registered'}.")
+        say(f"{path}: the Wayroost hook is {'already registered' if mode == 'add' else 'not registered'}.")
         return NOTHING
     if not hooks:
         del new_data["hooks"]
@@ -644,7 +657,7 @@ helper() { as_user "$PY3" -I -c "$HELPER" "$@"; }
 PORT="$DEFAULT_PORT"
 if (( ! REMOVE )); then
   if [[ ! -f "$ETC/config.json" ]]; then
-    echo "$ETC/config.json doesn't exist. Set up Signalbox first (docs/setup.md)." >&2
+    echo "$ETC/config.json doesn't exist. Set up Wayroost first (docs/setup.md)." >&2
     exit 1
   fi
   PORT="$(python3 -I - "$ETC/config.json" <<'PY'
@@ -660,18 +673,18 @@ if not isinstance(bridge, dict) or bridge.get("enabled") is not True:
     sys.exit(
         f"The bridge is turned off. To turn it on:\n"
         f"  1. add  \"bridge\": {{ \"enabled\": true }}  to {path}\n"
-        f"     (\"port\" is optional, default 8792; it must differ from listen.port and 8791),\n"
-        f"  2. sudo systemctl restart signalbox   (Signalbox then creates the bridge token),\n"
+        f"     (\"port\" is optional, default 19012; it must differ from listen.port and 19011),\n"
+        f"  2. sudo systemctl restart signalbox   (Wayroost then creates the bridge token),\n"
         f"  3. run this script again."
     )
-port = bridge.get("port", 8792)
+port = bridge.get("port", 19012)
 if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
     sys.exit(f"bridge.port in {path} must be a whole number from 1 to 65535.")
 print(port)
 PY
 )"
   if [[ ! -f "$TOKEN_SRC" || -L "$TOKEN_SRC" ]]; then
-    echo "Signalbox hasn't created the bridge token yet ($TOKEN_SRC)." >&2
+    echo "Wayroost hasn't created the bridge token yet ($TOKEN_SRC)." >&2
     echo "Restart it with the bridge enabled (sudo systemctl restart signalbox), then run this script again." >&2
     exit 1
   fi

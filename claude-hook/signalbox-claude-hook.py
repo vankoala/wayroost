@@ -18,7 +18,7 @@ only for a run an agent launched, posts to the Signalbox bridge on this machine:
 A session no agent launched (no launcher in its environment) is never reported, nor is one run
 through the Agent SDK (Paseo's own Claude agents: Paseo shows those itself). Prints nothing:
 Claude Code adds a SessionStart or UserPromptSubmit hook's output to the conversation. Always exits
-0, waits at most a second for Signalbox, sends only to 127.0.0.1, and never logs.
+0, waits at most a second for Signalbox, sends only to 127.0.0.1, and never logs run contents.
 """
 import json
 import os
@@ -26,9 +26,26 @@ import re
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
-BRIDGE = "http://127.0.0.1:8792/bridge/v1/note_run"
-TOKEN_FILE = os.path.expanduser("~/.config/signalbox/bridge-token")
+BRIDGE = "http://127.0.0.1:19012/bridge/v1/note_run"
+# The installer puts the runtime next to this hook; source checks use helper/.
+_runtime_dir = Path(__file__).resolve().parent
+if not (_runtime_dir / "wayroost_runtime.py").is_file():
+    _runtime_dir = _runtime_dir.parent / "helper"
+sys.path.insert(0, str(_runtime_dir))
+try:
+    if not (_runtime_dir / "wayroost_runtime.py").is_file():
+        raise ImportError("Wayroost runtime is missing")
+    from wayroost_runtime import BackgroundGate, env as runtime_env  # noqa: E402
+except ImportError:
+    BackgroundGate = None
+
+    def runtime_env(suffix, default=None, environ=None):
+        environ = os.environ if environ is None else environ
+        return environ.get(f"WAYROOST_{suffix}", environ.get(f"SIGNALBOX_{suffix}", default))
+
+TOKEN_FILE = runtime_env("BRIDGE_TOKEN_FILE") or os.path.expanduser("~/.config/signalbox/bridge-token")
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 HERMES_ID = re.compile(r"\d{8}_\d{6}_[0-9A-Za-z]{1,64}")
 EVENTS = {"SessionStart": "start", "UserPromptSubmit": "prompt", "Stop": "stop", "SessionEnd": "end"}
@@ -38,7 +55,7 @@ TAIL_BYTES = 4 << 20  # the answer is near the end; a long run's transcript need
 
 def candidates(env, own_id):
     found = []
-    launcher = env.get("SIGNALBOX_LAUNCHER", "").strip()
+    launcher = runtime_env("LAUNCHER", "", env).strip()
     if launcher.startswith("claude:") and UUID.fullmatch(launcher[7:]) and launcher[7:] != own_id:
         found.append({"kind": "claude", "id": launcher[7:]})
     session = env.get("HERMES_SESSION_ID", "").strip()
@@ -102,6 +119,8 @@ def post(body):
 def main():
     event = None
     try:
+        if BackgroundGate is None or not BackgroundGate(default_config=Path(__file__).with_name("wayroost-role.json")).run(lambda: True):
+            return
         data = json.loads(sys.stdin.read() or "{}")
         event = EVENTS.get(data.get("hook_event_name", ""))
         session = str(data.get("session_id", ""))
@@ -120,6 +139,7 @@ def main():
             env_file = os.environ.get("CLAUDE_ENV_FILE")
             if env_file:
                 with open(env_file, "a", encoding="utf-8") as f:
+                    f.write(f"export WAYROOST_LAUNCHER=claude:{session}\n")
                     f.write(f"export SIGNALBOX_LAUNCHER=claude:{session}\n")
         elif event == "prompt":
             prompt = data.get("prompt")

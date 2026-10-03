@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { Dashboard } from '../src/connectors/service.js';
 import { Schedules, toCron, type PaseoRun, type PaseoSchedule, type PaseoSchedulesApi } from '../src/schedules.js';
@@ -70,7 +71,7 @@ class FakeDashboard implements Dashboard {
 
 function make() {
   const dashboard = new FakeDashboard();
-  return { dashboard, schedules: new Schedules({ dashboard: () => dashboard, log: quietLog }) };
+  return { dashboard, schedules: new Schedules({ background: new BackgroundGate('primary'), dashboard: () => dashboard, log: quietLog }) };
 }
 
 describe('Schedules', () => {
@@ -204,7 +205,7 @@ describe('Schedules with Paseo', () => {
   it('lists Paseo schedules beside Hermes jobs, with their agent and last-run state', async () => {
     const dashboard = new FakeDashboard();
     const paseo = new FakePaseo();
-    const list = await new Schedules({ dashboard: () => dashboard, paseo, log: quietLog }).list();
+    const list = await new Schedules({ background: new BackgroundGate('primary'), dashboard: () => dashboard, paseo, log: quietLog }).list();
     const nightly = list.jobs.find((j) => j.id === 'sch_nightly')!;
     expect(nightly).toMatchObject({ source: 'paseo', name: 'Nightly tests', schedule: '0 2 * * * (America/New_York)', state: 'error',
       lastError: 'Agent exited: provider unavailable', runs: 2, target: 'New claude agent in ~/app' });
@@ -217,15 +218,15 @@ describe('Schedules with Paseo', () => {
   it('still lists one source when the other is down', async () => {
     const paseo = new FakePaseo();
     paseo.schedulesList = async () => { throw new Error('reconnecting'); };
-    const list = await new Schedules({ dashboard: () => new FakeDashboard(), paseo, log: quietLog }).list();
+    const list = await new Schedules({ background: new BackgroundGate('primary'), dashboard: () => new FakeDashboard(), paseo, log: quietLog }).list();
     expect(list.jobs).toHaveLength(5);
     expect(list.unavailable).toEqual([{ source: 'paseo', reason: 'unavailable' }]);
-    const noHermes = await new Schedules({ dashboard: () => undefined, paseo: new FakePaseo(), log: quietLog }).list();
+    const noHermes = await new Schedules({ background: new BackgroundGate('primary'), dashboard: () => undefined, paseo: new FakePaseo(), log: quietLog }).list();
     expect(noHermes.jobs.map((j) => j.source)).toEqual(['paseo', 'paseo']);
   });
 
   it('runs open as Paseo agents, newest first', async () => {
-    const runs = await new Schedules({ dashboard: () => undefined, paseo: new FakePaseo(), log: quietLog }).runs('paseo', 'sch_nightly');
+    const runs = await new Schedules({ background: new BackgroundGate('primary'), dashboard: () => undefined, paseo: new FakePaseo(), log: quietLog }).runs('paseo', 'sch_nightly');
     expect(runs.map((r) => [r.status, r.open?.id.slice(0, 4), r.error ?? r.preview])).toEqual([
       ['failed', '3333', 'Agent exited: provider unavailable'],
       ['succeeded', '2222', 'All 120 tests pass.'],
@@ -234,7 +235,7 @@ describe('Schedules with Paseo', () => {
 
   it('pauses, runs, edits (as cron) and deletes through Paseo', async () => {
     const paseo = new FakePaseo();
-    const s = new Schedules({ dashboard: () => undefined, paseo, log: quietLog });
+    const s = new Schedules({ background: new BackgroundGate('primary'), dashboard: () => undefined, paseo, log: quietLog });
     await s.setPaused('paseo', 'sch_ci', false);
     await s.runNow('paseo', 'sch_nightly');
     await s.update('paseo', 'sch_ci', { schedule: 'every 30m', name: 'CI watch' });
@@ -256,7 +257,7 @@ describe('Schedules with Paseo', () => {
     const keys = await makeKeys();
     const token = await makeToken(keys);
     const paseo = new FakePaseo();
-    const { app } = await makeApp(keys, { schedules: new Schedules({ dashboard: () => undefined, paseo, log: quietLog }) });
+    const { app } = await makeApp(keys, { schedules: new Schedules({ background: new BackgroundGate('primary'), dashboard: () => undefined, paseo, log: quietLog }) });
     const runs = await app.inject({ url: '/api/schedules/paseo/sch_nightly/runs', headers: apiHeaders(token) });
     expect(runs.json().runs).toHaveLength(2);
     const put = (url: string, body: unknown) => app.inject({ method: 'PUT', url, headers: postHeaders(token), payload: JSON.stringify(body) });
@@ -318,7 +319,7 @@ describe('Schedules: names, ideas, overview, builder', () => {
       { id: '111111111111', name: 'pulse-relay', script: 'relay.py', schedule: { kind: 'cron', expr: '*/2 * * * *' }, enabled: true, state: 'scheduled' },
       { id: '222222222222', name: 'quick-poll', prompt: 'Poll.', schedule: { kind: 'interval', minutes: 5 }, enabled: true, state: 'scheduled' },
     );
-    const jobs = (await new Schedules({ dashboard: () => dashboard, log: quietLog }).list()).jobs;
+    const jobs = (await new Schedules({ background: new BackgroundGate('primary'), dashboard: () => dashboard, log: quietLog }).list()).jobs;
     const by = (id: string) => jobs.find((j) => j.id === id)!;
     expect(by('111111111111')).toMatchObject({ title: 'Pulse relay', plumbing: true });
     expect(by('222222222222').plumbing).toBe(true);           // every 5 minutes
@@ -330,7 +331,7 @@ describe('Schedules: names, ideas, overview, builder', () => {
     const assist = new FakeAssist();
     const stateDir = mkdtempSync(joinPath(tmpdir(), 'sb-ideas-'));
     let changed = 0;
-    const make2 = () => new Schedules({ dashboard: () => new FakeDashboard(), assist, stateDir, onChanged: () => changed++, log: quietLog });
+    const make2 = () => new Schedules({ background: new BackgroundGate('primary'), dashboard: () => new FakeDashboard(), assist, stateDir, onChanged: () => changed++, log: quietLog });
     const s = make2();
     await s.list();
     await expect.poll(() => changed).toBe(1);
@@ -349,7 +350,7 @@ describe('Schedules: names, ideas, overview, builder', () => {
     const dashboard = new FakeDashboard();
     dashboard.jobs.push({ id: '111111111111', name: 'pulse-relay', script: 'relay.py', schedule: { kind: 'cron', expr: '*/2 * * * *' },
       enabled: true, state: 'scheduled', next_run_at: iso(30_000) });
-    const ov = await new Schedules({ dashboard: () => dashboard, log: quietLog }).overview();
+    const ov = await new Schedules({ background: new BackgroundGate('primary'), dashboard: () => dashboard, log: quietLog }).overview();
     expect(ov.failed.map((j) => j.title)).toEqual(['Price watch']);
     expect(ov.next.map((j) => j.title)).toEqual(['Book club mail', 'Morning briefing']);   // failing and paused jobs aren't "next up"
     expect(ov.next.some((j) => j.name === 'pulse-relay')).toBe(false);
@@ -360,7 +361,7 @@ describe('Schedules: names, ideas, overview, builder', () => {
   it('drafts a job: only real skills, a valid destination, nothing created', async () => {
     const dashboard = new SkillsDashboard();
     const assist = new FakeAssist();
-    const s = new Schedules({ dashboard: () => dashboard, assist, log: quietLog });
+    const s = new Schedules({ background: new BackgroundGate('primary'), dashboard: () => dashboard, assist, log: quietLog });
     const draft = await s.draft('Every weekday morning tell me if my train is delayed');
     expect(draft).toMatchObject({ name: 'Train delay alert', schedule: '0 7 * * 1-5', deliver: 'whatsapp', notes: 'Check the transit alerts page is reachable.' });
     expect(draft.skills).toEqual([{ name: 'directions', why: 'live travel times' }, { name: 'watchers', why: '' }]);
@@ -374,7 +375,7 @@ describe('Schedules: names, ideas, overview, builder', () => {
   it('creates a drafted job with its skills, and keeps its idea', async () => {
     const dashboard = new FakeDashboard();
     const assist = new FakeAssist();
-    const s = new Schedules({ dashboard: () => dashboard, assist, log: quietLog });
+    const s = new Schedules({ background: new BackgroundGate('primary'), dashboard: () => dashboard, assist, log: quietLog });
     await s.create({ name: 'Train delay alert', prompt: 'Check my train line.', schedule: '0 7 * * 1-5', deliver: 'whatsapp',
       skills: ['directions'], idea: 'Warns about train delays.' });
     expect(dashboard.jobs.at(-1)).toMatchObject({ name: 'Train delay alert', skills: ['directions'] });
@@ -385,7 +386,7 @@ describe('Schedules: names, ideas, overview, builder', () => {
   it('serves the overview and drafts over the API', async () => {
     const keys = await makeKeys();
     const token = await makeToken(keys);
-    const { app } = await makeApp(keys, { schedules: new Schedules({ dashboard: () => new SkillsDashboard(), assist: new FakeAssist(), log: quietLog }) });
+    const { app } = await makeApp(keys, { schedules: new Schedules({ background: new BackgroundGate('primary'), dashboard: () => new SkillsDashboard(), assist: new FakeAssist(), log: quietLog }) });
     expect((await app.inject({ url: '/api/schedules/overview', headers: apiHeaders(token) })).json().failed).toHaveLength(1);
     const post = (body: unknown) => app.inject({ method: 'POST', url: '/api/schedules/draft', headers: postHeaders(token), payload: JSON.stringify(body) });
     expect((await post({ goal: 'Every weekday tell me about train delays' })).json().name).toBe('Train delay alert');
@@ -457,14 +458,14 @@ describe('Schedules: what a job may use', () => {
 
   it("won't set tools on a Paseo job", async () => {
     const paseo = new FakePaseo();
-    const s = new Schedules({ dashboard: () => undefined, paseo, log: quietLog });
+    const s = new Schedules({ background: new BackgroundGate('primary'), dashboard: () => undefined, paseo, log: quietLog });
     await expect(s.update('paseo', 'sch_nightly', { tools: 'all' })).rejects.toMatchObject({ status: 400 });
   });
 
   it("takes the builder's pick, and falls back to nothing", async () => {
     const dashboard = new SkillsDashboard();
     const assist = new FakeAssist();
-    const s = new Schedules({ dashboard: () => dashboard, assist, log: quietLog });
+    const s = new Schedules({ background: new BackgroundGate('primary'), dashboard: () => dashboard, assist, log: quietLog });
     assist.draftReply = JSON.stringify({ ...JSON.parse(assist.draftReply), tools: 'travel', toolsWhy: 'needs live traffic' });
     expect(await s.draft('Every weekday tell me about traffic to work')).toMatchObject({ tools: 'travel', toolsWhy: 'needs live traffic' });
     expect(assist.calls[0]![0]!.content).toContain('pick the LEAST it needs');

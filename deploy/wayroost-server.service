@@ -1,0 +1,60 @@
+[Unit]
+Description=Wayroost web app (shadow)
+After=network-online.target wayroost-supervisor.service
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/wayroost/server/dist/server/index.js
+WorkingDirectory=/opt/wayroost/server
+Environment=NODE_ENV=production
+Environment=WAYROOST_ROLE=shadow
+Environment=WAYROOST_CONFIG=%d/config.json
+# M1 fallback uses the same Wayroost config, never Signalbox's config.
+Environment=SIGNALBOX_CONFIG=%d/config.json
+LoadCredential=config.json:/etc/wayroost/config.json
+# The server reads it as $CREDENTIALS_DIRECTORY/supervisor-server-key, in
+# preference to a supervisor.keyFile in its config (that is for development).
+LoadCredential=supervisor-server-key:/etc/wayroost/server-key
+# The installer conditionally adds paseo-password and safety-helper-key credentials.
+LoadCredential=loopback-tls-cert:/etc/wayroost/server-tls-cert.pem
+LoadCredential=loopback-tls-key:/etc/wayroost/server-tls-key.pem
+Restart=on-failure
+RestartSec=3
+DynamicUser=yes
+SupplementaryGroups=wayroost
+StateDirectory=wayroost-shadow
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=768M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

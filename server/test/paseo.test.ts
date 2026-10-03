@@ -1,16 +1,22 @@
+import { BackgroundGate } from '../src/background.js';
 import type { AgentPermissionRequest } from '@getpaseo/protocol/agent-types';
+import { AGENT_PROVIDER_DEFINITIONS } from '@getpaseo/protocol/provider-manifest';
+import { DaemonClient } from '@getpaseo/client/internal/daemon-client';
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ServerEvent, TimelineItem } from '../../shared/protocol.js';
 import type { Attachment } from '../src/attachments.js';
 import { EventHub } from '../src/hub.js';
 import { MAX_MEDIA_BYTES } from '../src/media.js';
 import { Lineage } from '../src/lineage.js';
-import { PaseoAdapter } from '../src/paseo/adapter.js';
+import { APP_VERSION, PaseoAdapter } from '../src/paseo/adapter.js';
 import { AgentTimelineMirror, type MirrorRow, type MirrorSink } from '../src/paseo/mirror.js';
+import { deviceSignal, withDeviceSignal } from '../src/security/device-signal.js';
 import {
   DISMISS_OPTION,
   HERMES_BUSY_MODEL,
   HERMES_PARENT_LABEL,
+  KNOWN_MODES,
   PARENT_AGENT_LABEL,
   SUBAGENT_READ_ONLY,
   agentControls,
@@ -29,6 +35,9 @@ import {
   timelineItem,
 } from '../src/paseo/normalize.js';
 import { UserFacingError } from '../src/sources.js';
+import { buildApp } from '../src/app.js';
+import { createAccessVerifier } from '../src/security/access.js';
+import { FakeHermes, makeConfig, makeKeys, makeToken, postHeaders } from './helpers.js';
 
 const quietLog = { info() {}, warn() {}, error() {} };
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
@@ -117,10 +126,20 @@ describe('paseo normalization', () => {
     ]);
     expect(tiers('codex', ['auto', 'auto-review', 'full-access'])).toEqual(['asks', 'auto', 'blocked']);
     expect(tiers('copilot', ['agent', 'plan', 'allow-all'])).toEqual(['asks', 'asks', 'blocked']);
+    // In 0.9.2 Copilot's ACP modes are named by the protocol's URLs.
+    const acp = 'https://agentclientprotocol.com/protocol/session-modes#';
+    expect(tiers('copilot', [`${acp}agent`, `${acp}plan`])).toEqual(['asks', 'asks']);
+    expect(tiers('omp', ['ask', 'write', 'full'])).toEqual(['asks', 'auto', 'blocked']);
     expect(tiers('opencode', ['plan', 'build'])).toEqual(['asks', 'auto']);
     expect(tiers('hermes', ['default', 'accept_edits', 'dont_ask'])).toEqual(['asks', 'auto', 'blocked']);
     // Unknown providers: blocked by name, asking only for conservative ids, otherwise "acts on its own".
     expect(tiers('newagent', ['yolo', 'Skip-Permissions', 'default', 'turbo'])).toEqual(['blocked', 'blocked', 'asks', 'auto']);
+  });
+
+  it("classifies every mode of the installed client's built-in providers explicitly", () => {
+    const unclassified = AGENT_PROVIDER_DEFINITIONS.flatMap((provider) =>
+      (provider.modes ?? []).filter((mode) => !KNOWN_MODES[provider.id]?.[mode.id]).map((mode) => `${provider.id}/${mode.id}`));
+    expect(unclassified).toEqual([]);
   });
 
   it('starts in a mode that asks, preferring the provider default only if it asks', () => {
@@ -157,12 +176,75 @@ describe('paseo normalization', () => {
   it('maps ACP permission actions and only accepts offered ones', () => {
     const { approvals } = requestApprovals('agent-1', shellRequest, 0);
     expect(approvals).toHaveLength(1);
-    expect(approvals[0]).toMatchObject({ id: 'perm-1', kind: 'permission', title: 'Run command', detail: 'rm -rf build' });
+    expect(approvals[0]).toMatchObject({ id: 'perm-1', kind: 'permission', title: 'Run command', detail: 'rm -rf build', detailKind: 'command' });
     expect(approvals[0]!.options.map((o) => o.kind)).toEqual(['allow', 'allow_session', 'allow_always', 'deny']);
     expect(permissionResponse(shellRequest, 'allow_once')).toEqual({ behavior: 'allow', selectedActionId: 'allow_once' });
     expect(permissionResponse(shellRequest, 'deny')).toEqual({ behavior: 'deny', selectedActionId: 'deny' });
     expect(permissionResponse(shellRequest, 'allow')).toBeNull();
     expect(permissionResponse(shellRequest, 'yolo')).toBeNull();
+  });
+
+  it("says what a structured detail is, whatever the request's title claims", () => {
+    const kindOf = (detail: unknown, extra: Record<string, unknown> = {}) =>
+      requestApprovals('a1', { ...shellRequest, title: 'Read file', detail, ...extra } as AgentPermissionRequest, 0).approvals[0]!
+        .detailKind;
+    expect(kindOf({ type: 'shell', command: '/tmp/erase.sh' })).toBe('command');
+    expect(kindOf({ type: 'read', filePath: '/home/me/a.ts' })).toBe('read');
+    expect(kindOf({ type: 'edit', filePath: '/home/me/a.ts', unifiedDiff: '@@ -1 +1 @@' })).toBe('edit');
+    expect(kindOf({ type: 'write', filePath: '/home/me/a.ts', content: 'x' })).toBe('write');
+    expect(kindOf({ type: 'fetch', url: 'https://example.com' })).toBe('fetch');
+    expect(kindOf({ type: 'search', query: 'TODO' })).toBe('other');
+    // A detail Paseo doesn't structure says nothing about what it is.
+    expect(kindOf(undefined, { description: 'cat notes.md' })).toBeUndefined();
+    expect(kindOf({ type: 'shell' })).toBeUndefined();
+  });
+
+  it("keeps a file request's path exactly as Paseo gives it", () => {
+    const detailOf = (detail: unknown) =>
+      requestApprovals('a1', { ...shellRequest, detail } as AgentPermissionRequest, 0).approvals[0]!.detail;
+    expect(detailOf({ type: 'read', filePath: '/home/another-user/.ssh/config' })).toBe('/home/another-user/.ssh/config');
+    expect(detailOf({ type: 'edit', filePath: '/etc/sudoers', unifiedDiff: '@@ -1 +1 @@' })).toBe('/etc/sudoers\n\n@@ -1 +1 @@');
+    expect(detailOf({ type: 'write', filePath: '/home/me/code/a.ts', content: 'x' })).toBe('/home/me/code/a.ts\n\nx');
+  });
+
+  it("sends a file request's whole path apart from its detail", () => {
+    const of = (detail: unknown) =>
+      requestApprovals('a1', { ...shellRequest, detail } as AgentPermissionRequest, 0).approvals[0]!;
+    // A line break in the path: the detail can't say where the path ends, the field can.
+    const path = '/home/me/code/billing/src\n/../../../../../etc/sudoers';
+    expect(of({ type: 'edit', filePath: path, unifiedDiff: '@@ -1 +1 @@' }).filePath).toBe(path);
+    expect(of({ type: 'write', filePath: path, content: 'x' }).filePath).toBe(path);
+    expect(of({ type: 'read', filePath: path }).filePath).toBe(path);
+    // Only file requests carry one, and only a path that's sent whole.
+    expect(of({ type: 'edit', unifiedDiff: '@@ -1 +1 @@' }).filePath).toBeUndefined();
+    expect(of({ type: 'shell', command: 'ls', filePath: '/etc/passwd' }).filePath).toBeUndefined();
+    const long = `/home/me/code/billing/${'a/'.repeat(40_000)}../../etc/sudoers`;
+    const cut = of({ type: 'read', filePath: long });
+    expect(cut.filePath).toBeUndefined();
+    expect(cut.detailTruncated).toBe(true);
+  });
+
+  it("shows what an unstructured request runs, never only its description", () => {
+    const bash = {
+      ...shellRequest,
+      name: 'Bash',
+      title: 'Bash',
+      detail: undefined,
+      description: 'https://example.com',
+      input: { command: 'rm -rf /srv/production' },
+    } as unknown as AgentPermissionRequest;
+    const [approval] = requestApprovals('a1', bash, 0).approvals;
+    expect(approval!.detail).toContain('rm -rf /srv/production');
+    expect(approval!.detail).not.toBe('https://example.com');
+    expect(approval!.detailKind).toBeUndefined();
+    // A structured detail with nothing in it falls back to the input too, untyped.
+    const empty = requestApprovals('a1', { ...bash, detail: { type: 'shell' } } as AgentPermissionRequest, 0).approvals[0]!;
+    expect(empty.detail).toContain('rm -rf /srv/production');
+    expect(empty.detailKind).toBeUndefined();
+    // With no input, the description is all there is.
+    const said = requestApprovals('a1', { ...bash, input: undefined } as AgentPermissionRequest, 0).approvals[0]!;
+    expect(said.detail).toBe('https://example.com');
+    expect(said.detailKind).toBeUndefined();
   });
 
   it('splits multi-question requests and builds answers the way Paseo does', () => {
@@ -312,11 +394,11 @@ describe('paseo normalization', () => {
       provider: 'hermes',
       sessionId: 'acp-5f0c2a8e',
       nativeHandle: 'acp-5f0c2a8e',
-      metadata: { command: ['hermes', 'acp'], env: { API_KEY: 'sk-secret' } },
+      metadata: { command: ['hermes', 'acp'], env: { API_KEY: 'obviously-fake-api-key' } },
     };
     const hermes = agentSummary(claudeAgent({ provider: 'hermes', persistence }) as never, 'Hermes', 0);
     expect(hermes).toMatchObject({ hermesInPaseo: true, aliases: [{ source: 'hermes', id: 'acp-5f0c2a8e' }] });
-    expect(JSON.stringify(hermes)).not.toMatch(/sk-secret|API_KEY|command/);
+    expect(JSON.stringify(hermes)).not.toMatch(/obviously-fake-api-key|API_KEY|command/);
     // Other providers' sessions aren't Hermes chats; a Hermes agent without a session has none yet.
     expect(agentSummary(claudeAgent({ persistence: { ...persistence, provider: 'claude' } }) as never, 'Claude Code', 0)).not.toHaveProperty('aliases');
     expect(agentSummary(claudeAgent({ provider: 'hermes', persistence: null }) as never, 'Hermes', 0)).not.toHaveProperty('aliases');
@@ -373,10 +455,87 @@ const live = (seq: number, item: object, epoch = 'e1') => ({
   epoch,
 });
 
+/** A timeline subscription like `DaemonClient.subscribeAgentTimeline` returns. */
+const noSubscription = () => {
+  const stop = (() => {}) as (() => void) & { ready: Promise<void> };
+  stop.ready = Promise.resolve();
+  return stop;
+};
+
 describe('paseo timeline mirror', () => {
+  it.each(['assistant_message', 'reasoning'] as const)('reconciles cumulative catch-up %s without repeating chunks', async (type) => {
+    const fetchAgentTimeline = vi.fn()
+      .mockResolvedValueOnce(page('e1', [{ seq: 1, item: { type, text: 'Hello ' } }]))
+      .mockResolvedValue(page('e1', [], {
+        entries: [{ seqStart: 1, seqEnd: 2, turnId: 't1', timestamp: '2026-09-27T00:00:01Z', item: { type, text: 'Hello world' } }],
+        endCursor: { epoch: 'e1', seq: 2 },
+      }));
+    const { sink, log } = recordingSink();
+    const mirror = new AgentTimelineMirror({ subscribeAgentTimeline: noSubscription, fetchAgentTimeline } as never, 'a1', sink, new BackgroundGate('primary'));
+    await mirror.loadTail();
+    const keys = mirror.rows.map((r) => r.key);
+    await mirror.catchUp();
+    await mirror.catchUp();
+    expect(mirror.rows.map((r) => r.item)).toEqual([{ type, text: 'Hello world' }]);
+    expect(mirror.rows.map((r) => r.key)).toEqual(keys);
+    expect(log).toContain(`upsert:${type}`);
+    expect(log.filter((l) => l.startsWith('append:'))).toEqual([]);
+    expect(fetchAgentTimeline.mock.calls.at(-1)?.[1]).toMatchObject({ cursor: { epoch: 'e1', seq: 2 } });
+    mirror.close();
+  });
+
+  it('applies buffered live chunks only after the cumulative catch-up cursor', async () => {
+    let resolvePage!: (value: ReturnType<typeof page>) => void;
+    const fetchAgentTimeline = vi.fn()
+      .mockResolvedValueOnce(page('e1', [{ seq: 1, item: { type: 'assistant_message', text: 'Hello ' } }]))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolvePage = resolve; }));
+    const { sink, log } = recordingSink();
+    const mirror = new AgentTimelineMirror({ subscribeAgentTimeline: noSubscription, fetchAgentTimeline } as never, 'a1', sink, new BackgroundGate('primary'));
+    await mirror.loadTail();
+    const catchUp = mirror.catchUp();
+    mirror.handleLive(live(2, { type: 'assistant_message', text: 'world' }) as never);
+    mirror.handleLive(live(3, { type: 'assistant_message', text: '!' }) as never);
+    resolvePage(page('e1', [], {
+      entries: [{ seqStart: 1, seqEnd: 2, turnId: 't1', timestamp: '2026-09-27T00:00:01Z', item: { type: 'assistant_message', text: 'Hello world' } }],
+      endCursor: { epoch: 'e1', seq: 2 },
+    }));
+    await catchUp;
+    expect(mirror.rows.map((r) => r.item)).toEqual([{ type: 'assistant_message', text: 'Hello world!' }]);
+    expect(log.filter((l) => l.startsWith('append:'))).toEqual(['append:!']);
+    mirror.close();
+  });
+
+  it('reconciles overlapping tool completion and advances from the returned cursor', async () => {
+    const tool = { type: 'tool_call', callId: 'fake-tool', name: 'Read', status: 'running', detail: { type: 'unknown' } };
+    const fetchAgentTimeline = vi.fn()
+      .mockResolvedValueOnce(page('e1', [{ seq: 1, item: tool }, { seq: 2, item: { type: 'assistant_message', text: 'Done' } }]))
+      .mockResolvedValueOnce(page('e1', [], {
+        entries: [
+          { seqStart: 1, seqEnd: 6, turnId: 't1', timestamp: '2026-09-27T00:00:01Z', item: { ...tool, status: 'completed' } },
+          { seqStart: 3, seqEnd: 3, turnId: 't1', timestamp: '2026-09-27T00:00:01Z', item: { type: 'user_message', text: 'Next' } },
+        ],
+        endCursor: { epoch: 'e1', seq: 7 },
+      }))
+      .mockResolvedValue(page('e1', []));
+    const { sink, log } = recordingSink();
+    const mirror = new AgentTimelineMirror({ subscribeAgentTimeline: noSubscription, fetchAgentTimeline } as never, 'a1', sink, new BackgroundGate('primary'));
+    await mirror.loadTail();
+    await mirror.catchUp();
+    expect(mirror.rows[0]?.item).toMatchObject({ status: 'completed' });
+    expect(mirror.rows.map((r) => r.seqStart)).toEqual([1, 2, 3]);
+    expect(log).toContain('upsert:tool_call');
+    await mirror.catchUp();
+    expect(fetchAgentTimeline.mock.calls.at(-1)?.[1]).toMatchObject({ cursor: { epoch: 'e1', seq: 7 } });
+    mirror.handleLive(live(7, { type: 'assistant_message', text: 'Replay' }) as never);
+    mirror.handleLive(live(8, { type: 'assistant_message', text: 'Live' }) as never);
+    expect(mirror.rows.at(-1)?.item).toEqual({ type: 'assistant_message', text: 'Live' });
+    mirror.close();
+  });
+
   it('merges streamed chunks, ignores replays, and catches up on gaps', async () => {
     const calls: Array<Record<string, unknown>> = [];
     const client = {
+      subscribeAgentTimeline: noSubscription,
       fetchAgentTimeline: async (_id: string, options: Record<string, unknown>) => {
         calls.push(options);
         if (options.direction === 'tail') {
@@ -385,11 +544,14 @@ describe('paseo timeline mirror', () => {
             { seq: 2, item: { type: 'assistant_message', text: 'Hel' } },
           ]);
         }
-        return page('e1', [{ seq: 4, item: { type: 'assistant_message', text: '!' } }]);
+        return page('e1', [], {
+          entries: [{ seqStart: 2, seqEnd: 4, turnId: 't1', timestamp: '2026-09-27T00:00:01Z', item: { type: 'assistant_message', text: 'Hello!' } }],
+          endCursor: { epoch: 'e1', seq: 4 },
+        });
       },
     };
     const { log, sink } = recordingSink();
-    const mirror = new AgentTimelineMirror(client as never, 'a1', sink);
+    const mirror = new AgentTimelineMirror(client as never, 'a1', sink, new BackgroundGate('primary'));
     await mirror.loadTail();
     expect(log).toEqual(['reset:2']);
 
@@ -399,20 +561,21 @@ describe('paseo timeline mirror', () => {
     expect(log.at(-1)).toBe('append:lo');
 
     mirror.handleLive(live(5, { type: 'assistant_message', text: '?' }) as never); // gap after 3
-    await expect.poll(() => calls.some((c) => c.direction === 'after' && c.projection === 'canonical')).toBe(true);
+    await expect.poll(() => calls.some((c) => c.direction === 'after' && c.projection === 'projected')).toBe(true);
     await expect.poll(() => mirror.rows.at(-1)!.item).toMatchObject({ text: 'Hello!' });
   });
 
   it('reloads everything when the agent restarts with a new epoch', async () => {
     let tailCalls = 0;
     const client = {
+      subscribeAgentTimeline: noSubscription,
       fetchAgentTimeline: async () => {
         tailCalls += 1;
         return page(tailCalls === 1 ? 'e1' : 'e2', [{ seq: 1, item: { type: 'user_message', text: 'hi' } }]);
       },
     };
     const { log, sink } = recordingSink();
-    const mirror = new AgentTimelineMirror(client as never, 'a1', sink);
+    const mirror = new AgentTimelineMirror(client as never, 'a1', sink, new BackgroundGate('primary'));
     await mirror.loadTail();
     mirror.handleLive(live(1, { type: 'assistant_message', text: 'new' }, 'e2') as never);
     await expect.poll(() => log.filter((l) => l.startsWith('reset')).length).toBe(2);
@@ -431,6 +594,13 @@ interface SendOptions {
 /** `extra`: more agents to list, as overrides of a running, loaded agent. */
 function fakeDaemon(extra: Array<{ id: string } & Record<string, unknown>> = []) {
   const handlers = new Map<string, Array<(m: { payload: unknown }) => void>>();
+  const timelineHandlers = new Map<string, {
+    update: (m: { type: string; payload: unknown }) => void;
+    error?: (error: unknown) => void;
+  }>();
+  const timelineSubscriptions: string[] = [];
+  const timelineReleases: string[] = [];
+  const observed: Array<{ events: string[]; update: (m: { type: string; payload: unknown }) => void }> = [];
   let statusListener: ((s: { status: string; reason?: string }) => void) | undefined;
   const responses: Array<{ agentId: string; requestId: string; response: unknown }> = [];
   const agent = (id: string, pendingPermissions: unknown[] = [], overrides: object = {}) => ({
@@ -452,7 +622,7 @@ function fakeDaemon(extra: Array<{ id: string } & Record<string, unknown>> = [])
     },
     on: (type: string, h: (m: { payload: unknown }) => void) => {
       handlers.set(type, [...(handlers.get(type) ?? []), h]);
-      return () => {};
+      return () => { handlers.set(type, (handlers.get(type) ?? []).filter((handler) => handler !== h)); };
     },
     connect: async () => statusListener?.({ status: 'connected' }),
     close: async () => {},
@@ -464,11 +634,17 @@ function fakeDaemon(extra: Array<{ id: string } & Record<string, unknown>> = [])
       ],
       pageInfo: { hasMore: false, nextCursor: null },
     }),
+    observeAgents: () => ({
+      ready: client.fetchAgents().then((page) => ({ ...page, subscriptionId: 'fake-agents' })),
+      subscribe: () => () => {},
+      release: async () => {},
+    }),
     fetchAgentTimeline: async (agentId: string) => {
       loads.push(['timeline', agentId]);
       return state.timeline ?? page('e1', [], { agent: state.liveAgent });
     },
-    fetchAgent: async ({ agentId }: { agentId: string }) => {
+    fetchAgent: async (arg: string | { agentId: string }) => {
+      const agentId = typeof arg === 'string' ? arg : arg.agentId;
       loads.push(['fetchAgent', agentId]);
       const overrides = extra.find((e) => e.id === agentId);
       return overrides ? { agent: agent(agentId, [], { ...overrides, ...changed[agentId] }), project: null } : null;
@@ -532,9 +708,29 @@ function fakeDaemon(extra: Array<{ id: string } & Record<string, unknown>> = [])
             },
           }
         : null,
+    // Since 0.9.2 the daemon streams an agent's timeline only to subscribers.
+    subscribeAgentTimeline: (agentId: string, handler: Parameters<DaemonClient['subscribeAgentTimeline']>[1]) =>
+      timelineClient.subscribeAgentTimeline(agentId, handler),
     listProviderSubagents: async (parentAgentId: string) => {
       subagentLists.push(parentAgentId);
       return { requestId: 's', parentAgentId, subagents: state.subagents[parentAgentId] ?? [], error: null };
+    },
+    // The 0.9.2 client waits on provider snapshots through an event subscription.
+    observeEvents: (events: string[]) => {
+      const entry = { events, update: (_m: { type: string; payload: unknown }) => {} };
+      observed.push(entry);
+      return {
+        subscriptionId: `obs-${observed.length}`,
+        ready: Promise.resolve({ subscriptionId: `obs-${observed.length}` }),
+        subscribe: (o: { update: (m: { type: string; payload: unknown }) => void }) => {
+          entry.update = o.update;
+          return () => { entry.update = () => {}; };
+        },
+        release: async () => {
+          const i = observed.indexOf(entry);
+          if (i >= 0) observed.splice(i, 1);
+        },
+      };
     },
     fetchWorkspaces: async () => ({ entries: [{ id: 'ws1', workspaceDirectory: '/home/me/code/app', projectRootPath: '/home/me/code/app', projectDisplayName: 'app' }] }),
     listProjects: async () => ({ projects: [] }),
@@ -542,6 +738,10 @@ function fakeDaemon(extra: Array<{ id: string } & Record<string, unknown>> = [])
       created.push(options);
       return agent('new-agent');
     },
+    cancelAgent: async (id: string) => { actions.push(['interrupt', id]); },
+    archiveAgent: async (id: string) => { actions.push(['archive', id]); },
+    refreshAgent: async (id: string) => { actions.push(['restore', id]); },
+    deleteAgent: async (id: string) => { actions.push(['delete', id]); },
     // Like Paseo's file explorer: realpath the cwd (ENOENT when missing, ENOTDIR below a file), then stat the entry.
     listDirectory: async (cwd: string, path: string) => {
       const full = path === '.' ? cwd : `${cwd === '/' ? '' : cwd}/${path}`;
@@ -569,6 +769,7 @@ function fakeDaemon(extra: Array<{ id: string } & Record<string, unknown>> = [])
     failSend: false,
     failUpload: false,
     timeline: null as ReturnType<typeof page> | null,
+    timelineFailure: null as string | null,
     liveAgent: null as object | null,
     commands: [
       { name: '/review', description: 'Review the changes', argumentHint: '[focus]', kind: 'command' },
@@ -590,6 +791,7 @@ function fakeDaemon(extra: Array<{ id: string } & Record<string, unknown>> = [])
     files: new Set(['/home/me/notes.txt']),
   };
   const folderCreates: Array<{ parentPath: string; name: string }> = [];
+  const actions: Array<[string, string]> = [];
   /** Agents whose sub-agents were listed (a call that would resume a stored agent). */
   const subagentLists: string[] = [];
   const reads: Array<{ cwd: string; path: string; maxBytes: number | undefined }> = [];
@@ -609,7 +811,40 @@ function fakeDaemon(extra: Array<{ id: string } & Record<string, unknown>> = [])
   const snapshotCwds: Array<string | null> = [];
   /** What the setters changed, as fetchAgent reports it. */
   const changed: Record<string, object> = {};
-  const emit = (type: string, payload: unknown) => handlers.get(type)?.forEach((h) => h({ payload }));
+  // Exercise the SDK's actual readiness/error lifecycle without opening a socket.
+  const timelineClient = new DaemonClient({ url: 'ws://127.0.0.1:8892', clientId: 'fake-timeline', logger: quietLog as never });
+  vi.spyOn(timelineClient, 'observeTimeline').mockImplementation(([agentId]) => {
+    timelineSubscriptions.push(agentId!);
+    const ready = state.timelineFailure
+      ? Promise.reject(new Error(state.timelineFailure))
+      : Promise.resolve({ subscriptionId: 'fake-timeline-subscription' });
+    let released = false;
+    return {
+      subscriptionId: 'fake-timeline-subscription',
+      ready,
+      subscribe: (observer: { update: (m: { type: string; payload: unknown }) => void; error?: (error: unknown) => void }) => {
+        timelineHandlers.set(agentId!, observer);
+        return () => { timelineHandlers.delete(agentId!); };
+      },
+      release: async () => {
+        if (released) return;
+        released = true;
+        timelineReleases.push(agentId!);
+        timelineHandlers.delete(agentId!);
+      },
+    } as never;
+  });
+  const emit = (type: string, payload: unknown) => {
+    const gated = ['agent_permission_request', 'agent_permission_resolved', 'agent.provider_subagents.update'];
+    if (gated.includes(type) && !observed.some((o) => o.events.includes(type))) return;
+    handlers.get(type)?.forEach((h) => h({ payload }));
+    if (['agent_stream', 'agent.timeline.replacement', 'agent.timeline.subscription_restored'].includes(type)) {
+      timelineHandlers.get((payload as { agentId: string }).agentId)?.update({ type, payload });
+    }
+    observed.forEach((o) => {
+      if (o.events.includes(type)) o.update({ type, payload });
+    });
+  };
   /** The socket drops and comes back: Signalbox lists everything again. */
   const reconnect = () => {
     statusListener?.({ status: 'disconnected' });
@@ -617,18 +852,19 @@ function fakeDaemon(extra: Array<{ id: string } & Record<string, unknown>> = [])
   };
   /** The socket drops, optionally with the daemon's close reason ("Incorrect password"). */
   const drop = (reason?: string) => statusListener?.({ status: 'disconnected', ...(reason ? { reason } : {}) });
+  const failTimeline = (agentId: string, error: string) => timelineHandlers.get(agentId)?.error?.(new Error(error));
   return {
     client, responses, emit, reconnect, drop, created, sent, uploads, commandCalls, loads, configCalls, snapshotCwds, reads, state, agent,
-    providerEntries, subagentLists, folderCreates,
+    providerEntries, subagentLists, folderCreates, observed, timelineSubscriptions, timelineReleases, failTimeline, actions,
   };
 }
 
-async function setup(extra: Parameters<typeof fakeDaemon>[0] = []) {
+async function setup(extra: Parameters<typeof fakeDaemon>[0] = [], background = new BackgroundGate('primary')) {
   const daemon = fakeDaemon(extra);
   const hub = new EventHub();
   const events: ServerEvent[] = [];
   const browser = hub.add({ readyState: 1, bufferedAmount: 0, send: (p: string) => events.push(JSON.parse(p)), terminate() {} } as never, 'x');
-  const adapter = new PaseoAdapter('ws://127.0.0.1:6777', hub, quietLog, 'cid_signalbox_test', () => daemon.client as never);
+  const adapter = new PaseoAdapter('ws://127.0.0.1:8895', hub, quietLog, 'cid_signalbox_test', () => daemon.client as never, background);
   adapter.start();
   await expect.poll(() => adapter.status().state).toBe('connected');
   // Let what the start asked the fake (e.g. each agent's sub-agents) come back.
@@ -644,6 +880,396 @@ async function setup(extra: Parameters<typeof fakeDaemon>[0] = []) {
   };
   return { adapter, daemon, events, itemsOf, open: (id: string) => hub.subscribe(browser, 'paseo', id) };
 }
+
+describe('shadow automatic reads', () => {
+  it.each(['response', 'error'] as const)('keeps newer reopened history when an older open returns an obsolete %s', async outcome => {
+    const agentId = 'fake-overlapping-open';
+    const { adapter, daemon } = await setup([{ id: agentId }], new BackgroundGate('shadow'));
+    try {
+      daemon.state.timeline = page('fake-epoch', [{ seq: 1, item: { type: 'assistant_message', text: 'A' } }]);
+      await adapter.getConversation(agentId, true);
+      const fetch = vi.spyOn(daemon.client, 'fetchAgentTimeline');
+      daemon.reconnect();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(await adapter.getConversation(agentId)).toMatchObject({ needsOpen: true });
+      expect(fetch).not.toHaveBeenCalled();
+      let resolveOlder!: (value: ReturnType<typeof page>) => void;
+      let rejectOlder!: (error: Error) => void;
+      const older = new Promise<ReturnType<typeof page>>((resolve, reject) => { resolveOlder = resolve; rejectOlder = reject; });
+      fetch.mockReturnValueOnce(older).mockResolvedValueOnce(page('fake-epoch', [
+        { seq: 1, item: { type: 'assistant_message', text: 'A' } },
+        { seq: 2, item: { type: 'assistant_message', text: 'B' } },
+      ]));
+      const first = adapter.getConversation(agentId, true);
+      const firstResult = expect(first).resolves.toMatchObject({ needsOpen: false, items: [{ text: 'AB' }] });
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+      expect(await adapter.getConversation(agentId, true)).toMatchObject({ needsOpen: false, items: [{ text: 'AB' }] });
+      if (outcome === 'response') resolveOlder(page('fake-epoch', [{ seq: 1, item: { type: 'assistant_message', text: 'A' } }]));
+      else rejectOlder(new Error('fake-obsolete-open-error'));
+      await firstResult;
+      const commandCalls = daemon.commandCalls.length;
+      adapter.setWatching(agentId, true);
+      expect(await adapter.getConversation(agentId)).toMatchObject({ needsOpen: false, items: [{ text: 'AB' }] });
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(daemon.commandCalls).toHaveLength(commandCalls);
+    } finally { adapter.stop(); }
+  });
+
+  it('uses only cached history on automatic reads and resubscriptions, even after reconnect', async () => {
+    const { adapter, daemon } = await setup([], new BackgroundGate('shadow'));
+    try {
+      const fetch = vi.spyOn(daemon.client, 'fetchAgentTimeline');
+      adapter.setWatching('a1', true);
+      expect(await adapter.getConversation('a1')).toMatchObject({ needsOpen: true, items: [] });
+      await adapter.listCommands('a1');
+      expect(fetch).not.toHaveBeenCalled();
+      expect(daemon.timelineSubscriptions).toEqual([]);
+      expect(daemon.commandCalls).toEqual([]);
+      await adapter.getConversation('a1', true);
+      expect(fetch).toHaveBeenCalledOnce();
+      fetch.mockClear();
+      daemon.reconnect();
+      await new Promise((resolve) => setImmediate(resolve));
+      adapter.setWatching('a1', true);
+      expect(await adapter.getConversation('a1')).toMatchObject({ needsOpen: true });
+      expect(fetch).not.toHaveBeenCalled();
+      await adapter.getConversation('a1', true);
+      expect(fetch).toHaveBeenCalledOnce();
+    } finally { adapter.stop(); }
+  });
+
+  it('never discovers subagents by RPC at bootstrap, reconnect, or agent update', async () => {
+    const { adapter, daemon } = await setup([claudeAgent()], new BackgroundGate('shadow'));
+    try {
+      expect(daemon.subagentLists).toEqual([]);
+      daemon.reconnect();
+      await new Promise((resolve) => setImmediate(resolve));
+      daemon.emit('agent_update', { kind: 'upsert', agent: daemon.agent('fake-new-parent', [], claudeAgent({ id: 'fake-new-parent' })) });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(daemon.subagentLists).toEqual([]);
+    } finally { adapter.stop(); }
+  });
+});
+
+describe.each(['primary', 'shadow'] as const)('%s optional command discovery on deliberate opens', role => {
+  it.each(['timeout', 'daemon error'] as const)('returns loaded history and approvals after a command %s', async failure => {
+    const { adapter, daemon } = await setup([], new BackgroundGate(role));
+    try {
+      daemon.state.timeline = page('e1', [{ seq: 1, item: { type: 'user_message', text: 'Demo history.' } }]);
+      daemon.state.commandsThrow = failure === 'timeout';
+      daemon.state.commandsError = failure === 'daemon error' ? 'Demo command discovery failed.' : null;
+      const detail = await adapter.getConversation('a1', true);
+      expect(detail.items).toEqual([{ kind: 'user', id: 's-e1-1', text: 'Demo history.' }]);
+      expect(detail.approvals).toHaveLength(1);
+      expect(detail.conversation.id).toBe('a1');
+      expect(daemon.loads).toEqual([['timeline', 'a1']]);
+      expect(daemon.commandCalls).toEqual(['a1']);
+      if (role === 'shadow') {
+        await adapter.getConversation('a1'); await adapter.listCommands('a1');
+        expect(daemon.commandCalls).toEqual(['a1']);
+        expect(daemon.loads).toEqual([['timeline', 'a1']]);
+      }
+      // A failed optional lookup is not cached: a later deliberate open can discover commands.
+      daemon.state.commandsThrow = false; daemon.state.commandsError = null;
+      await adapter.getConversation('a1', true);
+      expect(await adapter.listCommands('a1')).toMatchObject([{ name: 'review' }, { name: 'tdd' }]);
+      expect(daemon.commandCalls).toEqual(['a1', 'a1']);
+    } finally { adapter.stop(); }
+  });
+});
+
+describe('shared Paseo timeline authorization', () => {
+  const agentId = 'fake-shared-agent';
+  const history = (seq: number, text: string) => {
+    const snapshot = page('fake-epoch', [{ seq, item: { type: 'assistant_message', text } }]);
+    return { ...snapshot, startCursor: { epoch: 'fake-epoch', seq: 1 }, entries: snapshot.entries.map(entry => ({ ...entry, seqStart: 1 })) };
+  };
+
+  it.each(['sequence gap', 'reconnect', 'replacement'] as const)('keeps primary updates after the opening device is revoked: %s', async trigger => {
+    const { adapter, daemon, events, open } = await setup([{ id: agentId }]);
+    const owner = new AbortController(); const other = new AbortController();
+    const scopes: Array<AbortSignal | undefined> = [];
+    const fetch = daemon.client.fetchAgentTimeline;
+    vi.spyOn(daemon.client, 'fetchAgentTimeline').mockImplementation(id => { scopes.push(deviceSignal()); return fetch(id); });
+    try {
+      open(agentId);
+      daemon.state.timeline = history(1, 'A');
+      await withDeviceSignal(owner.signal, () => adapter.getConversation(agentId));
+      owner.abort();
+      daemon.state.timeline = history(3, 'ABC');
+      if (trigger === 'sequence gap') daemon.emit('agent_stream', { ...live(3, { type: 'assistant_message', text: 'C' }, 'fake-epoch'), agentId });
+      else if (trigger === 'reconnect') daemon.reconnect();
+      else daemon.emit('agent.timeline.replacement', { agentId, epoch: 'fake-epoch' });
+      await expect.poll(() => events.some(event => (event.type === 'items_replace' || event.type === 'items_upsert')
+        && event.conversationId === agentId && event.items.some(item => item.kind === 'assistant' && item.text === 'ABC'))).toBe(true);
+      expect((await withDeviceSignal(other.signal, () => adapter.getConversation(agentId))).items).toMatchObject([{ text: 'ABC' }]);
+      daemon.emit('agent_stream', { ...live(4, { type: 'assistant_message', text: 'D' }, 'fake-epoch'), agentId });
+      expect((await withDeviceSignal(other.signal, () => adapter.getConversation(agentId))).items).toMatchObject([{ text: 'ABCD' }]);
+      expect(scopes).toEqual([owner.signal, undefined]);
+      expect(daemon.timelineSubscriptions).toEqual([agentId]);
+      expect(daemon.timelineReleases).toEqual([]);
+    } finally { adapter.stop(); }
+  });
+
+  it('reopens a shadow mirror with the current device after its owner is revoked and the daemon reconnects', async () => {
+    const { adapter, daemon } = await setup([{ id: agentId }], new BackgroundGate('shadow'));
+    const owner = new AbortController(); const other = new AbortController();
+    const scopes: Array<AbortSignal | undefined> = [];
+    const fetch = daemon.client.fetchAgentTimeline;
+    vi.spyOn(daemon.client, 'fetchAgentTimeline').mockImplementation(id => { scopes.push(deviceSignal()); return fetch(id); });
+    const subscribe = vi.spyOn(daemon.client, 'subscribeAgentTimeline');
+    try {
+      daemon.state.timeline = history(1, 'A');
+      await withDeviceSignal(owner.signal, () => adapter.getConversation(agentId, true));
+      owner.abort(); daemon.reconnect();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(await withDeviceSignal(other.signal, () => adapter.getConversation(agentId))).toMatchObject({ needsOpen: true });
+      expect(scopes).toEqual([owner.signal]);
+      daemon.state.timeline = history(3, 'ABC');
+      expect(await withDeviceSignal(other.signal, () => adapter.getConversation(agentId, true))).toMatchObject({ needsOpen: false, items: [{ text: 'ABC' }] });
+      expect(scopes).toEqual([owner.signal, other.signal]);
+      expect(subscribe).toHaveBeenCalledOnce();
+      expect(daemon.timelineReleases).toEqual([]);
+    } finally { adapter.stop(); }
+  });
+
+  it('checks the current device after subscription readiness without retiring the shared subscription', async () => {
+    const { adapter, daemon } = await setup([{ id: agentId }], new BackgroundGate('shadow'));
+    const device = new AbortController(); const other = new AbortController();
+    let ready!: () => void;
+    const waiting = new Promise<void>(resolve => { ready = resolve; });
+    const subscribe = daemon.client.subscribeAgentTimeline;
+    const scopes: Array<AbortSignal | undefined> = [];
+    vi.spyOn(daemon.client, 'subscribeAgentTimeline').mockImplementation((id, handler) => {
+      scopes.push(deviceSignal());
+      return Object.assign(subscribe(id, handler), { ready: waiting });
+    });
+    const fetch = vi.spyOn(daemon.client, 'fetchAgentTimeline');
+    try {
+      const pending = withDeviceSignal(device.signal, () => adapter.getConversation(agentId, true));
+      const rejected = expect(pending).rejects.toMatchObject({ status: 403 });
+      device.abort(); ready(); await rejected;
+      expect(fetch).not.toHaveBeenCalled();
+      expect(scopes).toEqual([undefined]);
+      expect(daemon.timelineReleases).toEqual([]);
+      daemon.state.timeline = history(1, 'A');
+      expect(await withDeviceSignal(other.signal, () => adapter.getConversation(agentId, true))).toMatchObject({ items: [{ text: 'A' }] });
+      expect(daemon.timelineSubscriptions).toEqual([agentId]);
+    } finally { ready(); adapter.stop(); }
+  });
+
+  it.each(['older', 'newer'] as const)('isolates a revoked %s reader from another device opening the same mirror', async revokedReader => {
+    const { adapter, daemon } = await setup([{ id: agentId }], new BackgroundGate('shadow'));
+    const owner = new AbortController(); const revoked = new AbortController(); const other = new AbortController();
+    const pages: Array<(value: ReturnType<typeof page>) => void> = [];
+    try {
+      daemon.state.timeline = history(1, 'A');
+      await withDeviceSignal(owner.signal, () => adapter.getConversation(agentId, true));
+      owner.abort(); daemon.reconnect();
+      await new Promise(resolve => setImmediate(resolve));
+      vi.spyOn(daemon.client, 'fetchAgentTimeline').mockImplementation(() => new Promise(resolve => { pages.push(resolve); }));
+      const first = revokedReader === 'older' ? revoked : other;
+      const second = revokedReader === 'older' ? other : revoked;
+      const reads = [withDeviceSignal(first.signal, () => adapter.getConversation(agentId, true)),
+        withDeviceSignal(second.signal, () => adapter.getConversation(agentId, true))]
+        .map(read => read.then(detail => ({ detail }), error => ({ error })));
+      const revokedIndex = revokedReader === 'older' ? 0 : 1;
+      await expect.poll(() => pages.length).toBe(2);
+      revoked.abort();
+      expect(await reads[revokedIndex]).toMatchObject({ error: { status: 403 } });
+      expect(daemon.timelineReleases).toEqual([]);
+      pages[1 - revokedIndex]!(history(3, 'ABC'));
+      expect(await reads[1 - revokedIndex]).toMatchObject({ detail: { items: [{ text: revokedReader === 'older' ? 'ABC' : 'A' }] } });
+      pages[revokedIndex]!(history(4, 'Obsolete response'));
+      await new Promise(resolve => setImmediate(resolve));
+      expect(daemon.timelineSubscriptions).toEqual([agentId]);
+      expect(daemon.timelineReleases).toEqual([]);
+      expect((await withDeviceSignal(other.signal, () => adapter.getConversation(agentId))).items).toMatchObject([{ text: revokedReader === 'older' ? 'ABC' : 'A' }]);
+      // The revoked newer read invalidated the older page: the live device can retry.
+      if (revokedReader === 'newer') {
+        const retry = withDeviceSignal(other.signal, () => adapter.getConversation(agentId, true));
+        await expect.poll(() => pages.length).toBe(3);
+        pages[2]!(history(3, 'ABC'));
+        expect(await retry).toMatchObject({ needsOpen: false, items: [{ text: 'ABC' }] });
+      }
+    } finally { for (const resolve of pages) resolve(history(3, 'ABC')); adapter.stop(); }
+  });
+
+  it('runs catch-up from buffered events outside the explicit loader device context', async () => {
+    const { adapter, daemon } = await setup([{ id: agentId }]);
+    const device = new AbortController();
+    const scopes: Array<AbortSignal | undefined> = [];
+    vi.spyOn(daemon.client, 'fetchAgentTimeline').mockImplementationOnce(async () => {
+      scopes.push(deviceSignal());
+      daemon.emit('agent_stream', { ...live(3, { type: 'assistant_message', text: 'C' }, 'fake-epoch'), agentId });
+      return history(1, 'A');
+    }).mockImplementationOnce(async () => { scopes.push(deviceSignal()); return history(3, 'ABC'); });
+    try {
+      await withDeviceSignal(device.signal, () => adapter.getConversation(agentId));
+      expect(scopes).toEqual([device.signal, undefined]);
+      device.abort();
+      expect((await adapter.getConversation(agentId)).items).toMatchObject([{ text: 'ABC' }]);
+      expect(daemon.timelineReleases).toEqual([]);
+    } finally { adapter.stop(); }
+  });
+});
+
+describe('paseo subscription lifecycle', () => {
+  it('finishes an unwatched thirteenth open before evicting its mirror', async () => {
+    const ids = Array.from({ length: 13 }, (_, i) => `fake-cache-${i}`);
+    const { adapter, daemon } = await setup(ids.map((id) => ({ id })));
+    for (const id of ids.slice(0, 12)) {
+      adapter.setWatching(id, true);
+      await adapter.getConversation(id);
+    }
+    daemon.state.timeline = page('e1', [{ seq: 1, item: { type: 'assistant_message', text: 'Completion' } }]);
+    const result = await adapter.getConversation(ids[12]!);
+    expect(result.items).toEqual([expect.objectContaining({ text: 'Completion' })]);
+    expect(daemon.timelineReleases).toEqual([ids[12]]);
+    expect(daemon.timelineSubscriptions).toHaveLength(13);
+    await adapter.getConversation(ids[0]!);
+    expect(daemon.timelineSubscriptions).toHaveLength(13);
+    adapter.stop();
+  });
+
+  it('protects a shared mirror until every concurrent open has built its response', async () => {
+    const ids = Array.from({ length: 13 }, (_, i) => `fake-concurrent-${i}`);
+    const { adapter, daemon } = await setup(ids.map((id) => ({ id })));
+    for (const id of ids.slice(0, 12)) {
+      adapter.setWatching(id, true);
+      await adapter.getConversation(id);
+    }
+    const pages: Array<(value: ReturnType<typeof page>) => void> = [];
+    vi.spyOn(daemon.client, 'fetchAgentTimeline').mockImplementation(() => new Promise((resolve) => pages.push(resolve)));
+    const first = adapter.getConversation(ids[12]!);
+    const second = adapter.getConversation(ids[12]!);
+    void first.catch(() => {});
+    void second.catch(() => {});
+    await expect.poll(() => pages.length).toBe(2);
+    pages[0]!(page('e1', [{ seq: 1, item: { type: 'assistant_message', text: 'First' } }]));
+    // The older response is obsolete, but its reader must leave the shared mirror alive.
+    expect(await first).toMatchObject({ items: [] });
+    expect(daemon.timelineReleases).toEqual([]);
+    pages[1]!(page('e1', [{ seq: 1, item: { type: 'assistant_message', text: 'Second' } }]));
+    expect(await second).toMatchObject({ items: [expect.objectContaining({ text: 'Second' })] });
+    expect(daemon.timelineReleases).toEqual([ids[12]]);
+    adapter.stop();
+  });
+
+  it('owns permission and subagent subscriptions through reconnect and releases them on stop', async () => {
+    const { adapter, daemon, events } = await setup([claudeAgent()]);
+    const subscribed = () => daemon.observed.flatMap((o) => o.events);
+    expect(subscribed()).toEqual(expect.arrayContaining([
+      'agent_permission_request', 'agent_permission_resolved', 'agent.provider_subagents.update',
+    ]));
+    // Another Paseo client answers this request; no local response or agent update follows.
+    daemon.emit('agent_permission_resolved', { agentId: 'a1', requestId: shellRequest.id });
+    expect(adapter.listApprovals().some((a) => a.id === shellRequest.id)).toBe(false);
+    expect(daemon.responses).toEqual([]);
+    const request = { ...shellRequest, id: 'fake-new-permission' };
+    daemon.emit('agent_permission_request', { agentId: 'a1', request });
+    expect(adapter.listApprovals().some((a) => a.id === request.id)).toBe(true);
+    daemon.emit('agent_permission_resolved', { agentId: 'a1', requestId: request.id });
+    expect(adapter.listApprovals().some((a) => a.id === request.id)).toBe(false);
+
+    daemon.reconnect();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(subscribed().filter((e) => e === 'agent_permission_resolved')).toHaveLength(1);
+    const subagent = {
+      id: 'fake-tool', parentAgentId: 'claude1', provider: 'claude', title: 'Explore',
+      status: 'running', createdAt: '2026-09-27T01:00:00Z', updatedAt: '2026-09-27T01:00:00Z',
+    };
+    daemon.emit('agent.provider_subagents.update', { kind: 'upsert', subagent });
+    expect((await adapter.listConversations()).some((c) => c.id === 'claude1:fake-tool')).toBe(true);
+    daemon.emit('agent.provider_subagents.update', { kind: 'remove', parentAgentId: 'claude1', subagentId: 'fake-tool' });
+    expect((await adapter.listConversations()).some((c) => c.id === 'claude1:fake-tool')).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'conversation_removed', id: 'claude1:fake-tool' });
+    adapter.stop();
+    await expect.poll(() => daemon.observed.length).toBe(0);
+    adapter.start();
+    await expect.poll(() => adapter.status().state).toBe('connected');
+    expect(subscribed().filter((e) => e === 'agent_permission_resolved')).toHaveLength(1);
+    daemon.emit('agent_permission_resolved', { agentId: 'a1', requestId: shellRequest.id });
+    expect(adapter.listApprovals().some((a) => a.id === shellRequest.id)).toBe(false);
+    adapter.stop();
+  });
+
+  it('rejects a failed initial timeline subscription and establishes a fresh one on the next open', async () => {
+    const { adapter, daemon } = await setup();
+    daemon.state.timelineFailure = 'fake subscription refused';
+    await expect(adapter.getConversation('a1')).rejects.toThrow('fake subscription refused');
+    expect(daemon.loads).toEqual([]);
+    expect(daemon.timelineReleases).toEqual(['a1']);
+    daemon.state.timelineFailure = null;
+    await adapter.getConversation('a1');
+    expect(daemon.timelineSubscriptions).toEqual(['a1', 'a1']);
+    daemon.emit('agent_stream', live(1, { type: 'assistant_message', text: 'Recovered' }));
+    expect((await adapter.getConversation('a1')).items).toEqual([expect.objectContaining({ text: 'Recovered' })]);
+    adapter.stop();
+  });
+
+  it('invalidates a loaded mirror after timeline restoration fails on reconnect', async () => {
+    const { adapter, daemon } = await setup();
+    await adapter.getConversation('a1');
+    daemon.reconnect();
+    await new Promise((resolve) => setImmediate(resolve));
+    daemon.failTimeline('a1', 'fake restore refused');
+    expect(daemon.timelineReleases).toEqual(['a1']);
+    await adapter.getConversation('a1');
+    expect(daemon.timelineSubscriptions).toEqual(['a1', 'a1']);
+    daemon.emit('agent_stream', live(1, { type: 'assistant_message', text: 'Live again' }));
+    expect((await adapter.getConversation('a1')).items).toEqual([expect.objectContaining({ text: 'Live again' })]);
+    adapter.stop();
+  });
+
+  it('keeps a late page from reviving a failed mirror or dropping its replacement', async () => {
+    const { adapter, daemon } = await setup();
+    let resolvePage!: (value: ReturnType<typeof page>) => void;
+    vi.spyOn(daemon.client, 'fetchAgentTimeline').mockImplementationOnce(() => new Promise((resolve) => { resolvePage = resolve; }));
+    const oldOpen = adapter.getConversation('a1');
+    const rejected = expect(oldOpen).rejects.toThrow('fake lost subscription');
+    await expect.poll(() => daemon.timelineSubscriptions.length).toBe(1);
+    daemon.failTimeline('a1', 'fake lost subscription');
+    await adapter.getConversation('a1');
+    resolvePage(page('e1', [{ seq: 1, item: { type: 'assistant_message', text: 'Stale page' } }]));
+    await rejected;
+    expect(daemon.timelineReleases).toEqual(['a1']);
+    expect((await adapter.getConversation('a1')).items).toEqual([]);
+    expect(daemon.timelineSubscriptions).toEqual(['a1', 'a1']);
+    daemon.emit('agent_stream', live(1, { type: 'assistant_message', text: 'Current subscription' }));
+    expect((await adapter.getConversation('a1')).items).toEqual([expect.objectContaining({ text: 'Current subscription' })]);
+    adapter.stop();
+    expect(daemon.timelineReleases).toEqual(['a1', 'a1']);
+  });
+});
+
+describe.each(['shadow', 'primary'] as const)('%s real Paseo authenticated actions', (role) => {
+  it('forwards sends, create, approval, interrupt, archive, restore, delete and mkdir to the daemon', async () => {
+    const { adapter, daemon } = await setup([], new BackgroundGate(role));
+    const keys = await makeKeys();
+    const token = await makeToken(keys);
+    const config = { ...makeConfig(), role };
+    const app = await buildApp({ config, sources: { hermes: new FakeHermes(), paseo: adapter }, hub: new EventHub(), logger: false,
+      verifier: createAccessVerifier({ ...config.access!, keySource: keys.keySource }) });
+    const post = (url: string, payload: object) => app.inject({ method: 'POST', url, payload, headers: postHeaders(token) });
+    try {
+      expect((await post('/api/conversations/paseo/a1/messages', { text: 'Demo request' })).statusCode).toBe(200);
+      expect((await post('/api/conversations/paseo/a1/approvals/perm-1', { optionId: 'allow_once' })).statusCode).toBe(200);
+      daemon.emit('agent_update', { agent: daemon.agent('a1', [], { status: 'running' }) });
+      expect((await post('/api/conversations/paseo/a1/interrupt', {})).statusCode).toBe(200);
+      expect((await post('/api/paseo/conversations', { providerId: 'claude', cwd: '/home/me/code/app', text: 'Demo chat' })).statusCode).toBe(200);
+      for (const action of ['archive', 'restore', 'delete']) {
+        expect((await post(`/api/threads/${action}`, { threads: [{ source: 'paseo', id: 'a1' }] })).json()).toEqual({ done: 1, failed: [] });
+      }
+      expect((await post('/api/folders', { path: '/home/me/code/demo' })).statusCode).toBe(200);
+      expect(daemon.sent.some((s) => s.agentId === 'a1' && s.text === 'Demo request')).toBe(true);
+      expect(daemon.created).toHaveLength(1);
+      expect(daemon.responses).toContainEqual(expect.objectContaining({ agentId: 'a1', requestId: 'perm-1' }));
+      expect(daemon.actions).toEqual([['interrupt', 'a1'], ['archive', 'a1'], ['restore', 'a1'], ['delete', 'a1']]);
+      expect(daemon.folderCreates).toContainEqual({ parentPath: '/home/me/code', name: 'demo' });
+    } finally { adapter.stop(); await app.close(); }
+  });
+});
 
 describe('paseo adapter folders', () => {
   it('says whether a folder exists, the way the daemon sees it', async () => {
@@ -780,6 +1406,22 @@ describe('paseo adapter approvals', () => {
     daemon.emit('agent_permission_resolved', { agentId: 'a1', requestId: 'perm-1', resolution: { behavior: 'allow' } });
     expect(adapter.listApprovals().some((a) => a.id === 'perm-1')).toBe(false);
     expect(events.some((e) => e.type === 'approval_removed' && e.approvalId === 'perm-1')).toBe(true);
+  });
+
+  it('derives both worker snapshots from live permission requests and resolutions', async () => {
+    const { adapter, daemon } = await setup([{ id: 'demo-worker', status: 'running' }]);
+    const count = (id: string) => [adapter.workerSnapshot(id)!.pendingPermissions,
+      adapter.workerSnapshots().find((snap) => snap.id === id)!.pendingPermissions];
+    expect(count('demo-worker')).toEqual([0, 0]);
+    daemon.emit('agent_permission_request', { agentId: 'demo-worker', request: { ...shellRequest, id: 'perm-demo-live' } });
+    expect(adapter.listApprovals().some((a) => a.conversationId === 'demo-worker')).toBe(true);
+    expect(count('demo-worker')).toEqual([1, 1]);
+    daemon.emit('agent_permission_resolved', { agentId: 'a1', requestId: 'perm-1', resolution: { behavior: 'allow' } });
+    expect(adapter.listApprovals().some((a) => a.conversationId === 'a1')).toBe(false);
+    expect(count('a1')).toEqual([0, 0]);
+    daemon.emit('agent_permission_resolved', { agentId: 'demo-worker', requestId: 'perm-demo-live', resolution: { behavior: 'allow' } });
+    expect(count('demo-worker')).toEqual([0, 0]);
+    await adapter.stop();
   });
 });
 
@@ -1086,7 +1728,7 @@ describe('paseo adapter: images an agent showed', () => {
   it("refuses files that aren't images, and passes on why Paseo refused, without retrying elsewhere", async () => {
     const { adapter, daemon } = await setup();
     daemon.state.readKind = 'text';
-    await refused(adapter.readImage('a1', '/home/me/code/app/notes.png'), 415, "That file isn't an image Signalbox can show.");
+    await refused(adapter.readImage('a1', '/home/me/code/app/notes.png'), 415, "That file isn't an image Wayroost can show.");
     daemon.state.readKind = 'image';
 
     const cases: Array<[string, number, string]> = [
@@ -1315,7 +1957,7 @@ describe('paseo adapter: provider sub-agents', () => {
     const daemon = fakeDaemon(extra);
     daemon.state.subagents = { claude1: [sub('toolu_9')], stored: [sub('toolu_s', { parentAgentId: 'stored' })] };
     const hub = new EventHub();
-    const adapter = new PaseoAdapter('ws://127.0.0.1:6777', hub, quietLog, 'cid_signalbox_test', () => daemon.client as never);
+    const adapter = new PaseoAdapter('ws://127.0.0.1:19007', hub, quietLog, 'cid_signalbox_test', () => daemon.client as never, new BackgroundGate('primary'));
     adapter.start();
     await expect.poll(async () => (await rows(adapter)).map((r) => r.id)).toEqual(['claude1:toolu_9']);
     expect([...daemon.subagentLists].sort()).toEqual(['claude1', 'codex1']);
@@ -1349,7 +1991,7 @@ describe('paseo adapter: provider sub-agents', () => {
   it("doesn't ask a daemon that can't list sub-agents", async () => {
     const daemon = fakeDaemon([claudeAgent()]);
     daemon.state.canListSubagents = false;
-    const adapter = new PaseoAdapter('ws://127.0.0.1:6777', new EventHub(), quietLog, 'cid_signalbox_test', () => daemon.client as never);
+    const adapter = new PaseoAdapter('ws://127.0.0.1:19007', new EventHub(), quietLog, 'cid_signalbox_test', () => daemon.client as never, new BackgroundGate('primary'));
     adapter.start();
     await expect.poll(() => adapter.status().state).toBe('connected');
     await new Promise((resolve) => setImmediate(resolve));
@@ -1404,8 +2046,8 @@ describe('Claude Code runs started from a shell (claude -p)', () => {
   it('shows a run under whatever started it, read-only, and never one of Paseo’s own agents', async () => {
     const own = claudeAgent({ id: 'claude1', persistence: { provider: 'claude', sessionId: OWN } });
     const daemon = fakeDaemon([own]);
-    const adapter = new PaseoAdapter('ws://127.0.0.1:6777', new EventHub(), quietLog, 'cid_signalbox_test', () => daemon.client as never);
-    const lineage = new Lineage(null, quietLog);
+    const adapter = new PaseoAdapter('ws://127.0.0.1:19007', new EventHub(), quietLog, 'cid_signalbox_test', () => daemon.client as never, new BackgroundGate('primary'));
+    const lineage = new Lineage(null, quietLog, undefined, new BackgroundGate('primary'));
     adapter.useLineage(lineage);
     adapter.start();
     await expect.poll(() => adapter.status().state).toBe('connected');
@@ -1438,7 +2080,7 @@ describe('Claude Code runs started from a shell (claude -p)', () => {
 
   it('lists a run once it has a task or an answer, never a launch that failed before its prompt', async () => {
     const { adapter, events } = await setup();
-    const lineage = new Lineage(null, quietLog);
+    const lineage = new Lineage(null, quietLog, undefined, new BackgroundGate('primary'));
     adapter.useLineage(lineage);
     const upserts = (id: string) => events.filter((e) => e.type === 'conversation_upsert' && e.conversation.id === `crun:${id}`);
     const FAILED = '0c1a0de0-0000-4000-8000-000000000006';
@@ -1460,12 +2102,19 @@ describe('Claude Code runs started from a shell (claude -p)', () => {
   });
 });
 
+describe('Paseo client identity', () => {
+  it('sends the installed client version as its app version', () => {
+    const installed = JSON.parse(readFileSync(new URL('../../node_modules/@getpaseo/client/package.json', import.meta.url), 'utf8'));
+    expect(APP_VERSION).toBe(installed.version);
+  });
+});
+
 describe('Paseo password', () => {
   it('logs a refused password once, and says so in the status', async () => {
     const daemon = fakeDaemon();
     const warns: string[] = [];
     const log = { info() {}, warn: (_o: object, m: string) => warns.push(m), error() {} };
-    const adapter = new PaseoAdapter('ws://127.0.0.1:6777', new EventHub(), log as never, 'cid_signalbox_test', () => daemon.client as never);
+    const adapter = new PaseoAdapter('ws://127.0.0.1:19007', new EventHub(), log as never, 'cid_signalbox_test', () => daemon.client as never, new BackgroundGate('primary'));
     adapter.start();
     await expect.poll(() => adapter.status().state).toBe('connected');
     daemon.drop('Incorrect password');

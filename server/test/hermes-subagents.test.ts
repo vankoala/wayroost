@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,8 +43,8 @@ describe('which chat a sub-agent run nests under', () => {
   });
 
   it('2. an earlier id of a compressed listed chat, or of one that moved', () => {
-    const listed = [chat('T', { _lineage_ids: ['R0', 'R1', 'T'], _lineage_root_id: 'R0' })];
-    const rows = [run('a', 'R0'), run('b', 'R1'), run('c', 'OLD')];
+    const listed = [chat('T', { _lineage_ids: ['demo-root', 'demo-parent', 'T'], _lineage_root_id: 'demo-root' })];
+    const rows = [run('a', 'demo-root'), run('b', 'demo-parent'), run('c', 'OLD')];
     const movedTo = new Map([
       ['OLD', 'MID'],
       ['MID', 'T'],
@@ -144,10 +145,10 @@ describe('sub-agent rows', () => {
   });
 
   it('gives a compressed chat its earlier ids, so runs named by them still find it', () => {
-    const summary = sessionSummary(chat('T', { _lineage_ids: ['R0', 'R1', 'T'] }), 'idle', 0);
+    const summary = sessionSummary(chat('T', { _lineage_ids: ['demo-root', 'demo-parent', 'T'] }), 'idle', 0);
     expect(summary.aliases).toEqual([
-      { source: 'hermes', id: 'R0' },
-      { source: 'hermes', id: 'R1' },
+      { source: 'hermes', id: 'demo-root' },
+      { source: 'hermes', id: 'demo-parent' },
     ]);
     expect(sessionSummary(chat('T'), 'idle', 0)).not.toHaveProperty('aliases');
   });
@@ -178,7 +179,7 @@ describe('hermes sub-agents against the fake dashboard', () => {
     };
     const stateDir = mkdtempSync(join(tmpdir(), 'sb-subagents-'));
     new SecretStore(stateDir).writeHermes(FAKE_USER);
-    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), { info() {}, warn() {}, error() {} });
+    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), { info() {}, warn() {}, error() {} }, { background: new BackgroundGate('primary') });
     fake.subagentRuns = [
       run('20260928_100000_run001', STORED, { title: 'Subagent: Find the flaky test', model: 'openrouter/qwen3-coder', is_active: true, ended_at: null }),
       run('20260928_100500_run002', UUID),

@@ -2,7 +2,7 @@ import { Bot, CornerDownRight, Feather } from 'lucide-react';
 import type { ConversationSummary } from '../../../shared/protocol';
 import { readableBridgeText } from '../bridge';
 import { shortTime } from '../format';
-import { conversationPath, navigate } from '../router';
+import { conversationPath, navigate, parseChatsFilter, useUrl } from '../router';
 import { SourceAvatar } from './common';
 
 /** Run by its parent's agent (delegate_task, a Task sub-agent): read-only here. */
@@ -41,6 +41,7 @@ export function ConversationRow({
   /** Inside a project card: the folder is already shown, so lead with the agent. */
   compact?: boolean;
 }) {
+  const filter = parseChatsFilter(useUrl());
   const preview = readableBridgeText(c.preview);
   const detail = compact
     ? [c.source === 'paseo' && !c.hermesInPaseo ? c.agentLabel : undefined, preview].filter(Boolean).join(' · ')
@@ -52,7 +53,7 @@ export function ConversationRow({
       type="button"
       className={`row${nested ? ' nested' : ''}`}
       aria-current={active ? 'page' : undefined}
-      onClick={() => navigate(conversationPath(c.source, c.id))}
+      onClick={() => navigate(conversationPath(c.source, c.id, filter))}
     >
       <SourceAvatar source={c.source} live={c.status === 'running'} linked={c.hermesInPaseo} small={nested} />
       <div className="row-main">

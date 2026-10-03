@@ -6,7 +6,7 @@
 // C0/C1 controls (except tab/newline), soft hyphen, bidi controls, zero-width
 // and joiner characters, invisible separators, variation selectors, BOM.
 const INVISIBLE =
-  /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F­؜ᅟᅠ឴឵᠎​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￻]/g;
+  /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00ad\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]/g;
 
 export interface RevealedDetail {
   /** Safe-to-display text. */

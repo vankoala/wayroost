@@ -1,3 +1,4 @@
+import { checkDeviceSignal } from '../security/device-signal.js';
 import { z } from 'zod';
 import {
   bridgeEnvelope,
@@ -11,11 +12,12 @@ import type { Logger } from '../hermes/adapter.js';
 import type { EventHub } from '../hub.js';
 import { HERMES_PARENT_LABEL, PARENT_AGENT_LABEL, modeTier } from '../paseo/normalize.js';
 import type { Lineage } from '../lineage.js';
-import { UserFacingError, type Sources, type StartedBy } from '../sources.js';
+import { UserFacingError, transientFailure, type Sources, type StartedBy } from '../sources.js';
 import { defaultChatTitle } from './envelope.js';
 import { chatEntry, chatKey, cut, transcript, type ChatStatus } from './format.js';
 import { LOOP_NOTICE, SendLimits, SlidingWindow } from './limits.js';
 import { NOT_A_PROJECT, ProjectIndex, canonicalFolder, isBareFolder, type ProjectRef } from './project.js';
+import { shadowBackground, type BackgroundGate } from '../background.js';
 
 // The project bridge: agents working in a project list, read, message and start
 // the other chats in the same project (as the Projects view groups them),
@@ -32,15 +34,15 @@ export const REPORT_TOOLS = ['note_launch', 'note_run'] as const;
 export type ReportTool = (typeof REPORT_TOOLS)[number];
 export const isReportTool = (name: string): name is ReportTool => (REPORT_TOOLS as readonly string[]).includes(name);
 
-export const PAUSED_MESSAGE = 'The user paused the Signalbox bridge.';
+export const PAUSED_MESSAGE = 'The user paused the Wayroost bridge.';
 export const SLASH_MESSAGE = "Slash commands can't be sent through the bridge.";
 export const NOT_IN_PROJECT = "That chat isn't in this project.";
-export const WAIT_NEEDS_IDENTITY = 'wait_for_reply needs a chat Signalbox can identify';
+export const WAIT_NEEDS_IDENTITY = 'wait_for_reply needs a chat Wayroost can identify';
 
 /** What the tools tell the calling agent to do next. */
 export const NOTES = {
   sent: "Delivered. They'll see your reply address; use wait_for_reply to wait for their answer.",
-  sentAnonymous: "Delivered. Signalbox couldn't identify your chat, so they can't reply to you through the bridge.",
+  sentAnonymous: "Delivered. Wayroost couldn't identify your chat, so they can't reply to you through the bridge.",
   queued: (position: number) =>
     `They're busy, so your message waits (number ${position} in line) and goes out when they're idle. Use wait_for_reply to wait for their answer.`,
   queuedAnonymous: (position: number) =>
@@ -48,7 +50,7 @@ export const NOTES = {
   handedOver: 'They were waiting for your reply and got it.',
   started: "Started. It sees your message and your reply address; use wait_for_reply to wait for its answer.",
   startedAnonymous: 'Started.',
-  anonymous: "Signalbox couldn't identify your chat, so other chats can't reply to you and wait_for_reply won't work.",
+  anonymous: "Wayroost couldn't identify your chat, so other chats can't reply to you and wait_for_reply won't work.",
   finished: 'They finished without replying through the bridge; this is their latest message.',
   finishedSilent: 'They finished without replying through the bridge, and wrote nothing new.',
   timedOut: (status: ChatStatus) =>
@@ -63,6 +65,8 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const MAX_LISTED = 50;
 const MAX_WAITING_PER_CHAT = 5;
+/** Signalbox's own messages waiting for one chat (the task log keeps the rest until there's room). */
+const MAX_SYSTEM_WAITING_PER_CHAT = 10;
 const QUEUE_TTL_MS = HOUR;
 const POLL_MS = 3_000;
 /** After a delivery, a chat counts as done with it once seen busy, or after this long idle. */
@@ -92,6 +96,7 @@ export interface CallOptions {
 }
 
 export interface BridgeOptions {
+  background?: BackgroundGate;
   sources: Sources;
   hub: EventHub;
   log: Logger;
@@ -126,6 +131,47 @@ interface Queued {
   callerLog: string;
   at: number;
   attempts: number;
+  /** Reserved by an adapter; it cannot also become a wait's reply. */
+  sending?: boolean;
+  /** Set for a message from Signalbox itself (see deliverSystem). */
+  system?: SystemMessage;
+}
+
+/** Equal-time system messages use the task ledger's reservation key order. Ordinary ties remain FIFO. */
+function queueOrder(a: Queued, b: Queued): number {
+  return a.at - b.at || (a.system?.key ?? '').localeCompare(b.system?.key ?? '');
+}
+
+/**
+ * Who queues Signalbox's own messages. Not a chat key ("hermes:…" or "paseo:…"),
+ * so no chat's wait_for_reply, loop breaker or rate limit ever matches it.
+ */
+export const SYSTEM_CALLER = 'signalbox:system';
+
+/** A message from Signalbox itself (the task log), not from an agent. */
+export interface SystemMessage {
+  /** One per message: queuing the same key again while it waits changes nothing. */
+  key: string;
+  target: { source: Source; id: string };
+  /** Who it's from, as the envelope names it. */
+  sender: string;
+  text: string;
+  /** Resolve a continuation before readiness checks; undefined holds delivery until its reservation is available. */
+  resolveTarget?(): Promise<SystemMessage['target'] | undefined>;
+  /** Asked right before it goes out (the chat may have heard the news meanwhile); false drops it as "unwanted". */
+  stillWanted?(): Promise<boolean>;
+  /** It reached the chat. */
+  delivered(at: number): void;
+  /** It won't be delivered: the chat is gone, delivery kept failing, or it was withdrawn. */
+  dropped(reason: string): void;
+}
+
+/** What the task log hears from the bridge. */
+export interface BridgeObserver {
+  /** A chat started an agent. Runs before acknowledging it; a failed provenance write must throw. */
+  started?(agent: { source: Source; id: string }, by: StartedBy, at: number): void;
+  /** A wait_for_reply returned the chat's answer or its finish. */
+  waited?(callerKey: string, targetKey: string, kind: 'reply' | 'finished', at: number): void;
 }
 
 interface StartedChat {
@@ -282,9 +328,84 @@ export class Bridge {
   private delivering = false;
   private ticking = false;
   private readonly now: () => number;
+  private readonly observers: BridgeObserver[] = [];
 
   constructor(private readonly options: BridgeOptions) {
     this.now = options.now ?? Date.now;
+  }
+
+  /** Hear about launches and answered waits (the task log). */
+  watch(observer: BridgeObserver): void {
+    this.observers.push(observer);
+  }
+
+  private tell(visit: (observer: BridgeObserver) => void): void {
+    for (const observer of this.observers) {
+      try {
+        visit(observer);
+      } catch (err) {
+        // An observer must never break a tool call.
+        this.options.log.warn({ err: errorText(err) }, 'bridge observer failed');
+      }
+    }
+  }
+
+  // ---- Signalbox's own messages --------------------------------------------------
+
+  /**
+   * Queue a message from Signalbox itself. It goes out like any waiting message:
+   * oldest first, once the chat is idle with nothing waiting on the user and has
+   * settled, never while the bridge is paused. Agents' rate limits and the loop
+   * breaker are about agents, so they don't apply (the caller keeps its own).
+   * The caller withdraws stale news; queue expiry never loses it during an outage.
+   * It is never handed to a wait_for_reply.
+   */
+  deliverSystem(message: SystemMessage): 'queued' | 'already queued' | 'full' {
+    if (SLASH.test(message.text)) throw new UserFacingError(SLASH_MESSAGE, 400);
+    const key = chatKey(message.target);
+    const queue = this.queues.get(key) ?? [];
+    if (queue.some((m) => m.system?.key === message.key)) return 'already queued';
+    // A chat that stays busy mustn't pile up Signalbox's messages: the caller keeps them for later.
+    if (queue.filter((m) => m.system).length >= MAX_SYSTEM_WAITING_PER_CHAT) return 'full';
+    const now = this.now();
+    queue.push({
+      target: { source: message.target.source, id: message.target.id },
+      envelope: bridgeEnvelope(message.sender, message.text),
+      text: message.text,
+      callerKey: SYSTEM_CALLER,
+      callerLog: 'signalbox',
+      at: now,
+      attempts: 0,
+      system: message,
+    });
+    queue.sort(queueOrder);
+    this.queues.set(key, queue);
+    // Wakes the existing delivery loop for Wayroost's own message (the bridge runs only in primary).
+    // Not agents' activity: Settings' counts leave it out.
+    this.ensurePolling();
+    return 'queued';
+  }
+
+  /** Take back a waiting message from Signalbox itself (its news went stale). True if it was still waiting. */
+  withdrawSystem(key: string): boolean {
+    for (const [chat, queue] of [...this.queues]) {
+      const index = queue.findIndex((m) => m.system?.key === key);
+      if (index < 0) continue;
+      const [message] = queue.splice(index, 1);
+      if (!queue.length) this.queues.delete(chat);
+      this.dropSystem(message!, 'withdrawn');
+      return true;
+    }
+    return false;
+  }
+
+  private dropSystem(message: Queued, reason: string): void {
+    if (!message.system) return;
+    try {
+      message.system.dropped(reason);
+    } catch (err) {
+      this.options.log.warn({ err: errorText(err) }, 'bridge system message callback failed');
+    }
   }
 
   // ---- the app's controls ---------------------------------------------------
@@ -305,6 +426,7 @@ export class Bridge {
 
   /** Kill switch. Waits end at once; waiting messages stay (up to an hour) and go out once resumed. */
   setPaused(paused: boolean): BridgeStatus {
+    checkDeviceSignal();
     if (paused !== this.paused) this.options.log.info({ paused }, paused ? 'bridge paused' : 'bridge resumed');
     this.paused = paused;
     if (paused) for (const waiter of [...this.waiters.values()]) this.settle(waiter, new UserFacingError(PAUSED_MESSAGE, 503));
@@ -321,7 +443,7 @@ export class Bridge {
     this.stopped = true;
     this.stopPolling();
     for (const waiter of [...this.waiters.values()]) {
-      this.settle(waiter, new UserFacingError('Signalbox is shutting down.', 503));
+      this.settle(waiter, new UserFacingError('Wayroost is shutting down.', 503));
     }
   }
 
@@ -334,6 +456,7 @@ export class Bridge {
 
   /** Run one tool. Throws UserFacingError (with an HTTP status) when refused. */
   async call(tool: string, args: unknown, identity: BridgeIdentity = {}, options: CallOptions = {}): Promise<unknown> {
+    (this.options.background ?? shadowBackground).require();
     if (isReportTool(tool)) return this.report(tool, args);
     const log: CallLog = { tool, caller: 'unknown' };
     try {
@@ -476,7 +599,9 @@ export class Bridge {
 
     const envelope = bridgeEnvelope(caller.label, args.text, caller.chat ? chatKey(caller.chat) : undefined);
     const waiting = this.queues.get(key);
-    if (!waiting?.length && fresh && this.ready(key, fresh, now)) {
+    // Only agents' messages count here: Signalbox's own never hold one back or use up the limit.
+    const agentsWaiting = waiting?.filter((m) => !m.system).length ?? 0;
+    if (!agentsWaiting && fresh && this.ready(key, fresh, now)) {
       this.limits.record(caller.key, key, now);
       const previous = this.deliveries.get(key);
       this.deliveries.set(key, { at: now, sawBusy: false });
@@ -492,7 +617,7 @@ export class Bridge {
       return { delivered: 'now' as const, note: caller.chat ? NOTES.sent : NOTES.sentAnonymous };
     }
 
-    if ((waiting?.length ?? 0) >= MAX_WAITING_PER_CHAT) {
+    if (agentsWaiting >= MAX_WAITING_PER_CHAT) {
       throw new UserFacingError(
         `That chat already has ${MAX_WAITING_PER_CHAT} messages waiting for it to finish. Try again later.`,
         429,
@@ -579,6 +704,7 @@ export class Bridge {
     this.recent.started.add('*', now);
     log.target = chatKey(place.chat);
     log.outcome = 'started';
+    if (startedBy) for (const observer of this.observers) observer.started?.({ source: args.backend, id }, startedBy, now);
     // Its first message came from the caller: waiting on it counts from now.
     if (startedBy) this.lastDelivered.set(pairKey(caller.key, log.target), now);
     return { chat: log.target, title, note: startedBy ? NOTES.started : NOTES.startedAnonymous };
@@ -674,7 +800,7 @@ export class Bridge {
   /** An answer from the target that was queued for the caller goes to the wait instead. */
   private takeQueuedReply(waiter: Waiter): boolean {
     const queue = this.queues.get(waiter.callerKey);
-    const index = queue?.findIndex((m) => m.callerKey === waiter.targetKey) ?? -1;
+    const index = queue?.findIndex((m) => !m.sending && m.callerKey === waiter.targetKey) ?? -1;
     if (!queue || index < 0) return false;
     const [message] = queue.splice(index, 1);
     if (!queue.length) this.queues.delete(waiter.callerKey);
@@ -739,6 +865,10 @@ export class Bridge {
     if (this.waiters.get(waiter.callerKey) === waiter) this.waiters.delete(waiter.callerKey);
     if (outcome instanceof Error) waiter.reject(outcome);
     else waiter.resolve(outcome);
+    if (!(outcome instanceof Error) && outcome.kind !== 'timed_out') {
+      const kind = outcome.kind;
+      this.tell((o) => o.waited?.(waiter.callerKey, waiter.targetKey, kind, this.now()));
+    }
   }
 
   /** A message from `callerKey` reached `targetKey`: any wait for its answer counts from now. */
@@ -810,7 +940,7 @@ export class Bridge {
     return found;
   }
 
-  private async freshSummary(target: { source: Source; id: string }): Promise<ConversationSummary | undefined> {
+  private async freshSummary(target: ChatRef): Promise<ConversationSummary | undefined> {
     const list = await this.options.sources[target.source].listConversations().catch(() => []);
     return list.find((c) => c.id === target.id);
   }
@@ -894,6 +1024,49 @@ export class Bridge {
     }
   }
 
+  private async retargetQueued(key: string, queue: Queued[], head: Queued): Promise<boolean> {
+    const resolved = head.system?.resolveTarget ? await head.system.resolveTarget() : head.target;
+    if (this.paused || this.queues.get(key) !== queue || queue[0] !== head || !resolved) return false;
+    const source = this.options.sources[resolved.source];
+    const target = { source: resolved.source, id: source.resolveChat?.(resolved.id) ?? resolved.id };
+    const next = chatKey(target);
+    if (next === key) return true;
+    const destination = this.queues.get(next) ?? [];
+    if (head.system && destination.filter((m) => m.system).length >= MAX_SYSTEM_WAITING_PER_CHAT) return false;
+    queue.shift();
+    if (!queue.length) this.queues.delete(key);
+    head.target = { source: target.source, id: target.id };
+    if (head.system) head.system.target = { ...head.target };
+    destination.push(head);
+    destination.sort(queueOrder);
+    this.queues.set(next, destination);
+    return false; // The destination's readiness and delivery reservation are checked on its turn.
+  }
+
+  /** Compression during a lookup must move the queue and reservation before readiness is checked. */
+  private async queuedSummary(key: string, queue: Queued[], head: Queued): Promise<ConversationSummary | undefined> {
+    const source = this.options.sources[head.target.source];
+    const list = await source.listConversations();
+    const listedId = source.resolveChat?.(head.target.id) ?? head.target.id;
+    if (source.resolveListedChat) await source.resolveListedChat(listedId, list);
+    else if (list.some((c) => c.id !== listedId && c.aliases?.some((a) => sameChat(a, { source: head.target.source, id: listedId })))) {
+      throw new UserFacingError('Hermes recipient identity is awaiting confirmation.', 503);
+    }
+    if (!(await this.retargetQueued(key, queue, head))) return undefined;
+    const current = source.resolveChat?.(head.target.id) ?? head.target.id;
+    if (current !== head.target.id) {
+      await this.retargetQueued(key, queue, head);
+      return undefined;
+    }
+    const summary = source.deliverySummary ? await source.deliverySummary(current)
+      : list.find((c) => c.id === current) ?? (head.system ? source.summaryOf?.(current) : undefined);
+    if (!(await this.retargetQueued(key, queue, head))) return undefined;
+    if (summary && !sameChat(summary, head.target)) {
+      throw new UserFacingError('Hermes recipient identity could not be resolved.', 503);
+    }
+    return summary;
+  }
+
   /** Deliver waiting messages to chats that became idle: the oldest first, one per chat at a time. */
   async deliverQueued(): Promise<void> {
     if (this.delivering) return;
@@ -904,32 +1077,97 @@ export class Bridge {
         if (this.paused) return;
         const head = queue[0];
         if (!head) continue;
-        const summary = await this.freshSummary(head.target);
-        const now = this.now();
-        // The queue may have changed while we looked (the loop breaker, a wait, a pause).
-        if (this.paused || this.queues.get(key) !== queue || queue[0] !== head) continue;
-        if (!summary || !this.ready(key, summary, now)) continue;
-        queue.shift();
-        if (!queue.length) this.queues.delete(key);
-        this.deliveries.set(key, { at: now, sawBusy: false });
         try {
-          await this.options.sources[head.target.source].sendMessage(head.target.id, head.envelope);
-          this.delivered(head.callerKey, key, now);
-          this.options.log.info({ caller: head.callerLog, target: key, waitedMs: now - head.at }, 'bridge delivered a waiting message');
-        } catch (err) {
-          this.deliveries.delete(key);
-          head.attempts += 1;
-          const gone = err instanceof UserFacingError && err.status === 404;
-          if (!gone && head.attempts < MAX_DELIVERY_ATTEMPTS) {
-            const current = this.queues.get(key) ?? [];
-            current.unshift(head);
-            this.queues.set(key, current);
-          } else {
-            this.options.log.warn(
-              { caller: head.callerLog, target: key, err: errorText(err) },
-              'bridge dropped a message it could not deliver',
-            );
+          if (!(await this.retargetQueued(key, queue, head))) continue;
+          const source = this.options.sources[head.target.source];
+          if (head.system && source.status().state !== 'connected') continue;
+          // Signalbox's own messages also reach an older chat the recent list leaves out.
+          const summary = await this.queuedSummary(key, queue, head);
+          let now = this.now();
+          // The queue may have changed while we looked (the loop breaker, a wait, a pause).
+          if (this.paused || this.queues.get(key) !== queue || queue[0] !== head) continue;
+          if (!summary) {
+            if (head.system) throw new UserFacingError('Hermes recipient readiness could not be resolved.', 503);
+            continue;
           }
+          if (!this.ready(key, summary, now)) continue;
+          if (head.system?.stillWanted) {
+            const wanted = await head.system.stillWanted();
+            if (this.paused || this.queues.get(key) !== queue || queue[0] !== head) continue;
+            if (!wanted) {
+              queue.shift();
+              if (!queue.length) this.queues.delete(key);
+              this.dropSystem(head, 'unwanted');
+              continue;
+            }
+            if (!(await this.retargetQueued(key, queue, head))) continue;
+            const fresh = await this.queuedSummary(key, queue, head);
+            now = this.now();
+            if (this.paused || this.queues.get(key) !== queue || queue[0] !== head) continue;
+            if (!fresh) throw new UserFacingError('Hermes recipient readiness could not be resolved.', 503);
+            if (!this.ready(key, fresh, now)) continue;
+          }
+          if (head.system && source.status().state !== 'connected') continue;
+          const reservation = { at: now, sawBusy: false };
+          this.deliveries.set(key, reservation);
+          head.sending = true;
+          try {
+            const beforeSubmit = async () => {
+              const pending = () => !this.paused && !this.stopped && this.queues.get(key) === queue && queue[0] === head;
+              if (!pending()) throw new UserFacingError('Bridge delivery is paused or cancelled.', 503);
+              if (head.system?.stillWanted) {
+                const wanted = await head.system.stillWanted();
+                if (!pending()) throw new UserFacingError('Bridge delivery is paused or cancelled.', 503);
+                if (!wanted) {
+                  queue.shift();
+                  if (!queue.length) this.queues.delete(key);
+                  this.dropSystem(head, 'unwanted');
+                  throw new UserFacingError('Bridge delivery is no longer wanted.', 503);
+                }
+              }
+              if (!(await this.retargetQueued(key, queue, head)) || !pending() ||
+                  source.status().state !== 'connected' || this.deliveries.get(key) !== reservation) {
+                throw new UserFacingError('Bridge delivery is awaiting recipient readiness.', 503);
+              }
+            };
+            if (source.sendMessageWhenIdle) await source.sendMessageWhenIdle(head.target.id, head.envelope, beforeSubmit);
+            else { await beforeSubmit(); await source.sendMessage(head.target.id, head.envelope); }
+            reservation.at = this.now();
+            // Equal-time updates can sort ahead while submission awaits acknowledgement.
+            if (this.queues.get(key) === queue) {
+              const index = queue.indexOf(head);
+              if (index >= 0) {
+                queue.splice(index, 1);
+                if (!queue.length) this.queues.delete(key);
+              }
+            }
+            // Signalbox's own messages aren't agents' activity, and nobody waits on their answer.
+            if (!head.system) this.delivered(head.callerKey, key, reservation.at);
+            this.options.log.info({ caller: head.callerLog, target: key, waitedMs: now - head.at }, 'bridge delivered a waiting message');
+            if (head.system) {
+              try {
+                head.system.delivered(this.now());
+              } catch (err) {
+                this.options.log.warn({ err: errorText(err) }, 'bridge system message callback failed');
+              }
+            }
+          } catch (err) {
+            if (this.deliveries.get(key) === reservation) this.deliveries.delete(key);
+            if (this.queues.get(key) === queue && queue[0] === head) {
+              queue.shift();
+              if (!queue.length) this.queues.delete(key);
+              this.deliveryFailure(key, head, err);
+            }
+          } finally {
+            delete head.sending;
+          }
+        } catch (err) {
+          if (this.queues.get(key) !== queue || queue[0] !== head) continue;
+          // Readiness/evidence outages never consume a send attempt or remove ordinary messages.
+          if (transientFailure(err)) continue;
+          queue.shift();
+          if (!queue.length) this.queues.delete(key);
+          this.deliveryFailure(key, head, err);
         }
       }
     } finally {
@@ -937,11 +1175,25 @@ export class Bridge {
     }
   }
 
+  private deliveryFailure(key: string, head: Queued, err: unknown): void {
+    if (!transientFailure(err)) head.attempts += 1;
+    const gone = err instanceof UserFacingError && err.status === 404;
+    if (!gone && head.attempts < MAX_DELIVERY_ATTEMPTS) {
+      const current = this.queues.get(key) ?? [];
+      current.unshift(head);
+      this.queues.set(key, current);
+      return;
+    }
+    this.options.log.warn({ caller: head.callerLog, target: key, err: errorText(err) }, 'bridge dropped a message it could not deliver');
+    this.dropSystem(head, gone ? 'gone' : 'failed');
+  }
+
   private expire(now: number): void {
     for (const [key, queue] of [...this.queues]) {
-      const keep = queue.filter((m) => now - m.at < QUEUE_TTL_MS);
+      const keep = queue.filter((m) => m.system || now - m.at < QUEUE_TTL_MS);
       if (keep.length === queue.length) continue;
       this.options.log.info({ target: key, dropped: queue.length - keep.length }, 'bridge dropped messages that waited over an hour');
+      for (const message of queue) if (!keep.includes(message)) this.dropSystem(message, 'expired');
       if (keep.length) queue.splice(0, queue.length, ...keep);
       else this.queues.delete(key);
     }

@@ -1,0 +1,29 @@
+[Unit]
+Description=Wayroost supervisor
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=wayroost
+WorkingDirectory=/opt/wayroost/supervisor
+ExecStart=/usr/bin/node /opt/wayroost/supervisor/dist/supervisor/supervisor/src/index.js
+Environment=WAYROOST_SUPERVISOR_CONFIG=/etc/wayroost/supervisor.json
+LoadCredential=loopback-tls-cert:/etc/wayroost/supervisor-tls-cert.pem
+LoadCredential=loopback-tls-key:/etc/wayroost/supervisor-tls-key.pem
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=wayroost
+RuntimeDirectoryMode=0750
+StateDirectory=wayroost-supervisor
+StateDirectoryMode=0700
+UMask=0077
+
+# The manager starts transient actions outside this filesystem namespace.
+# Keep root's systemd-run/systemctl privileges; do not apply NoNewPrivileges.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/wayroost-supervisor /run/wayroost
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

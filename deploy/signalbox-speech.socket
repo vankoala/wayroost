@@ -1,5 +1,5 @@
 [Unit]
-Description=Signalbox speech service socket (voice mode)
+Description=Wayroost speech service socket (voice mode)
 Documentation=file:///opt/signalbox/README.md
 
 [Socket]

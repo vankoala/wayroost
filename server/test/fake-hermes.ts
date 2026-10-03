@@ -113,6 +113,29 @@ export class FakeHermes {
   supportsSubagents = true;
   /** Hermes-in-Paseo sessions (`source=acp`). */
   acpSessions: Array<Record<string, unknown>> = [];
+  /** Scheduled-job runs (`source=cron`), as the cron section of the desktop app lists them. */
+  cronRuns: Array<Record<string, unknown>> = [];
+  /** Live cron job states and claims (`GET /api/cron/jobs`); null answers 500. */
+  cronJobs: unknown = [];
+  /** Override a cron history page to test incomplete or malformed replies. */
+  cronPage?: (query: Record<string, string>) => unknown;
+  /**
+   * The gateway part of `GET /api/status` (hermes_cli/web_routers/status.py): whether the
+   * messaging gateway runs and its in-flight work count. null answers 500.
+   */
+  apiStatus: Record<string, unknown> | null = {
+    gateway_running: true, gateway_state: 'running', active_agents: 0,
+    gateway_updated_at: new Date().toISOString(), gateway_heartbeat_stale_s: null, gateway_shared_with: null,
+  };
+  /** Raw runtime evidence, when supplied: /api/status exposes only its normalized count. */
+  apiRuntime?: Record<string, unknown> | null;
+  profileRuntime: Record<string, Record<string, unknown> | null> = {};
+  /** Profile roster and scoped replies, including failures hidden by aggregate endpoints. */
+  apiProfiles: unknown = { profiles: [{ name: 'default' }] };
+  profileStatus: Record<string, Record<string, unknown> | null> = {};
+  profileCronJobs: Record<string, unknown> = {};
+  profileCronRuns: Record<string, Array<Record<string, unknown>>> = {};
+  profileQueries: Array<{ path: string; profile: string | null }> = [];
   /** Detail rows (`GET /api/sessions/<id>`), by id. */
   details: Record<string, Record<string, unknown>> = {};
   /** Query strings of every `GET /api/sessions`. */
@@ -245,6 +268,32 @@ export class FakeHermes {
       res.end(FAKE_PNG);
       return;
     }
+    if (url.pathname === '/api/profiles') {
+      if (this.apiProfiles === null) return json(500, { detail: 'Internal Server Error' });
+      return json(200, this.apiProfiles);
+    }
+    const profile = url.searchParams.get('profile');
+    if (url.pathname === '/api/status') {
+      this.profileQueries.push({ path: url.pathname, profile });
+      const status = profile && Object.hasOwn(this.profileStatus, profile) ? this.profileStatus[profile] : this.apiStatus;
+      if (!status) return json(500, { detail: 'Internal Server Error' });
+      const runtime = profile && Object.hasOwn(this.profileRuntime, profile) ? this.profileRuntime[profile] : this.apiRuntime;
+      const raw = runtime?.active_agents;
+      // gateway.status.parse_active_agents: missing/invalid values become zero, fractions truncate.
+      const count = typeof raw === 'number' || typeof raw === 'boolean' ? Number(raw)
+        : typeof raw === 'string' && /^[+-]?\d+$/.test(raw.trim()) ? Number(raw) : 0;
+      const normalized = Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0;
+      return json(200, {
+        version: '0.0.0-demo', ...status,
+        ...(runtime !== undefined ? { active_agents: normalized } : {}),
+      });
+    }
+    if (url.pathname === '/api/cron/jobs') {
+      this.profileQueries.push({ path: url.pathname, profile });
+      const jobs = profile && Object.hasOwn(this.profileCronJobs, profile) ? this.profileCronJobs[profile] : this.cronJobs;
+      if (jobs === null) return json(500, { detail: 'Internal Server Error' });
+      return json(200, jobs);
+    }
     if (url.pathname === '/api/chat/workspaces') {
       // hermes_cli/web_routers/chat_workspaces.py
       this.workspaceRequests += 1;
@@ -259,6 +308,12 @@ export class FakeHermes {
       const query = Object.fromEntries(url.searchParams);
       this.listQueries.push(query);
       if (query.source === 'acp') return json(200, { sessions: this.acpSessions, total: this.acpSessions.length });
+      if (query.source === 'cron') {
+        if (this.cronPage) return json(200, this.cronPage(query));
+        const offset = Number(query.offset ?? 0);
+        const runs = profile && Object.hasOwn(this.profileCronRuns, profile) ? this.profileCronRuns[profile]! : this.cronRuns;
+        return json(200, { sessions: runs.slice(offset, offset + Number(query.limit ?? 20)), total: runs.length });
+      }
       // hermes_cli/session_listing.py: excluding `subagent` asks for the runs, given show_subagents.
       const wantsRuns = (query.exclude_sources ?? '').split(',').includes('subagent') && this.showSubagents;
       const archived = query.archived ?? 'exclude';

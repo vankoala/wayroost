@@ -29,7 +29,7 @@ describe('loadMedia', () => {
     expect(cachedMedia(link('a'))).toBe(a);
     expect(fetch).toHaveBeenCalledTimes(1);
     const init = fetch.mock.calls[0] as unknown as [string, RequestInit];
-    expect(init[1].headers).toEqual({ 'x-signalbox-request': '1' });
+    expect(init[1].headers).toEqual({ 'x-wayroost-request': '1' });
   });
 
   it("shows the server's reason, and doesn't ask again right away", async () => {

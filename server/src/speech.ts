@@ -1,3 +1,4 @@
+import { checkDeviceSignal, deviceSignal, actionSignal, withDeviceSignal } from './security/device-signal.js';
 import { request } from 'node:http';
 import {
   VOICE_MAX_SECONDS,
@@ -6,6 +7,8 @@ import {
   type VoiceEvent,
 } from '../../shared/protocol.js';
 import { UserFacingError } from './sources.js';
+import { CloudSpeechError, type CloudSpeechService } from './cloud-speech.js';
+import type { AppVoice, SpeechFrame } from '../../shared/voice.js';
 
 // Voice mode. The speech service (speech/signalbox-speech.py, set up by
 // deploy/setup-speech.sh) runs beside Signalbox and answers on a Unix socket
@@ -31,8 +34,99 @@ export interface SpeechHealth {
 
 export interface SpeechService {
   health(): Promise<SpeechHealth>;
-  transcribe(pcm: Buffer): Promise<{ text: string; ms: number }>;
-  speak(text: string, voice: string, speed: number): Promise<Buffer>;
+  transcribe(pcm: Buffer, signal?: AbortSignal): Promise<{ text: string; ms: number }>;
+  speak(text: string, voice: string, speed: number, signal?: AbortSignal): Promise<Buffer>;
+}
+
+interface CloudState {
+  generation: number;
+  failure?: { until: number; reason: import('../../shared/voice.js').CloudVoiceErrorCode };
+}
+const cloudStates = new WeakMap<CloudSpeechService, CloudState>();
+const CLOUD_AUDIO_DEADLINE_MS = 2_000;
+
+function nextAudio(iterator: AsyncIterator<Buffer>, signal: AbortSignal): Promise<IteratorResult<Buffer>> {
+  return new Promise((resolve, reject) => {
+    const timeout = () => { cleanup(); reject(new CloudSpeechError('timeout')); };
+    const timer = setTimeout(timeout, CLOUD_AUDIO_DEADLINE_MS);
+    const cleanup = () => { clearTimeout(timer); signal.removeEventListener('abort', timeout); };
+    signal.addEventListener('abort', timeout, { once: true });
+    if (signal.aborted) { timeout(); return; }
+    Promise.resolve().then(() => iterator.next()).then(
+      part => { cleanup(); resolve(part); }, err => { cleanup(); reject(err); },
+    );
+  });
+}
+
+/** Cloud errors, including a broken stream, replay this exact text using the local voice. */
+export async function* readAloud(local: SpeechService, cloud: CloudSpeechService | undefined, choice: AppVoice, text: string, voice: string, speed: number, signal?: AbortSignal): AsyncGenerator<SpeechFrame> {
+  if (signal?.aborted) return;
+  let started = false;
+  let reason: import('../../shared/voice.js').CloudVoiceErrorCode | undefined;
+  if (choice.provider === 'elevenlabs') {
+    const state = cloud ? cloudStates.get(cloud) ?? { generation: 0 } : undefined;
+    if (cloud && state) cloudStates.set(cloud, state);
+    const failure = state?.failure;
+    const generation = state?.generation;
+    const abort = new AbortController();
+    const cancel = () => abort.abort();
+    signal?.addEventListener('abort', cancel, { once: true });
+    let iterator: AsyncIterator<Buffer> | undefined;
+    try {
+      if (failure && failure.until > Date.now()) throw new CloudSpeechError(failure.reason);
+      if (!cloud) throw new CloudSpeechError('unreachable');
+      checkDeviceSignal();
+      iterator = cloud.synthesize(text, choice, 'pcm_24000', abort.signal)[Symbol.asyncIterator]();
+      let bytes = 0;
+      while (true) {
+        const part = await nextAudio(iterator, abort.signal);
+        if (signal?.aborted) return;
+        if (part.done) break;
+        const chunk = part.value;
+        if (!chunk.length) continue;
+        if (!started) { yield { type: 'start', provider: 'elevenlabs', voice: choice.voiceId!, format: 'pcm_24000' }; started = true; }
+        bytes += chunk.length;
+        if (bytes > MAX_REPLY_BYTES) throw new CloudSpeechError('failed');
+        yield { type: 'audio', data: chunk.toString('base64') };
+      }
+      if (!bytes || bytes % 2) throw new CloudSpeechError('failed');
+      // An older stream cannot erase a failure reported after it started.
+      if (state && state.generation === generation) delete state.failure;
+      yield { type: 'end', provider: 'elevenlabs', voice: choice.voiceId! };
+      return;
+    } catch (err) {
+      if (signal?.aborted) return;
+      reason = err instanceof CloudSpeechError ? err.code : 'failed';
+      if (state && iterator) {
+        state.generation += 1;
+        const until = Date.now() + (reason === 'auth' || reason === 'quota' ? 300_000 : 60_000);
+        // Concurrent failures must not shorten the active cooldown or change its reason.
+        if (!state.failure || until > state.failure.until) state.failure = { until, reason };
+      }
+    } finally {
+      signal?.removeEventListener('abort', cancel);
+      abort.abort();
+      // Abort the socket immediately; a hostile iterator may never finish next().
+      void iterator?.return?.().catch(() => {});
+    }
+  }
+  if (signal?.aborted) return;
+  checkDeviceSignal();
+  const wav = await (signal ? local.speak(text, voice, speed, signal) : local.speak(text, voice, speed));
+  if (signal?.aborted) return;
+  yield { type: started ? 'reset' : 'start', provider: 'local', voice, format: 'wav', ...(reason ? { reason } : {}) };
+  yield { type: 'audio', data: wav.toString('base64') };
+  yield { type: 'end', provider: 'local', voice };
+}
+
+export function pcmWav(pcm: Buffer, speed = 1): Buffer {
+  const rate = Math.round(24000 * speed);
+  const header = Buffer.alloc(44);
+  header.write('RIFF'); header.writeUInt32LE(36 + pcm.length, 4); header.write('WAVEfmt ', 8);
+  header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(rate, 24); header.writeUInt32LE(rate * 2, 28); header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34);
+  header.write('data', 36); header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
 }
 
 const UNAVAILABLE = "Voice isn't available right now: the speech service on your PC isn't answering.";
@@ -48,11 +142,14 @@ export class SpeechClient implements SpeechService {
 
   constructor(private readonly socketPath: string) {}
 
-  private call(method: string, path: string, body: Buffer | undefined, type: string, timeoutMs: number): Promise<Reply> {
+  private call(method: string, path: string, body: Buffer | undefined, type: string, timeoutMs: number, signal = deviceSignal()): Promise<Reply> {
     return new Promise((resolve, reject) => {
+      checkDeviceSignal();
+      checkDeviceSignal(signal);
       const req = request(
         {
           socketPath: this.socketPath,
+          signal: actionSignal(signal),
           method,
           path,
           // A fresh connection each time: the service closes idle ones, and a
@@ -122,8 +219,8 @@ export class SpeechClient implements SpeechService {
     return health;
   }
 
-  async transcribe(pcm: Buffer): Promise<{ text: string; ms: number }> {
-    const reply = await this.call('POST', '/stt', pcm, 'application/octet-stream', WORK_TIMEOUT_MS);
+  async transcribe(pcm: Buffer, signal?: AbortSignal): Promise<{ text: string; ms: number }> {
+    const reply = await this.call('POST', '/stt', pcm, 'application/octet-stream', WORK_TIMEOUT_MS, signal);
     if (reply.status !== 200) throw SpeechClient.failed(reply, "Couldn't write down what you said.");
     const data = SpeechClient.json(reply);
     return {
@@ -132,9 +229,9 @@ export class SpeechClient implements SpeechService {
     };
   }
 
-  async speak(text: string, voice: string, speed: number): Promise<Buffer> {
+  async speak(text: string, voice: string, speed: number, signal?: AbortSignal): Promise<Buffer> {
     const body = Buffer.from(JSON.stringify({ text, voice, speed }));
-    const reply = await this.call('POST', '/tts', body, 'application/json', WORK_TIMEOUT_MS);
+    const reply = await this.call('POST', '/tts', body, 'application/json', WORK_TIMEOUT_MS, signal);
     if (reply.status !== 200) throw SpeechClient.failed(reply, "Couldn't read that aloud.");
     if (!reply.type.startsWith('audio/wav') || reply.body.length < 44) {
       throw new UserFacingError("Couldn't read that aloud.", 502);
@@ -173,6 +270,7 @@ export class VoiceSession {
     private readonly speech: SpeechService,
     private readonly send: (event: VoiceEvent) => void,
     private readonly idleMs = RUN_IDLE_MS,
+    private readonly signal?: AbortSignal,
   ) {}
 
   start(id: number): void {
@@ -240,8 +338,13 @@ export class VoiceSession {
     // One transcription at a time per browser, in the order they were spoken.
     this.waiting += 1;
     this.queue = this.queue.then(async () => {
+      if (this.closed || this.signal?.aborted) {
+        // Its socket is gone (or its device revoked): nobody is waiting for the text.
+        this.waiting -= 1;
+        return;
+      }
       try {
-        const { text, ms } = await this.speech.transcribe(pcm);
+        const { text, ms } = await withDeviceSignal(this.signal, () => this.speech.transcribe(pcm, this.signal));
         this.emit({ type: 'voice', run: run.id, stage: 'stt-end', text, ms });
       } catch (err) {
         this.error(run.id, err instanceof UserFacingError && err.status === 503 ? 'unavailable' : 'failed');

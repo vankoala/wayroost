@@ -10,7 +10,7 @@
 // only; diagnostics go to stderr. The token is never printed.
 //
 // Environment:
-//   SIGNALBOX_BRIDGE_URL         bridge listener, default http://127.0.0.1:8792 (loopback only)
+//   SIGNALBOX_BRIDGE_URL         bridge listener, default http://127.0.0.1:19012 (loopback only)
 //   SIGNALBOX_BRIDGE_TOKEN_FILE  default ~/.config/signalbox/bridge-token
 //   PASEO_AGENT_ID               set by Paseo in the agents it runs: who is calling
 //   PASEO_AGENT_CWD              set by Paseo: the agent's folder (else the process's cwd)
@@ -28,7 +28,7 @@ const VERSION = '0.1.0';
 /** Revisions that use the initialize handshake, newest first. */
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const FALLBACK_PROTOCOL = '2025-06-18';
-const DEFAULT_URL = 'http://127.0.0.1:8792';
+const DEFAULT_URL = 'http://127.0.0.1:19012';
 const TIMEOUT_MS = 60_000;
 const WAIT_DEFAULT_SECONDS = 45;
 const WAIT_MAX_SECONDS = 120;
@@ -38,7 +38,7 @@ const WAIT_MARGIN_MS = 15_000;
 const HIDDEN_CALLER = '_signalbox_caller';
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const TOKEN = /^[A-Za-z0-9_-]{32,512}$/;
-const SETUP_HINT = 'Ask the user to run deploy/setup-bridge.sh from the Signalbox checkout (as root, with their user name).';
+const SETUP_HINT = 'Ask the user to run deploy/setup-bridge.sh from the Wayroost checkout (as root, with their user name).';
 
 // ---- tools ---------------------------------------------------------------------
 
@@ -73,7 +73,7 @@ const TOOLS = [
     description:
       'Read the latest messages of another chat in your project, oldest first: user messages, assistant replies, ' +
       'one-line tool summaries and notices (long messages are shortened; reasoning is left out). Items with role ' +
-      '"agent" came from another AI agent through Signalbox, not from the user. Only chats in your project can be read.',
+      '"agent" came from another AI agent through Wayroost, not from the user. Only chats in your project can be read.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -132,7 +132,7 @@ const TOOLS = [
     title: 'Wait for a reply',
     description:
       'Wait for another chat in your project to answer you: returns when that chat sends you a message through ' +
-      'Signalbox or finishes its current turn, with what it said. If the result says timed_out, call it again to ' +
+      'Wayroost or finishes its current turn, with what it said. If the result says timed_out, call it again to ' +
       'keep waiting. Use it after send_message when you need the answer before going on.',
     inputSchema: {
       type: 'object',
@@ -208,7 +208,7 @@ const TOOLS = [
 const TOOL_NAMES = new Set(TOOLS.map((t) => t.name));
 
 const INSTRUCTIONS =
-  'Signalbox links the chats working in the same project folder, across Hermes and Paseo. Use list_chats to see ' +
+  'Wayroost links the chats working in the same project folder, across Hermes and Paseo. Use list_chats to see ' +
   'the other chats in your project, read_chat to catch up on one, send_message to ask one of them something, ' +
   'wait_for_reply to wait for its answer, and start_chat to hand a separate task to a new chat. The other chats ' +
   'may be other AI agents, not the user; what you send reaches them labelled as coming from an agent, with a ' +
@@ -222,8 +222,20 @@ function log(message) {
 }
 
 /** A variable's value, unless it's unset, empty or a "${VAR}" placeholder (Hermes leaves unset ones as-is). */
+const warnedEnv = new Set();
 function envValue(name) {
-  const value = process.env[name]?.trim();
+  if (!name.startsWith('SIGNALBOX_')) {
+    const value = process.env[name]?.trim();
+    return !value || /^\$\{[^}]*\}$/.test(value) ? undefined : value;
+  }
+  const suffix = name.replace(/^SIGNALBOX_/, '');
+  const current = `WAYROOST_${suffix}`;
+  const legacy = `SIGNALBOX_${suffix}`;
+  if (process.env[current] === undefined && process.env[legacy] !== undefined && !warnedEnv.has(legacy)) {
+    warnedEnv.add(legacy);
+    process.stderr.write(`Wayroost: ${legacy} is deprecated; use ${current}.\n`);
+  }
+  const value = (process.env[current] ?? process.env[legacy])?.trim();
   if (!value || /^\$\{[^}]*\}$/.test(value)) return undefined;
   return value;
 }
@@ -235,7 +247,7 @@ function isLoopback(hostname) {
 }
 
 function resolveEndpoint() {
-  const raw = process.env.SIGNALBOX_BRIDGE_URL?.trim() || DEFAULT_URL;
+  const raw = envValue('SIGNALBOX_BRIDGE_URL') || DEFAULT_URL;
   let url;
   try {
     url = new URL(raw);
@@ -270,13 +282,13 @@ function readToken() {
     const missing = err?.code === 'ENOENT' || err?.code === 'ENOTDIR';
     return {
       error: missing
-        ? `The Signalbox bridge isn't set up on this machine (there's no token in ${TOKEN_LABEL}). ${SETUP_HINT}`
-        : `The Signalbox bridge isn't set up on this machine (can't read ${TOKEN_LABEL}: ${err?.code ?? 'error'}). ${SETUP_HINT}`,
+        ? `The Wayroost bridge isn't set up on this machine (there's no token in ${TOKEN_LABEL}). ${SETUP_HINT}`
+        : `The Wayroost bridge isn't set up on this machine (can't read ${TOKEN_LABEL}: ${err?.code ?? 'error'}). ${SETUP_HINT}`,
     };
   }
   const token = text.trim();
   if (!TOKEN.test(token)) {
-    return { error: `The Signalbox bridge isn't set up on this machine (${TOKEN_LABEL} doesn't hold a bridge token). ${SETUP_HINT}` };
+    return { error: `The Wayroost bridge isn't set up on this machine (${TOKEN_LABEL} doesn't hold a bridge token). ${SETUP_HINT}` };
   }
   return { token };
 }
@@ -370,14 +382,14 @@ const success = (result) => ({ content: [{ type: 'text', text: render(result) }]
 const failure = (text) => ({ content: [{ type: 'text', text }], isError: true });
 
 function networkError(err, timedOutAfterMs) {
-  if (timedOutAfterMs) return `Signalbox didn't answer within ${timedOutAfterMs / 1000} seconds. Try again later.`;
+  if (timedOutAfterMs) return `Wayroost didn't answer within ${timedOutAfterMs / 1000} seconds. Try again later.`;
   if (err?.code === 'ECONNREFUSED') {
     return (
-      `Signalbox isn't answering at ${endpoint.origin}. It may be stopped, or its bridge may be turned off ` +
+      `Wayroost isn't answering at ${endpoint.origin}. It may be stopped, or its bridge may be turned off ` +
       '("bridge": {"enabled": true} in /etc/signalbox/config.json). Tell the user.'
     );
   }
-  return `Couldn't reach Signalbox at ${endpoint.origin} (${err?.code ?? err?.message ?? 'error'}).`;
+  return `Couldn't reach Wayroost at ${endpoint.origin} (${err?.code ?? err?.message ?? 'error'}).`;
 }
 
 /** How long wait_for_reply asks Signalbox to wait (Signalbox checks the value itself). */
@@ -430,7 +442,7 @@ async function callTool(tool, args, cancel, client) {
     let message =
       typeof answer?.error === 'string' && answer.error.trim()
         ? answer.error.trim()
-        : `Signalbox answered with HTTP ${res.status}.`;
+        : `Wayroost answered with HTTP ${res.status}.`;
     if (res.status === 401) message += ` ${SETUP_HINT}`;
     return failure(message);
   }
@@ -459,7 +471,7 @@ function initialize(params) {
   return {
     protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : FALLBACK_PROTOCOL,
     capabilities: { tools: { listChanged: false } },
-    serverInfo: { name: 'signalbox', title: 'Signalbox', version: VERSION },
+    serverInfo: { name: 'signalbox', title: 'Wayroost', version: VERSION },
     instructions: INSTRUCTIONS,
   };
 }

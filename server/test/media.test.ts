@@ -167,7 +167,7 @@ describe('media route', () => {
     expect(hermes.calls.filter((c) => c.startsWith('image:'))).toHaveLength(1);
 
     // Same API rules as everything else: no marker header, no image.
-    const noMarker = await app.inject({ url: url!, headers: { ...apiHeaders(token), 'x-signalbox-request': '' } });
+    const noMarker = await app.inject({ url: url!, headers: { ...apiHeaders(token), 'x-wayroost-request': '' } });
     expect(noMarker.statusCode).toBe(403);
   });
 

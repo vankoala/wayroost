@@ -12,6 +12,9 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,10 +49,68 @@ class HookTests(unittest.TestCase):
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return str(path)
 
+    def test_shadow_and_unresolved_roles_never_report_or_write_launcher_env(self):
+        target = Path(self.tmp.name) / "launcher-env"
+        data = {"hook_event_name": "SessionStart", "session_id": SID, "cwd": "/home/me/app"}
+        for role_env in ({}, {"WAYROOST_ROLE": "shadow"}, {"WAYROOST_ROLE": "Shadow"},
+                         {"WAYROOST_ROLE": "primary", "WAYROOST_CONFIG": str(Path(self.tmp.name) / "missing")}):
+            with self.subTest(role_env=role_env), mock.patch.dict(os.environ,
+                    {"PASEO_AGENT_ID": AGENT, "CLAUDE_ENV_FILE": str(target), **role_env}, clear=True), \
+                    mock.patch.object(hook, "post") as post, mock.patch("sys.stdin", io.StringIO(json.dumps(data))):
+                hook.main()
+                post.assert_not_called()
+                self.assertFalse(target.exists())
+
+    def test_missing_runtime_copy_exits_zero_without_launcher_write(self):
+        target = Path(self.tmp.name) / HOOK.name
+        shutil.copyfile(HOOK, target)
+        env_file = Path(self.tmp.name) / "launcher-env"
+        result = subprocess.run([sys.executable, "-I", str(target)],
+                                input=json.dumps({"hook_event_name": "SessionStart", "session_id": SID}),
+                                env={"PATH": os.defpath, "WAYROOST_ROLE": "primary", "PASEO_AGENT_ID": AGENT,
+                                     "CLAUDE_ENV_FILE": str(env_file)}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(env_file.exists())
+
+    def test_installed_hook_uses_scoped_primary_config_and_fails_closed(self):
+        target = Path(self.tmp.name) / HOOK.name
+        shutil.copyfile(HOOK, target)
+        shutil.copyfile(HOOK.parent.parent / "helper" / "wayroost_runtime.py", target.with_name("wayroost_runtime.py"))
+        role_config = target.with_name("wayroost-role.json")
+        role_config.write_bytes((HOOK.parent.parent / "deploy" / "primary-role.json").read_bytes())
+        spec = importlib.util.spec_from_file_location("installed_hook_test", target)
+        installed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installed)
+        data = {"hook_event_name": "SessionStart", "session_id": SID, "cwd": "/home/me/app"}
+        for environ, allowed in (({}, True), ({"WAYROOST_ROLE": "shadow"}, False),
+                                 ({"SIGNALBOX_ROLE": "shadow"}, False), ({"WAYROOST_ROLE": "bad"}, False),
+                                 ({"WAYROOST_CONFIG": str(target.parent / "missing")}, False)):
+            env_file = target.parent / "launcher-env"
+            env_file.unlink(missing_ok=True)
+            with self.subTest(environ=environ), mock.patch.dict(os.environ,
+                    {"PASEO_AGENT_ID": AGENT, "CLAUDE_ENV_FILE": str(env_file), **environ}, clear=True), \
+                    mock.patch.object(installed, "post") as post, mock.patch("sys.stdin", io.StringIO(json.dumps(data))):
+                installed.main()
+            self.assertEqual(post.called, allowed)
+            self.assertEqual(env_file.exists(), allowed)
+        for text in ('invalid', '{}', '{"role":"shadow"}'):
+            role_config.write_text(text)
+            with self.subTest(text=text), mock.patch.dict(os.environ, {"PASEO_AGENT_ID": AGENT}, clear=True), \
+                    mock.patch.object(installed, "post") as post, mock.patch("sys.stdin", io.StringIO(json.dumps(data))):
+                installed.main()
+            post.assert_not_called()
+        role_config.unlink()
+        with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": AGENT}, clear=True), \
+                mock.patch.object(installed, "post") as post, mock.patch("sys.stdin", io.StringIO(json.dumps(data))):
+            installed.main()
+        post.assert_not_called()
+
     def run_hook(self, event, env=None, **fields):
         """Run the hook as Claude Code would; returns the bodies it posted and what it printed."""
         data = {"hook_event_name": event, "session_id": SID, "cwd": "/home/me/app", **fields}
         env = {"PASEO_AGENT_ID": AGENT, "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"} if env is None else env
+        env = {"WAYROOST_ROLE": "primary", **env}
         out = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(hook, "post") as post, \
                 mock.patch("sys.stdin", io.StringIO(json.dumps(data))), contextlib.redirect_stdout(out):
@@ -101,7 +162,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(body["candidates"], [{"kind": "hermes", "id": "20260315_101500_c0ffee"}, {"kind": "paseo", "id": AGENT}])
         self.assertEqual((body["cwd"], body["entrypoint"]), ("/home/me/app", "sdk-cli"))
         self.assertIsInstance(body["started_at"], float)
-        self.assertEqual(env_file.read_text(), f"export SIGNALBOX_LAUNCHER=claude:{SID}\n")
+        self.assertEqual(env_file.read_text(), f"export WAYROOST_LAUNCHER=claude:{SID}\nexport SIGNALBOX_LAUNCHER=claude:{SID}\n")
 
     def test_runs_no_agent_launched_are_not_reported(self):
         posted, _ = self.run_hook("SessionStart", env={"CLAUDE_CODE_ENTRYPOINT": "cli"})

@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { EventHub } from '../src/hub.js';
 import { PaseoAdapter } from '../src/paseo/adapter.js';
@@ -49,9 +50,19 @@ function fakeDaemon() {
       return () => {};
     },
     on: () => () => {},
+    observeEvents: () => ({
+      ready: Promise.resolve({ subscriptionId: 'fake-events' }),
+      subscribe: () => () => {},
+      release: async () => {},
+    }),
     connect: async () => statusListener?.({ status: 'connected' }),
     close: async () => {},
     fetchAgents: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
+    observeAgents: () => ({
+      ready: client.fetchAgents().then((page) => ({ ...page, subscriptionId: 'fake-agents' })),
+      subscribe: () => () => {},
+      release: async () => {},
+    }),
     getLastServerInfoMessage: () => null,
     getProvidersSnapshot: async () => ({
       requestId: 'p',
@@ -78,13 +89,30 @@ function fakeDaemon() {
 
 async function connected() {
   const daemon = fakeDaemon();
-  const adapter = new PaseoAdapter('ws://127.0.0.1:6777', new EventHub(), quietLog, 'cid_test', () => daemon.client as never);
+  const adapter = new PaseoAdapter('ws://127.0.0.1:19007', new EventHub(), quietLog, 'cid_test', () => daemon.client as never, new BackgroundGate('primary'));
+  adapter.useConfigWriter({ setCloudAgentEnabled: async (id, enabled) => { await daemon.client.patchDaemonConfig({ providers: { [id]: { enabled } } }); } });
   adapter.start();
   await expect.poll(() => adapter.status().state).toBe('connected');
   return { adapter, daemon };
 }
 
 describe('PaseoAdapter: cloud agents', () => {
+  it('refuses an uncoordinated config patch when the owner helper is unavailable', async () => {
+    const { adapter, daemon } = await connected();
+    adapter.useConfigWriter(undefined);
+    await expect(adapter.setCloudAgentEnabled('codex', false)).rejects.toMatchObject({ status: 424 });
+    expect(daemon.patches).toEqual([]);
+    expect(daemon.refreshed).toEqual([]);
+  });
+
+  it('preserves the unavailable-helper response and does not patch or refresh the daemon', async () => {
+    const { adapter, daemon } = await connected();
+    adapter.useConfigWriter({ setCloudAgentEnabled: async () => { throw new UserFacingError('Demo helper unavailable.', 424); } });
+    await expect(adapter.setCloudAgentEnabled('codex', false)).rejects.toMatchObject({ status: 424 });
+    expect(daemon.patches).toEqual([]);
+    expect(daemon.refreshed).toEqual([]);
+  });
+
   it('reports each cloud agent as Paseo has it', async () => {
     const { adapter } = await connected();
     const { agents } = await adapter.cloudAgents();
@@ -171,7 +199,7 @@ describe('app: /api/cloud-agents', () => {
     expect((await put(app, 'codex', { enabled: false }, { host, origin: ORIGIN, 'content-type': 'application/json' })).statusCode).toBe(401);
     // Signed in, but not from our own page (no request marker, another origin).
     const crossSite = { ...postHeaders(token), origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' };
-    delete (crossSite as Record<string, string>)['x-signalbox-request'];
+    delete (crossSite as Record<string, string>)['x-wayroost-request'];
     expect((await put(app, 'codex', { enabled: false }, crossSite)).statusCode).toBe(403);
     expect(paseo.calls.filter((c) => c.startsWith('cloud:'))).toEqual([]);
     await app.close();

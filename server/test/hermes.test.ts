@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -70,6 +71,12 @@ describe('hermes normalization', () => {
     expect(b.options.map((o) => o.id)).toEqual(['once', 'session', 'always', 'deny']);
   });
 
+  it('marks a permission detail as the command it is, whatever the description says', () => {
+    const a = permissionApproval('srq-3', 's1', { description: 'Read file', command: '/tmp/erase.sh' }, 0);
+    expect(a).toMatchObject({ title: 'Read file', detail: '/tmp/erase.sh', detailKind: 'command' });
+    expect(permissionApproval('srq-4', 's1', { tool_name: 'browser' }, 0).detailKind).toBeUndefined();
+  });
+
   it('maps clarify picks to the answer strings Hermes expects', () => {
     const [single] = clarifyQuestions({ question: 'Which branch?', choices: ['main', 'dev'] });
     expect(clarifyAnswer(single!, { optionId: '1' })).toBe('dev');
@@ -104,7 +111,7 @@ describe('hermes adapter against a protocol-faithful fake dashboard', () => {
     const client = hub.add(socket as never, 'owner@example.com');
     hub.subscribe(client, 'hermes', FakeHermes.stored);
     stateDir = mkdtempSync(join(tmpdir(), 'sb-hermes-'));
-    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog);
+    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { background: new BackgroundGate('primary') });
   });
 
   afterEach(async () => {

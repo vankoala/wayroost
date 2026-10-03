@@ -1,3 +1,4 @@
+import { checkDeviceSignal, deviceSignal, actionSignal } from '../security/device-signal.js';
 import type { HermesCredentials } from '../secrets.js';
 
 // Signs in to the Hermes dashboard the way its own clients do: password login
@@ -10,6 +11,7 @@ export class HermesAuthError extends Error {
   constructor(
     message: string,
     readonly kind: HermesAuthErrorKind,
+    readonly status?: number,
   ) {
     super(message);
   }
@@ -59,20 +61,22 @@ export class HermesAuth {
   }
 
   /** Verify a username/password pair and adopt the resulting session. */
-  async login(explicit?: HermesCredentials): Promise<void> {
+  async login(explicit?: HermesCredentials, signal = deviceSignal()): Promise<void> {
     const creds = explicit ?? this.credentials();
     if (!creds) throw new HermesAuthError('Sign in to Hermes in Settings.', 'no_credentials');
 
     let res: Response;
     try {
+      checkDeviceSignal(signal);
       res = await fetch(`${this.baseUrl}/auth/password-login`, {
         method: 'POST',
         redirect: 'manual',
         headers: { 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify({ provider: 'basic', username: creds.username, password: creds.password, next: '' }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: actionSignal(AbortSignal.timeout(REQUEST_TIMEOUT_MS), signal),
       });
     } catch {
+      checkDeviceSignal(signal);
       throw new HermesAuthError("Can't reach the Hermes dashboard.", 'unavailable');
     }
     if (res.status === 401 || res.status === 422) {
@@ -85,9 +89,12 @@ export class HermesAuth {
 
     const { access, refresh } = parseSessionCookies(res.headers.getSetCookie());
     if (!access || !refresh) throw new HermesAuthError('Hermes sign-in returned no session.', 'unavailable');
+    checkDeviceSignal(signal);
     this.accessToken = access;
     this.refreshToken = refresh;
-    this.expiresAt = await this.lookupExpiry(access);
+    const expiry = await this.lookupExpiry(access, signal);
+    checkDeviceSignal(signal);
+    this.expiresAt = expiry;
   }
 
   /** A currently valid access token, refreshing or signing in again as needed. */
@@ -101,14 +108,18 @@ export class HermesAuth {
   }
 
   /** fetch() against the dashboard with auth; retries once after a 401. */
-  async fetch(path: string, init: RequestInit = {}): Promise<Response> {
-    const send = async () =>
-      fetch(`${this.baseUrl}${path}`, {
+  async fetch(path: string, init: RequestInit = {}, signal = deviceSignal()): Promise<Response> {
+    const send = async () => {
+      checkDeviceSignal(signal);
+      const token = await this.token();
+      checkDeviceSignal(signal);
+      return fetch(`${this.baseUrl}${path}`, {
         ...init,
         redirect: 'manual',
-        headers: { accept: 'application/json', ...init.headers, authorization: `Bearer ${await this.token()}` },
-        signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        headers: { accept: 'application/json', ...init.headers, authorization: `Bearer ${token}` },
+        signal: actionSignal(init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS), signal),
       });
+    };
     let res = await send();
     if (res.status === 401) {
       this.accessToken = undefined; // force refresh / re-login
@@ -117,9 +128,9 @@ export class HermesAuth {
     return res;
   }
 
-  async json<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const res = await this.fetch(path, init);
-    if (!res.ok) throw new HermesAuthError(`Hermes request failed (${res.status}).`, 'unavailable');
+  async json<T>(path: string, init: RequestInit = {}, signal = deviceSignal()): Promise<T> {
+    const res = await this.fetch(path, init, signal);
+    if (!res.ok) throw new HermesAuthError(`Hermes request failed (${res.status}).`, 'unavailable', res.status);
     return (await res.json()) as T;
   }
 
@@ -127,13 +138,15 @@ export class HermesAuth {
     if (this.refreshToken) {
       let res: Response;
       try {
+        checkDeviceSignal();
         res = await fetch(`${this.baseUrl}/auth/native/refresh`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', accept: 'application/json' },
           body: JSON.stringify({ refresh_token: this.refreshToken, provider: 'basic' }),
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          signal: actionSignal(AbortSignal.timeout(REQUEST_TIMEOUT_MS)),
         });
       } catch {
+        checkDeviceSignal();
         // Hermes is unreachable: retry later rather than sending the password
         // to whatever might be listening on its port.
         throw new HermesAuthError("Can't reach the Hermes dashboard.", 'unavailable');
@@ -145,6 +158,7 @@ export class HermesAuth {
           expires_at?: number;
         };
         if (body.access_token && body.refresh_token) {
+          checkDeviceSignal();
           this.accessToken = body.access_token;
           this.refreshToken = body.refresh_token;
           this.expiresAt = body.expires_at ? body.expires_at * 1000 : Date.now() + FALLBACK_TTL_MS;
@@ -159,17 +173,19 @@ export class HermesAuth {
     await this.login();
   }
 
-  private async lookupExpiry(token: string): Promise<number> {
+  private async lookupExpiry(token: string, signal = deviceSignal()): Promise<number> {
     try {
+      checkDeviceSignal(signal);
       const res = await fetch(`${this.baseUrl}/api/auth/me`, {
         headers: { accept: 'application/json', authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: actionSignal(AbortSignal.timeout(REQUEST_TIMEOUT_MS), signal),
       });
       if (res.ok) {
         const me = (await res.json()) as { expires_at?: number };
         if (typeof me.expires_at === 'number') return me.expires_at * 1000;
       }
     } catch {
+      checkDeviceSignal(signal);
       // use the fallback below
     }
     return Date.now() + FALLBACK_TTL_MS;

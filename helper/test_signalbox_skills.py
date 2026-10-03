@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import signalbox_skills as S  # noqa: E402
+from wayroost_runtime import BackgroundGate
 
 
 def write_skill(root: Path, name: str, body: str = "Body.", platforms: str = "", extra: dict | None = None) -> Path:
@@ -49,7 +50,7 @@ class Base(unittest.TestCase):
             return {"verdict": self.verdict, "findings": []}
 
         return S.SkillsService(places, self.hermes / "signalbox-skills", self.hermes, scan=scan,
-                               clock=lambda: self.now[0])
+                               clock=lambda: self.now[0], background=BackgroundGate("primary"))
 
     def tick(self, svc, seconds=60):
         self.now[0] += seconds

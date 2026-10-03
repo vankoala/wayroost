@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,7 +27,7 @@ describe('hermes "/" commands', () => {
   });
 
   it('refuses commands that switch safeguards off', () => {
-    expect(blockedReason({ name: 'yolo', arg: '' })).toMatch(/can't be run from Signalbox/);
+    expect(blockedReason({ name: 'yolo', arg: '' })).toMatch(/can't be run from Wayroost/);
     expect(blockedReason({ name: 'approve', arg: 'all' })).toMatch(/approval/);
     expect(blockedReason({ name: 'approvals', arg: '' })).toBeNull(); // just shows the mode
     expect(blockedReason({ name: 'approvals', arg: 'off' })).toMatch(/\/approvals off/);
@@ -149,7 +150,7 @@ describe('hermes adapter: attachments and commands', () => {
     hub.subscribe(client, 'hermes', '20260927_090000_bbbbbb');
     const stateDir = mkdtempSync(join(tmpdir(), 'sb-hermes-'));
     new SecretStore(stateDir).writeHermes(FAKE_USER);
-    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { commandWaitMs: 300 });
+    adapter = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { background: new BackgroundGate('primary'), commandWaitMs: 300 });
     adapter.start();
     await expect.poll(() => adapter.status().state).toBe('connected');
   });

@@ -1,6 +1,8 @@
 // Contract between the signalbox server and the browser. Both Hermes and
 // Paseo are normalized into these shapes so the UI treats them the same way.
 
+import type { ActionSummary, SupervisorStatus } from './supervisor.js';
+
 export type Source = 'hermes' | 'paseo';
 export const SOURCES: readonly Source[] = ['hermes', 'paseo'];
 
@@ -188,6 +190,19 @@ export interface Approval {
   detail?: string;
   /** The detail was too long to send in full; the UI won't allow approving from here. */
   detailTruncated?: boolean;
+  /**
+   * Permissions only: what the detail is, when the backend says so (Hermes'
+   * command, Paseo's structured tool detail). 'other' is a detail of another
+   * kind (a search, a plan, plain text). Absent when the backend doesn't say.
+   */
+  detailKind?: 'command' | 'edit' | 'write' | 'read' | 'fetch' | 'other';
+  /**
+   * Edit, write and read permissions: the file's whole path, exactly as the
+   * backend gives it. The detail starts with it too, but a path can hold a
+   * line break, so where the path ends can't be read back from the detail.
+   * Absent when the backend gives no path, or one too long to send.
+   */
+  filePath?: string;
   options: ApprovalOption[];
   /** Questions only: a typed answer is accepted. */
   allowText?: boolean;
@@ -207,6 +222,8 @@ export interface ApprovalAnswer {
 }
 
 export interface ConversationDetail {
+  /** Shadow reads need a deliberate open before backend activation. */
+  needsOpen?: boolean;
   conversation: ConversationSummary;
   items: TimelineItem[];
   approvals: Approval[];
@@ -214,7 +231,8 @@ export interface ConversationDetail {
 
 /** Server → browser messages on /ws. */
 export type ServerEvent =
-  | { type: 'hello'; email: string; statuses: SourceStatus[] }
+  /** `email`: the Cloudflare Access identity, when the request came through Access. `device`: the paired device. */
+  | { type: 'hello'; email?: string; device?: DeviceInfo; statuses: SourceStatus[] }
   | { type: 'source_status'; status: SourceStatus }
   | { type: 'conversation_upsert'; conversation: ConversationSummary }
   | { type: 'conversation_removed'; source: Source; id: string }
@@ -235,6 +253,12 @@ export type ServerEvent =
   | { type: 'feed_upsert'; card: FeedCard }
   | { type: 'feed_removed'; id: string }
   | { type: 'skills_changed' }
+  /** Status & power: what the supervisor says about the PC. */
+  | { type: 'power_status'; power: PowerStatus }
+  /** The lifecycle action the supervisor is running changed state (queued, running, done…). */
+  | { type: 'power_action'; action: ActionSummary }
+  /** One progress line from the running action ("Main model loading…"). */
+  | { type: 'power_line'; actionId: string; line: string }
   | { type: 'pong' };
 
 /** Browser → server messages on /ws. */
@@ -274,23 +298,87 @@ export interface VoiceStatus {
   available: boolean;
   /** Voices replies can be read in (Kokoro names, e.g. af_heart). */
   voices: string[];
-  /** The voice in use everywhere: the one picked in Settings → Voice, else the service's default. */
+  /** The shared local voice, also used when cloud output fails. */
   defaultVoice: string;
+  appReadAloud?: import('./voice.js').AppVoice;
+  cloud?: { available: boolean; voices: import('./voice.js').CloudVoice[]; models: import('./voice.js').CloudModel[]; error?: import('./voice.js').CloudVoiceErrorCode };
+  canChange?: boolean;
 }
 
-/** PUT /api/voice: the shared voice was saved; whether Hermes Phone took it too. */
+/** PUT /api/voice: shared local voice and/or app provider saved. */
 export interface VoiceSaveResult extends VoiceStatus {
-  /** updated: calls use it from the next one; failed: the phone line refused or is down; off: no phone line. */
+  /** Whether the shared local voice reached the phone and car lines. */
   calls: 'updated' | 'failed' | 'off';
   callsMessage?: string;
 }
 
 export interface MeResponse {
-  email: string;
+  /** The Cloudflare Access identity, when the request came through Access. */
+  email?: string;
+  /** The paired device making the request (absent only when device sign-in is turned off). */
+  device?: DeviceInfo;
   statuses: SourceStatus[];
 }
 
+export interface Capabilities {
+  tasks: boolean;
+}
+
+// ---- Device pairing (sign-in) ------------------------------------------------
+//
+// Every browser and the desktop app sign in as a paired device: a cookie holding
+// the device id and a 256-bit secret the server keeps only a hash of. A device
+// pairs once with a single-use code from a paired desktop or the PC itself.
+
+export const DEVICE_KINDS = ['desktop', 'phone'] as const;
+export type DeviceKind = (typeof DEVICE_KINDS)[number];
+
+/**
+ * What a device may do. A desktop can do everything; a phone confirms power
+ * actions with a second tap and can only read settings that belong to the PC.
+ */
+export type DeviceScope = 'chats' | 'settings' | 'pc-settings' | 'power' | 'power-confirm' | 'devices';
+
+export interface DeviceInfo {
+  id: string;
+  name: string;
+  kind: DeviceKind;
+  scopes: DeviceScope[];
+  /** Epoch ms. */
+  created: number;
+  /** Epoch ms; updated at most hourly. */
+  lastSeen: number;
+}
+
+/** GET /api/devices */
+export interface DeviceList {
+  devices: DeviceInfo[];
+  /** The device asking, if it's paired. */
+  currentId: string | null;
+  /** Too many wrong codes: pairing stays off until a paired desktop unlocks it. */
+  pairingLocked: boolean;
+}
+
+/** POST /api/pair/offer: a single-use code, shown as a QR of `url` (the code rides in the fragment). */
+export interface PairOffer {
+  code: string;
+  url: string;
+  kind: DeviceKind;
+  /** Epoch ms. */
+  expiresAt: number;
+}
+
+/** POST /api/pair */
+export interface PairResult {
+  device: DeviceInfo;
+}
+
+/** The page a pairing link opens; the code follows in the URL fragment, which never reaches a server. */
+export const PAIR_PATH = '/pair';
+
 export interface ListResponse {
+  role?: 'primary' | 'shadow';
+  notifications?: boolean;
   conversations: ConversationSummary[];
   approvals: Approval[];
   statuses: SourceStatus[];
@@ -415,6 +503,50 @@ export interface SafetyCommandsStatus {
   commands: string[];
 }
 
+// ---- Worker updates (the task log) ----
+
+/** Time boxes (minutes) a worker can get when it doesn't name its own. */
+export const WORKER_TIME_BOXES = [15, 30, 45, 60, 90, 120, 180, 240] as const;
+
+/**
+ * Settings → Project bridge → "Worker updates": Signalbox tells the Hermes chat
+ * that started a Paseo worker when the worker finishes, fails, stops, waits on
+ * you, or runs past its time box. On by default.
+ */
+export interface WorkerUpdatesStatus {
+  enabled: boolean;
+  /** The time box for a worker that doesn't set signalbox.due-minutes. */
+  defaultMinutes: number;
+  timeBoxes: number[];
+}
+
+/** Read-only task ledger entries for the Tasks page. */
+export interface TaskSummary {
+  id: string;
+  title: string;
+  role: 'manager' | 'coder-lead' | 'worker' | 'reviewer' | 'agent';
+  status: 'running' | 'needs-approval' | 'finished' | 'failed' | 'stopped';
+  chat: string;
+  verified: boolean;
+  linkReason?: string;
+  dueAt: number;
+  overdue: boolean;
+  updatedAt: number;
+  relays: Array<{
+    id: string;
+    kind: 'update' | 'overdue';
+    queuedAt?: number;
+    deliveredAt?: number;
+    held?: string;
+    skipped?: string;
+    failures: number;
+  }>;
+}
+
+export interface TaskList {
+  tasks: TaskSummary[];
+}
+
 // ---- Cloud agents (which agents on cloud models may be started at all) ----
 
 /**
@@ -491,6 +623,7 @@ export interface ScheduleTools {
 }
 
 export interface ScheduleJob {
+  inactiveReason?: string;
   source: ScheduleSource;
   id: string;
   /** The job's own name in Hermes/Paseo ("news-digest") — what Edit changes. */
@@ -598,7 +731,13 @@ export interface PhoneStatus {
   running: boolean;
   ok: boolean;
   pinSet: boolean;
+  /**
+   * Not running because the line is off (nothing listens on its port), so no call
+   * is up. Missing while not running: the helper couldn't tell (no answer in time).
+   */
+  off?: boolean;
   ownerNumber?: string | null;
+  /** Calls up now, when the line said; missing is unknown, not zero. */
   activeCalls?: number;
   totalCalls?: number;
   publicHost?: string | null;
@@ -688,6 +827,8 @@ export interface TriggerTarget {
 }
 
 export interface Trigger {
+  inactiveReason?: string;
+  role?: 'shadow' | 'primary';
   id: string;
   name: string;
   /** The Gmail search it watches, e.g. "from:bookclub.example.org". */
@@ -816,8 +957,20 @@ export const SLASH_COMMAND_RE = /^\/[^\s/]*(?:\s|$)/;
 export const WS_CLOSE_SESSION_EXPIRED = 4401;
 /** Close code for the periodic re-authentication: reconnect right away (through Access). */
 export const WS_CLOSE_REAUTH = 4000;
+/** Close code when the device was revoked (or its pairing ended): sign in again by pairing. */
+export const WS_CLOSE_DEVICE_REVOKED = 4403;
 /** Every API request must carry this header; browsers can't add it cross-site without CORS. */
-export const REQUEST_MARKER_HEADER = 'x-signalbox-request';
+export const REQUEST_MARKER_HEADER = 'x-wayroost-request';
+/** Signalbox's name for the same header, still accepted during M1. */
+export const LEGACY_REQUEST_MARKER_HEADER = 'x-signalbox-request';
+/**
+ * The desktop app adds this header (value DESKTOP_APP_HEADER_VALUE) to every
+ * request it makes. On a local http:// origin the server pairs and signs in
+ * only requests that carry it: a browser keeps one cookie jar for every port
+ * on 127.0.0.1, so a device cookie there would reach any local web server.
+ */
+export const DESKTOP_APP_HEADER = 'x-wayroost-app';
+export const DESKTOP_APP_HEADER_VALUE = 'desktop';
 
 // ---- For you (Hermes' pulse) -------------------------------------------------------
 //
@@ -887,3 +1040,45 @@ export interface FeedActionResult {
   card: FeedCard;
   chat?: { source: Source; id: string };
 }
+
+// ---- Status & power (the supervisor) ---------------------------------------------
+//
+// The supervisor (shared/supervisor.ts) is the only thing that starts and stops
+// services on the PC. This server watches it over a Unix socket, caches what it
+// says, and answers for the phone: every power action from a phone needs a
+// confirm tap first. The desktop app reports presence (active/idle/locked) so
+// later releases can route alerts by it; M1 only records and shows it. Who asks
+// is always a paired device (DeviceKind above).
+
+export const PRESENCE_STATES = ['active', 'idle', 'locked'] as const;
+export type PresenceState = (typeof PRESENCE_STATES)[number];
+
+/** The last report from one device, kept in memory only. */
+export interface DevicePresence {
+  /** The paired device that reported it (its id). */
+  device: string;
+  kind: DeviceKind;
+  state: PresenceState;
+  /** Epoch ms of that report. */
+  at: number;
+}
+
+/** GET /api/power, and the payload pushed as `power_status`. */
+export interface PowerStatus {
+  /** False means the supervisor isn't answering: `sentence` says so in plain words. */
+  running: boolean;
+  /** The supervisor's latest snapshot; absent while it isn't running. */
+  status?: SupervisorStatus;
+  /** One plain line for the status block: the supervisor's own sentence, or "isn't running". */
+  sentence: string;
+  /** The latest report from every device that has sent one, newest first. */
+  presence: DevicePresence[];
+}
+
+/**
+ * Reply to POST /api/power/actions (always 202). A phone's first call gets
+ * `confirm` (a single-use token) and `summary` (one plain sentence to tap);
+ * everything else gets the action the supervisor accepted. A 409 means another
+ * lifecycle action is already running.
+ */
+export type PowerActionResponse = { confirm: string; summary: string } | { action: ActionSummary };

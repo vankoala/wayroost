@@ -1,9 +1,11 @@
+import { checkDeviceSignal } from './security/device-signal.js';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ConversationSummary, Source } from '../../shared/protocol.js';
 import type { Logger } from './hermes/adapter.js';
 import type { StartedBy } from './sources.js';
+import type { BackgroundGate } from './background.js';
 
 // Who started what, for the runs neither backend links by itself: Hermes chats an
 // agent started from a shell (`hermes chat --oneshot`), `claude -p` runs, and the
@@ -80,8 +82,9 @@ export class Lineage {
 
   constructor(
     private readonly dir: string | null,
-    private readonly log?: Logger,
+    private readonly log: Logger | undefined,
     private readonly now: () => number = Date.now,
+    private readonly background: BackgroundGate,
   ) {
     if (!dir) return;
     try {
@@ -110,13 +113,14 @@ export class Lineage {
 
   /** A Hermes chat started by an agent from a shell, with the launchers its environment named. */
   noteLaunch(hermesId: string, candidates: Candidate[], startedAt: number): void {
-    if (!candidates.length) return;
+    if (!this.background.run(() => true) || !candidates.length) return;
     this.data.launches[hermesId] = { candidates, startedAt, reportedAt: this.now() };
     this.changed({ kind: 'launch', hermesId });
   }
 
   /** One event of a Claude Code run: its start (with its launchers), its task, or its end with the final answer. */
   noteRun(sessionId: string, event: 'start' | 'prompt' | 'stop' | 'end', fields: Partial<Omit<RunRecord, 'status' | 'updatedAt'>> & { error?: boolean }): void {
+    if (!this.background.run(() => true)) return;
     const at = this.now();
     const existing = this.data.runs[sessionId];
     if (!existing && event !== 'start' && !fields.candidates?.length) return; // never saw it start with a launcher
@@ -140,6 +144,7 @@ export class Lineage {
   }
 
   setStartedBy(key: string, value: StartedBy): void {
+    if (!this.background.run(() => true)) return;
     this.data.startedBy[key] = { ...value, at: this.now() };
     this.scheduleSave();
   }
@@ -219,7 +224,9 @@ export class Lineage {
 
   /** Write now (also used at shutdown and by tests). Oldest entries go first when a table is full. */
   save(): void {
-    if (!this.dir) return;
+    if (!this.background.run(() => true) || !this.dir) return;
+    clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
     const cutoff = this.now() - MAX_AGE_MS;
     const trim = <T>(table: Record<string, T>, max: number, at: (v: T) => number) =>
       Object.fromEntries(
@@ -235,6 +242,7 @@ export class Lineage {
       startedBy: trim(this.data.startedBy, MAX_STARTED_BY, (v) => v.at),
     };
     try {
+      checkDeviceSignal();
       mkdirSync(this.dir, { recursive: true, mode: 0o700 });
       const path = join(this.dir, FILE);
       const tmp = `${path}.${process.pid}.tmp`;

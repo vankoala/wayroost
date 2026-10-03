@@ -82,7 +82,7 @@ export function ForYouSheet({ onClose, onSettings }: { onClose: () => void; onSe
       {feed === null ? (
         <div className="feed-empty">
           <Sparkles size={22} />
-          <p>For you isn't turned on for this Signalbox.</p>
+          <p>For you isn't turned on for this Wayroost.</p>
         </div>
       ) : cards.length === 0 ? (
         <div className="feed-empty">

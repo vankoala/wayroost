@@ -227,12 +227,30 @@ async function signalbox(handler: Handler): Promise<Fake> {
 // ---- tests ------------------------------------------------------------------------------
 
 describe('signalbox-bridge.mjs over stdio', () => {
+  it('prefers Wayroost bridge variables while retaining backend identity variables', async () => {
+    const fake = await signalbox(() => ok({ chats: [] }));
+    const tokenPath = join(home, 'wayroost-fake-token');
+    writeFileSync(tokenPath, TOKEN);
+    const client = start({
+      WAYROOST_BRIDGE_URL: fake.url,
+      SIGNALBOX_BRIDGE_URL: 'http://127.0.0.1:9',
+      WAYROOST_BRIDGE_TOKEN_FILE: tokenPath,
+      SIGNALBOX_BRIDGE_TOKEN_FILE: join(home, 'fake-missing-token'),
+      PASEO_AGENT_ID: 'fake-agent', PASEO_AGENT_CWD: '/home/me/code/demo',
+    });
+    await client.initialize();
+    expect((await client.call('list_chats', {})).isError).not.toBe(true);
+    expect(fake.seen[0]?.headers['x-bridge-paseo-agent']).toBe('fake-agent');
+    expect(fake.seen[0]?.headers['x-bridge-cwd']).toBe('/home/me/code/demo');
+    expect(client.stderr).not.toContain('deprecated');
+  });
+
   it('answers initialize, ping and tools/list', async () => {
     const client = start({ SIGNALBOX_BRIDGE_URL: 'http://127.0.0.1:9' });
     const init = await client.initialize('2025-06-18');
     expect(init.result.protocolVersion).toBe('2025-06-18');
     expect(init.result.capabilities).toEqual({ tools: { listChanged: false } });
-    expect(init.result.serverInfo).toMatchObject({ name: 'signalbox', version: VERSION });
+    expect(init.result.serverInfo).toMatchObject({ name: 'signalbox', title: 'Wayroost', version: VERSION });
     expect(init.result.instructions).toMatch(/other AI agents/);
     expect(init.result.instructions).toMatch(/approvals always stay with the user/);
 
@@ -284,7 +302,7 @@ describe('signalbox-bridge.mjs over stdio', () => {
     expect(send).toMatch(/To get the answer, call wait_for_reply, or look later with read_chat/);
     expect(send).toMatch(/came with a reply address, reply with send_message to that chat/);
     const wait = tool('wait_for_reply').description as string;
-    expect(wait).toMatch(/sends you a message through Signalbox or finishes its current turn/);
+    expect(wait).toMatch(/sends you a message through Wayroost or finishes its current turn/);
     expect(wait).toMatch(/If the result says timed_out, call it again/);
     expect(init.result.instructions).toMatch(/wait_for_reply/);
     expect(init.result.instructions).toMatch(/reply address, answer with send_message to that chat/);
@@ -365,7 +383,7 @@ describe('signalbox-bridge.mjs over stdio', () => {
     expect(fake.seen[0]!.body).toEqual({ backend_hint: 'hermes' });
   });
 
-  it('waits for a reply through Signalbox and passes its answer through', async () => {
+  it('waits for a reply through Wayroost and passes its answer through', async () => {
     const replied = { from: 'paseo:abc', kind: 'reply', text: 'Done: 3 tests fixed.' };
     const timedOut = { from: 'paseo:abc', kind: 'timed_out', status: 'working', note: 'Still working. Call wait_for_reply again.' };
     const fake = await signalbox(async (_tool, body) => {
@@ -428,12 +446,12 @@ describe('signalbox-bridge.mjs over stdio', () => {
     expect(fake.seen[0]!.headers['x-bridge-cwd']).toBe('%2Fhome%2Fme%2Fproj%C3%A9t%201');
   });
 
-  it("maps Signalbox's refusals to tool errors with its message", async () => {
+  it("maps Wayroost's refusals to tool errors with its message", async () => {
     const fake = await signalbox((tool, body) => {
       if (tool === 'send_message') return refused(429, 'This chat has sent too many messages. Try again in a few minutes.');
       if (tool === 'read_chat') return refused(403, "That chat isn't in this project.");
       if (tool === 'start_chat') return { status: 500, raw: '<html>oops</html>' };
-      return refused(503, `The user paused the Signalbox bridge. ${JSON.stringify(body)}`);
+      return refused(503, `The user paused the Wayroost bridge. ${JSON.stringify(body)}`);
     });
     const client = start({ SIGNALBOX_BRIDGE_URL: fake.url });
     await client.initialize();
@@ -448,10 +466,10 @@ describe('signalbox-bridge.mjs over stdio', () => {
 
     const broken = await client.call('start_chat', { backend: 'hermes', text: 'hi' });
     expect(broken.isError).toBe(true);
-    expect(text(broken)).toBe('Signalbox answered with HTTP 500.');
+    expect(text(broken)).toBe('Wayroost answered with HTTP 500.');
 
     const paused = await client.call('list_chats', {});
-    expect(text(paused)).toBe('The user paused the Signalbox bridge. {}');
+    expect(text(paused)).toBe('The user paused the Wayroost bridge. {}');
   });
 
   it('re-reads a replaced token after a 401, and otherwise explains how to fix it', async () => {
@@ -460,13 +478,13 @@ describe('signalbox-bridge.mjs over stdio', () => {
     const newToken = randomBytes(32).toString('base64url');
     writeFileSync(tokenFile, `${oldToken}\n`, { mode: 0o600 });
     const fake = await signalbox((_tool, _body, req) =>
-      req.headers.authorization === `Bearer ${newToken}` ? ok({ chats: [] }) : refused(401, "Signalbox didn't accept the bridge token."),
+      req.headers.authorization === `Bearer ${newToken}` ? ok({ chats: [] }) : refused(401, "Wayroost didn't accept the bridge token."),
     );
     const client = start({ SIGNALBOX_BRIDGE_URL: fake.url, SIGNALBOX_BRIDGE_TOKEN_FILE: tokenFile });
 
     const denied = await client.call('list_chats', {});
     expect(denied.isError).toBe(true);
-    expect(text(denied)).toMatch(/^Signalbox didn't accept the bridge token\. .*setup-bridge\.sh/);
+    expect(text(denied)).toMatch(/^Wayroost didn't accept the bridge token\. .*setup-bridge\.sh/);
     expect(fake.seen).toHaveLength(1);
 
     writeFileSync(tokenFile, newToken);
@@ -479,7 +497,7 @@ describe('signalbox-bridge.mjs over stdio', () => {
     }
   });
 
-  it("says the bridge isn't set up when there is no token, without calling Signalbox", async () => {
+  it("says the bridge isn't set up when there is no token, without calling Wayroost", async () => {
     const fake = await signalbox(() => ok({}));
     writeFileSync(join(home, 'junk-token'), 'not a token\n');
     for (const tokenFile of [join(home, 'no-such-token'), join(home, 'junk-token')]) {
@@ -489,7 +507,7 @@ describe('signalbox-bridge.mjs over stdio', () => {
       expect((await client.request('tools/list')).result.tools).toHaveLength(5);
       const answer = await client.call('list_chats', {});
       expect(answer.isError).toBe(true);
-      expect(text(answer)).toMatch(/^The Signalbox bridge isn't set up on this machine .*setup-bridge\.sh/);
+      expect(text(answer)).toMatch(/^The Wayroost bridge isn't set up on this machine .*setup-bridge\.sh/);
       expect(text(answer)).toContain(tokenFile);
       expect(client.stderr).toMatch(/isn't set up/);
     }
@@ -510,8 +528,8 @@ describe('signalbox-bridge.mjs over stdio', () => {
   it('refuses a bridge URL that is not on this machine', async () => {
     const fake = await signalbox(() => ok({ chats: [] }));
     const refusedUrls: Array<[string, RegExp]> = [
-      ['http://192.0.2.10:8792', /must point at this machine .*not 192\.0\.2\.10/],
-      ['http://example.com:8792', /must point at this machine .*not example\.com/],
+      ['http://192.0.2.10:19012', /must point at this machine .*not 192\.0\.2\.10/],
+      ['http://example.com:19012', /must point at this machine .*not example\.com/],
       [`http://127.0.0.1.example.com:${fake.port}`, /must point at this machine/],
       [`https://127.0.0.1:${fake.port}`, /must be an http:\/\/ address/],
       [`http://me:secret@127.0.0.1:${fake.port}`, /can't carry a user name or password/],
@@ -531,14 +549,14 @@ describe('signalbox-bridge.mjs over stdio', () => {
     expect(fake.seen[0]!.headers.host).toBe(`localhost:${fake.port}`);
   });
 
-  it("says so when Signalbox isn't running", async () => {
+  it("says so when Wayroost isn't running", async () => {
     const fake = await fakeServer(() => ok({}));
     const port = fake.port;
     await fake.close();
     const client = start({ SIGNALBOX_BRIDGE_URL: `http://127.0.0.1:${port}` });
     const answer = await client.call('list_chats', {});
     expect(answer.isError).toBe(true);
-    expect(text(answer)).toMatch(new RegExp(`^Signalbox isn't answering at http://127\\.0\\.0\\.1:${port}`));
+    expect(text(answer)).toMatch(new RegExp(`^Wayroost isn't answering at http://127\\.0\\.0\\.1:${port}`));
   });
 
   it('never goes through a proxy, even with NODE_USE_ENV_PROXY', async () => {
@@ -582,7 +600,7 @@ describe('signalbox-bridge.mjs over stdio', () => {
     const client = start({ SIGNALBOX_BRIDGE_URL: fake.url });
     await client.initialize();
     client.write(JSON.stringify({ jsonrpc: '2.0', id: 50, method: 'tools/call', params: { name: 'read_chat', arguments: { chat: 'paseo:x' } } }));
-    await until(() => fake.seen.length === 1, 'the call to reach Signalbox');
+    await until(() => fake.seen.length === 1, 'the call to reach Wayroost');
     client.notify('notifications/cancelled', { requestId: 50, reason: 'user interrupted' });
     expect((await client.request('ping', undefined, 51)).result).toEqual({});
     await until(() => fake.seen[0]!.aborted, 'the wrapper to hang up');
@@ -624,7 +642,7 @@ describe('signalbox-bridge.mjs over stdio', () => {
     expect(batch.map((m) => m.id)).toEqual(['b1', 'b2']);
   });
 
-  it('hangs up on Signalbox when the client goes away, so a held wait is dropped', async () => {
+  it('hangs up on Wayroost when the client goes away, so a held wait is dropped', async () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => {
       release = resolve;
@@ -636,7 +654,7 @@ describe('signalbox-bridge.mjs over stdio', () => {
     const client = new Client({ PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, SIGNALBOX_BRIDGE_URL: fake.url }, cwd);
     try {
       client.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'wait_for_reply', arguments: { chat: 'paseo:x', timeout_seconds: 120 } } }));
-      await until(() => fake.seen.length === 1, 'the wait to reach Signalbox');
+      await until(() => fake.seen.length === 1, 'the wait to reach Wayroost');
       expect(await client.close()).toBe(0); // well before the wait would end
       await until(() => fake.seen[0]!.aborted, 'the wrapper to hang up');
       expect(client.lines).toEqual([]);

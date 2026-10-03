@@ -1,3 +1,4 @@
+import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -211,7 +212,7 @@ describe('hermes secret prompts against the fake dashboard', () => {
   });
 
   async function connect(secretPrompts: boolean): Promise<HermesAdapter> {
-    const connected = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { secretPrompts });
+    const connected = new HermesAdapter(fake.url, hub, new SecretStore(stateDir), quietLog, { background: new BackgroundGate('primary'), secretPrompts });
     adapter = connected;
     connected.start();
     await expect.poll(() => connected.status().state).toBe('connected');
@@ -496,14 +497,14 @@ describe('answering a secret card through the API', () => {
     const adapterLogs: string[] = [];
     const capture = (level: string) => (obj: object, msg?: string) => void adapterLogs.push(JSON.stringify({ level, msg, ...obj }));
     const log: Logger = { info: capture('info'), warn: capture('warn'), error: capture('error') };
-    const adapter = new HermesAdapter(fake.url, hub, new SecretStore(config.stateDir), log, { secretPrompts: true });
+    const adapter = new HermesAdapter(fake.url, hub, new SecretStore(config.stateDir), log, { background: new BackgroundGate('primary'), secretPrompts: true });
 
     // Everything Fastify would log, at its most verbose level.
     const serverLogs: string[] = [];
     const app = await buildApp({
       config,
       hub,
-      verifier: createAccessVerifier({ ...config.access, keySource: keys.keySource }),
+      verifier: createAccessVerifier({ ...config.access!, keySource: keys.keySource }),
       sources: { hermes: adapter, paseo: new FakePaseo() },
       logger: { level: 'trace', stream: { write: (line: string) => void serverLogs.push(line) } },
     });

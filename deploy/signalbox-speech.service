@@ -1,5 +1,5 @@
 [Unit]
-Description=Signalbox speech service (speech-to-text and text-to-speech on the CPU, for voice mode)
+Description=Wayroost speech service (speech-to-text and text-to-speech on the CPU, for voice mode)
 Documentation=file:///opt/signalbox/README.md
 Requires=signalbox-speech.socket
 After=signalbox-speech.socket

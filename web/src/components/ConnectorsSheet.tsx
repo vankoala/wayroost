@@ -55,7 +55,7 @@ type Dialog =
   | { kind: 'disconnect'; connector: Connector };
 
 /** Settings → Connectors: the services Hermes can use for you, and mail triggers. */
-export function ConnectorsSheet({ onClose }: { onClose: () => void }) {
+export function ConnectorsSheet({ onClose, as = 'sheet' }: { onClose: () => void; as?: 'sheet' | 'page' }) {
   const [list, setList] = useState<ConnectorList | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loads, setLoads] = useState(0);
@@ -96,10 +96,10 @@ export function ConnectorsSheet({ onClose }: { onClose: () => void }) {
   const google = list?.connectors.find((c) => c.id === 'google');
 
   return (
-    <Sheet title="Connectors" onClose={onClose} wide>
+    <Sheet title="Connectors" onClose={onClose} wide as={as}>
       <p className="muted connectors-intro">
         Let Hermes use your apps. You sign in on each service's own page; the keys stay with Hermes on your PC, never
-        in Signalbox or on your phone.
+        in Wayroost or on your phone.
       </p>
       {error ? (
         <p className="error-text">{error}</p>
@@ -506,7 +506,7 @@ function GoogleDialog({ connector, onClose, onConnected }: { connector: Connecto
 
 // ---- Triggers --------------------------------------------------------------------
 
-const EXAMPLES = ['from:bookclub.example.org', 'subject:invoice', 'from:boss@company.com is:important'];
+const EXAMPLES = ['from:bookclub.example.org', 'subject:invoice', 'from:boss@example.com is:important'];
 
 function TriggersSection({ googleConnected }: { googleConnected: boolean }) {
   const [data, setData] = useState<TriggerList | null>(null);
@@ -589,6 +589,7 @@ function TriggersSection({ googleConnected }: { googleConnected: boolean }) {
                       <Mail size={12} /> {t.query || 'Gmail'} · every {t.every} min · {targetLabel(t.deliver)}
                     </div>
                     {t.action && <div className="muted trigger-action">{t.action}</div>}
+                    {t.inactiveReason && <div className="muted">{t.inactiveReason}</div>}
                     {t.tools && (
                       <div className={`muted trigger-tools${toolsCaution(t.tools) ? ' tools-full-text' : ''}`}>
                         {toolsCaution(t.tools) && <TriangleAlert size={12} />} Can use: {toolsLabel(t.tools)}
@@ -604,7 +605,7 @@ function TriggersSection({ googleConnected }: { googleConnected: boolean }) {
                     aria-checked={!t.paused}
                     aria-label={`${t.name} on`}
                     onClick={() => togglePause(t)}
-                    disabled={busy !== null}
+                    disabled={busy !== null || (t.paused && t.role !== 'primary')}
                   />
                   <button
                     type="button"

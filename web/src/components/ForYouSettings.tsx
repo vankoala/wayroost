@@ -4,6 +4,7 @@ import type { FeedSettings, ProactivityLevel } from '../../../shared/protocol';
 import { api } from '../api';
 import { disablePush, enablePush, pushState, type PushState } from '../push';
 import { toast } from '../store';
+import { SettingsTiming } from './SettingsTiming';
 
 const LEVELS: Array<{ id: ProactivityLevel; label: string; help: string }> = [
   { id: 'off', label: 'Off', help: 'No brief and no daytime checks' },
@@ -22,7 +23,7 @@ const timeLabel = (hhmm: string) => {
 };
 
 const PUSH_HELP: Record<PushState, string> = {
-  'needs-install': 'On iPhone, add Signalbox to your Home Screen first (Share, then Add to Home Screen), and turn this on there.',
+  'needs-install': 'On iPhone, add Wayroost to your Home Screen first (Share, then Add to Home Screen), and turn this on there.',
   unsupported: "This browser can't show notifications.",
   denied: 'Blocked for this site in the browser settings. Allow notifications there, then come back.',
   off: 'When an agent waits on you, and (if you like) new For-you cards.',
@@ -108,6 +109,7 @@ export function ForYouSettings() {
           <div className="grow">
             <div>How often Hermes speaks up</div>
             <div className="muted">{level.help}</div>
+            <SettingsTiming timing="now" />
           </div>
           {spinner('level')}
           <select
@@ -141,6 +143,7 @@ export function ForYouSettings() {
                 ? `No For-you notifications from ${timeLabel(quiet.start)} to ${timeLabel(quiet.end)}`
                 : 'For-you notifications any time'}
             </div>
+            <SettingsTiming timing="now" />
           </div>
           {spinner('quiet')}
           <button
@@ -155,6 +158,7 @@ export function ForYouSettings() {
         </div>
         {quiet && (
           <div className="kv quiet-times">
+            <SettingsTiming timing="now" />
             <span className="muted">From</span>
             <select
               value={quiet.start}
@@ -190,6 +194,7 @@ export function ForYouSettings() {
             <div className="grow">
               <div>Notifications on this device</div>
               <div className="muted">{PUSH_HELP[push]}</div>
+              <SettingsTiming timing="now" />
             </div>
             {spinner('phone')}
             {(push === 'on' || push === 'off') && (
@@ -214,6 +219,7 @@ export function ForYouSettings() {
                 <div className="muted">
                   Approvals and questions, quiet hours or not. The command itself is never in the notification.
                 </div>
+                <SettingsTiming timing="now" />
               </div>
               <button
                 type="button"
@@ -230,6 +236,7 @@ export function ForYouSettings() {
               <div className="grow">
                 <div>New For-you cards</div>
                 <div className="muted">The brief already comes on WhatsApp, so this starts off.</div>
+                <SettingsTiming timing="now" />
               </div>
               <button
                 type="button"
@@ -259,6 +266,7 @@ export function ForYouSettings() {
             <div className="grow">
               <div>Less like this</div>
               <div className="muted">Hermes skips these topics. Tap × to bring one back.</div>
+              <SettingsTiming timing="now" />
               <div className="less-like-list">
                 {settings.lessLike.map((l) => (
                   <span key={l.topic} className="less-like-chip" title={`For example: ${l.example}`}>

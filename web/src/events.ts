@@ -1,6 +1,13 @@
-import { WS_CLOSE_REAUTH, WS_CLOSE_SESSION_EXPIRED, type ServerEvent, type Source, type VoiceEvent } from '../../shared/protocol';
+import {
+  WS_CLOSE_REAUTH,
+  type ServerEvent,
+  type Source,
+  type VoiceEvent,
+} from '../../shared/protocol';
 import { loadConversation, loadFeed, refreshList } from './api';
-import { applyEvent, setState } from './store';
+import { markAuthenticationLost } from './authentication';
+import { applyPowerEvent } from './power';
+import { applyEvent, authenticationBlocked, getAuthenticationGeneration, onStoreChange, setState } from './store';
 
 // One WebSocket for live updates. It reconnects with backoff, resyncs the
 // inbox and the open conversation after every reconnect (events may have been
@@ -17,7 +24,21 @@ let watching: { source: Source; id: string } | null = null;
 let stopped = false;
 let voiceListener: ((event: VoiceEvent | { type: 'socket_closed' }) => void) | null = null;
 
+let wasBlocked = authenticationBlocked();
+onStoreChange(() => {
+  if (!authenticationBlocked()) {
+    if (wasBlocked) { wasBlocked = false; connect(); }
+    return;
+  }
+  wasBlocked = true;
+  clearTimeout(retryTimer); retryTimer = undefined;
+  clearInterval(pingTimer);
+  const previous = socket; socket = null;
+  previous?.close();
+});
+
 function send(message: object) {
+  if (authenticationBlocked()) return;
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
 
@@ -29,7 +50,7 @@ export function onVoiceEvent(listener: typeof voiceListener): void {
 }
 
 export function socketOpen(): boolean {
-  return socket?.readyState === WebSocket.OPEN;
+  return !authenticationBlocked() && socket?.readyState === WebSocket.OPEN;
 }
 
 export function sendVoiceControl(message: { type: 'voice_start' | 'voice_cancel'; run: number }): boolean {
@@ -49,7 +70,8 @@ export function sendVoiceAudio(run: number, pcm?: ArrayBuffer): boolean {
 }
 
 function scheduleReconnect() {
-  if (stopped || retryTimer) return;
+  // An unpaired browser can't connect: wait for the pairing page instead of retrying.
+  if (stopped || retryTimer || authenticationBlocked()) return;
   const delay = Math.min(MAX_BACKOFF_MS, 500 * 2 ** attempts) * (0.75 + Math.random() * 0.5);
   attempts += 1;
   retryTimer = setTimeout(() => {
@@ -59,13 +81,16 @@ function scheduleReconnect() {
 }
 
 export function connect(): void {
-  if (stopped || socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
+  if (stopped || authenticationBlocked() || socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
   setState((s) => ({ ...s, socket: 'connecting' }));
   const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const ws = new WebSocket(url);
   socket = ws;
+  const generation = getAuthenticationGeneration();
+  const current = () => socket === ws && generation === getAuthenticationGeneration() && !authenticationBlocked();
 
   ws.onopen = () => {
+    if (!current()) return;
     attempts = 0;
     setState((s) => ({ ...s, socket: 'open' }));
     clearInterval(pingTimer);
@@ -79,25 +104,27 @@ export function connect(): void {
   };
 
   ws.onmessage = (message) => {
+    if (!current()) return;
     try {
       const event = JSON.parse(String(message.data)) as ServerEvent;
       if (event.type === 'voice') voiceListener?.(event);
+      else if (event.type === 'power_status' || event.type === 'power_action' || event.type === 'power_line') applyPowerEvent(event);
       else applyEvent(event);
     } catch {
-      // Ignore malformed frames.
+      window.wayroostTray?.anomaly?.();
     }
   };
 
+  ws.onerror = () => {};
+
   ws.onclose = (event) => {
-    if (socket !== ws) return;
+    if (!current()) return;
     socket = null;
     voiceListener?.({ type: 'socket_closed' });
     clearInterval(pingTimer);
     setState((s) => ({ ...s, socket: 'closed' }));
-    if (event.code === WS_CLOSE_SESSION_EXPIRED) {
-      setState((s) => ({ ...s, sessionExpired: true }));
-      return;
-    }
+    if (window.wayroostTray?.socketClosed && (event.code === 4401 || event.code === 4403)) { window.wayroostTray.socketClosed(event.code); return; }
+    if (markAuthenticationLost({ code: event.code })) return;
     if (event.code === WS_CLOSE_REAUTH) {
       // Routine re-authentication: reconnect through Cloudflare Access right away.
       attempts = 0;

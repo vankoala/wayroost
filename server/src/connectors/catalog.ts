@@ -71,7 +71,7 @@ export const CATALOG: readonly CatalogEntry[] = [
     'building',
     'Your Cloudflare account (DNS, Workers, Access and more)',
     ['Read and change anything the account you sign in with can'],
-    'Signalbox itself is protected by Cloudflare Access. Grant only the permissions you need when Cloudflare asks, and keep this on "Ask before changes".',
+    'Wayroost itself is protected by Cloudflare Access. Grant only the permissions you need when Cloudflare asks, and keep this on "Ask before changes".',
   ),
   {
     ...signIn('hugging_face', 'Hugging Face', 'building', 'Search models, datasets, Spaces and papers (no account needed)', [

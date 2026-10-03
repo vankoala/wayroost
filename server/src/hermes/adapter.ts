@@ -1,5 +1,7 @@
+import { checkDeviceSignal, deviceSignal, withDeviceSignal } from '../security/device-signal.js';
 import { randomBytes } from 'node:crypto';
 import { posix } from 'node:path';
+import { z } from 'zod';
 import type {
   Approval,
   ApprovalAnswer,
@@ -28,6 +30,7 @@ import { MAX_MEDIA_BYTES, readCapped, type MediaFile } from '../media.js';
 import type { SecretStore } from '../secrets.js';
 import {
   UserFacingError,
+  transientFailure,
   eachThread,
   type CreateResult,
   type HermesCreateOptions,
@@ -67,6 +70,8 @@ import {
 } from './normalize.js';
 import { isDelegateRun, resolveSubagents, subagentSummary, type SubagentEntry } from './subagents.js';
 import type { Lineage } from '../lineage.js';
+import type { BackgroundGate } from '../background.js';
+import { ChatIdentity } from './identity.js';
 
 export interface Logger {
   info(obj: object, msg?: string): void;
@@ -86,6 +91,11 @@ interface ResumeSnapshot {
   /** A cold resume after a crash: Hermes scheduled the lost turn to re-run (session_auto_continue.py). */
   auto_continue?: { attempt?: number; interrupted_at?: number } | null;
 }
+
+type AttachmentFrame = { event: GatewayEvent } | {
+  request: Pick<ServerRequest, 'id' | 'method' | 'params'>;
+  generation: number | null;
+};
 
 /** What `session.info` last said about a chat's model and context. */
 interface SessionSettings {
@@ -285,9 +295,15 @@ export class HermesAdapter implements HermesSource {
   private statusValue: SourceStatus = { source: 'hermes', state: 'connecting' };
   private readonly rows = new Map<string, HermesSessionRow>();
   private readonly activeByStored = new Map<string, string>();
+  private activityRevision = 0;
+  private latestActivityPoll = 0;
+  private activityPoll?: { revision: number; attachmentGeneration: number; result: Promise<Set<string> | undefined> };
+  private readonly activityRevisions = new Map<string, number>();
   private readonly runtimeByStored = new Map<string, string>();
   private readonly storedByRuntime = new Map<string, string>();
   private readonly attaching = new Map<string, Promise<string>>();
+  private readonly attachmentFrames = new Map<string, AttachmentFrame[]>();
+  private attachmentGeneration = 0;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly turns = new Map<string, LiveTurn>();
   private readonly watched = new Set<string>();
@@ -297,7 +313,8 @@ export class HermesAdapter implements HermesSource {
   /** Recent "/" command output per conversation; Hermes doesn't store it. */
   private readonly commandItems = new Map<string, CommandItem[]>();
   /** Old stored id → the id the chat continues under. */
-  private readonly movedTo = new Map<string, string>();
+  readonly chatIdentity: ChatIdentity;
+  private readonly movedTo: Map<string, string>;
   /** Stored id → the chat that started it through the bridge. */
   private readonly startedBy = new Map<string, StartedBy>();
   private commandSeq = 0;
@@ -332,7 +349,10 @@ export class HermesAdapter implements HermesSource {
     private readonly secrets: SecretStore,
     private readonly log: Logger,
     private readonly options: {
+      background: BackgroundGate;
       commandWaitMs?: number;
+      /** Durable chat movement reports, also used by the task relay. A shadow keeps them in memory only. */
+      stateDir?: string;
       /** How often to ask Hermes which chats are live while a browser is connected (tests). */
       activePollMs?: number;
       /** Turn Hermes' password prompts into cards the phone can answer (config `hermes.secretPrompts`). */
@@ -341,8 +361,11 @@ export class HermesAdapter implements HermesSource {
       lineage?: Lineage;
       /** Settings → Security → "Hermes safety commands": let /yolo, /approve, /debug and the like through. */
       allowSafetyCommands?: () => boolean;
-    } = {},
+    },
   ) {
+    // The file only matters to the completion relay, which runs only in primary: a shadow writes none.
+    this.chatIdentity = new ChatIdentity(options.background.run(() => options.stateDir) ?? null);
+    this.movedTo = this.chatIdentity.moves;
     this.auth = new HermesAuth(baseUrl, () => secrets.readHermes());
     options.lineage?.setStartLookup('hermes', (id) => {
       const started = this.rows.get(id)?.started_at;
@@ -354,7 +377,7 @@ export class HermesAdapter implements HermesSource {
       if (this.rows.has(change.hermesId)) this.publishSummary(change.hermesId);
       this.scheduleListRefresh();
     });
-    this.gateway = new HermesGateway(baseUrl, this.auth);
+    this.gateway = new HermesGateway(baseUrl, this.auth, options.background);
     this.gateway.on('state', (state) => this.onGatewayState(state));
     this.gateway.on('ready', () => void this.onReady());
     this.gateway.on('event', (event) => this.onEvent(event));
@@ -372,7 +395,7 @@ export class HermesAdapter implements HermesSource {
   /** Reload MCP tools in Hermes' chats after a connector changes (the same as /reload-mcp now). */
   async reloadTools(): Promise<void> {
     if (!this.auth.hasCredentials()) return;
-    await this.gateway.call('reload.mcp', { confirm: true }, 60_000);
+    await this.call('reload.mcp', { confirm: true }, 60_000);
   }
 
   // ---- lifecycle ------------------------------------------------------------
@@ -410,6 +433,7 @@ export class HermesAdapter implements HermesSource {
   }
 
   private onGatewayState(state: string): void {
+    if (state !== 'ready') this.attachmentFrames.clear();
     if (this.statusValue.state === 'needs_credentials') return;
     if (state === 'connecting') this.setStatus('connecting');
     else if (state === 'closed') this.setStatus('disconnected', 'Reconnecting to Hermes…');
@@ -432,6 +456,7 @@ export class HermesAdapter implements HermesSource {
   private async onReady(): Promise<void> {
     this.setStatus('connected');
     // Attachments belonged to the previous socket.
+    this.attachmentGeneration++;
     this.runtimeByStored.clear();
     this.storedByRuntime.clear();
     this.catalogs.clear();
@@ -456,8 +481,8 @@ export class HermesAdapter implements HermesSource {
       try {
         data = await this.auth.json<{ sessions?: HermesSessionRow[] }>(LIST_QUERY);
       } catch (err) {
-        if (err instanceof HermesAuthError) this.onFailure(err);
-        throw err;
+        if (err instanceof HermesAuthError && (err.status === undefined || err.status === 503)) this.onFailure(err);
+        throw this.userError(err);
       }
       for (const row of data.sessions ?? []) {
         this.rows.set(row.id, row);
@@ -546,27 +571,27 @@ export class HermesAdapter implements HermesSource {
    * whole compression lineage. With a folder, also the older chats Hermes has
    * there that the inbox doesn't list.
    */
-  async archiveThreads(ids: string[], folder?: FolderScope): Promise<ThreadActionResult> {
+  async archiveThreads(ids: string[], folder?: FolderScope, signal = deviceSignal()): Promise<ThreadActionResult> {
     const archive = async (id: string) => {
-      await this.patchSession(id, { archived: true });
+      await this.patchSession(id, { archived: true }, signal);
       this.dropFromList(id);
     };
-    const result = await eachThread('hermes', ids, archive);
+    const result = await eachThread('hermes', ids, archive, signal);
     if (folder) {
       const listed = new Set(ids);
       const older = (await this.chatsIn(folder)).filter((id) => !listed.has(id));
-      const swept = await eachThread('hermes', older, archive);
+      const swept = await eachThread('hermes', older, archive, signal);
       result.done += swept.done;
       result.failed.push(...swept.failed);
     }
     return result;
   }
 
-  async restoreThreads(ids: string[]): Promise<ThreadActionResult> {
+  async restoreThreads(ids: string[], signal = deviceSignal()): Promise<ThreadActionResult> {
     const result = await eachThread('hermes', ids, async (id) => {
-      await this.patchSession(id, { archived: false });
+      await this.patchSession(id, { archived: false }, signal);
       this.tidied.delete(id);
-    });
+    }, signal);
     this.scheduleListRefresh(0);
     return result;
   }
@@ -575,15 +600,17 @@ export class HermesAdapter implements HermesSource {
    * Delete chats for good: every id of a compressed chat's lineage, each taking
    * its delegate_task runs along. Archived first, so no part of it shows meanwhile.
    */
-  async deleteThreads(ids: string[]): Promise<ThreadActionResult> {
+  async deleteThreads(ids: string[], signal = deviceSignal()): Promise<ThreadActionResult> {
     return eachThread('hermes', ids, async (id) => {
       const lineage = await this.lineageOf(id);
-      await this.patchSession(id, { archived: true });
+      checkDeviceSignal(signal);
+      await this.patchSession(id, { archived: true }, signal);
       this.dropFromList(id);
       for (const member of [id, ...lineage.filter((m) => m !== id)]) {
-        await this.auth.json(`/api/sessions/${encodeURIComponent(member)}`, { method: 'DELETE' });
+        checkDeviceSignal(signal);
+        await this.auth.json(`/api/sessions/${encodeURIComponent(member)}`, { method: 'DELETE' }, signal);
       }
-    });
+    }, signal);
   }
 
   async listArchived(limit: number): Promise<ArchivedThread[]> {
@@ -655,12 +682,12 @@ export class HermesAdapter implements HermesSource {
     return row?._lineage_ids ?? [];
   }
 
-  private patchSession(id: string, change: { archived: boolean }): Promise<unknown> {
+  private patchSession(id: string, change: { archived: boolean }, signal = deviceSignal()): Promise<unknown> {
     return this.auth.json(`/api/sessions/${encodeURIComponent(id)}`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(change),
-    });
+    }, signal);
   }
 
   /** Take an archived or deleted chat, and the runs folded under it, out of the inbox now. */
@@ -684,6 +711,59 @@ export class HermesAdapter implements HermesSource {
 
   private approvalsFor(stored: string): Approval[] {
     return this.listApprovals().filter((a) => a.conversationId === stored);
+  }
+
+  /** Follow explicit compression reports without relying on a recent-chat listing. */
+  resolveChat(stored: string): string {
+    return this.chatIdentity.resolve(stored);
+  }
+
+  /** A missed compression is held until Hermes' session row confirms the listed continuation. */
+  async resolveListedChat(stored: string, list: readonly ConversationSummary[]): Promise<string> {
+    const current = this.resolveChat(stored);
+    const candidates = list.filter((c) => c.id !== current && c.aliases?.some((a) => a.source === 'hermes' && a.id === current));
+    if (!candidates.length) return current;
+    if (candidates.length !== 1) throw new UserFacingError('Hermes recipient identity is awaiting confirmation.', 503);
+    let row: HermesSessionRow;
+    try {
+      row = await this.auth.json<HermesSessionRow>(`/api/sessions/${encodeURIComponent(candidates[0]!.id)}`);
+    } catch (err) { throw this.userError(err); }
+    const ids = row._lineage_ids;
+    if (row.id !== candidates[0]!.id || !Array.isArray(ids) || ids.at(-1) !== row.id || !ids.includes(current) ||
+        new Set(ids).size !== ids.length || !ids.every((id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id))) {
+      throw new UserFacingError('Hermes recipient identity is awaiting confirmation.', 503);
+    }
+    // Persist authoritative compression lineage before any relay can use it.
+    this.chatIdentity.recordLineage(ids);
+    this.rows.set(row.id, row);
+    return this.resolveChat(stored);
+  }
+
+  /** The current chat's live readiness, including chats omitted from the recent list. */
+  summaryOf(stored: string): ConversationSummary | undefined {
+    if (this.statusValue.state === 'needs_credentials') return undefined;
+    const current = this.resolveChat(stored);
+    const active = this.activeByStored.get(current);
+    if (!['idle', 'waiting', 'working', 'starting', 'streaming', 'resuming'].includes(active ?? '') &&
+        !this.turns.has(current) && !this.approvalsFor(current).length) return undefined;
+    return this.summaryFor(current);
+  }
+
+  async deliverySummary(stored: string): Promise<ConversationSummary | undefined> {
+    this.requireReady();
+    const current = this.resolveChat(stored);
+    // An omitted delegate must be classified before a resume can make it look writable.
+    if (await this.isSubagent(current, true)) return undefined;
+    // Known busy chats need no attachment; idle or unknown ones need a live snapshot.
+    const known = this.summaryOf(current);
+    if (known && (known.status !== 'idle' || known.pendingApprovals)) return known;
+    try {
+      // A queued delivery attaches to establish readiness. Only the bridge delivers, and only a primary runs it.
+      await this.ensureAttached(current, 'act');
+      if (this.resolveChat(stored) !== current) return undefined;
+      if (!this.summaryOf(current)) await this.refreshActive();
+      return this.summaryOf(current);
+    } catch (err) { throw this.userError(err); }
   }
 
   private summaryFor(stored: string): ConversationSummary {
@@ -731,6 +811,12 @@ export class HermesAdapter implements HermesSource {
     }, delay);
   }
 
+  // No activeTurns() count: /api/status normalizes missing or invalid runtime counts
+  // to zero, and gateway_running=false also covers failed identity probes. Neither
+  // it nor session.active_list establishes host-wide activity: independent desktop
+  // backends have their own session registries. busy.ts keeps an unavailable count
+  // unknown until Hermes offers authoritative evidence covering every backend.
+
   /**
    * What Hermes' live sessions are doing. Also the safety net for cards: a
    * session Hermes calls idle, or doesn't list (it restarted, or the session
@@ -739,14 +825,45 @@ export class HermesAdapter implements HermesSource {
    * isn't live, which could restart a turn Hermes lost in a crash. Returns the
    * stored ids of the live sessions, or undefined when Hermes didn't answer.
    */
-  private async refreshActive(): Promise<Set<string> | undefined> {
+  private refreshActive(): Promise<Set<string> | undefined> {
+    const revision = ++this.activityRevision;
+    this.latestActivityPoll = revision;
+    const attachmentGeneration = this.attachmentGeneration;
+    const result = this.readActive(revision);
+    this.activityPoll = { revision, attachmentGeneration, result };
+    return result;
+  }
+
+  private async readActive(revision: number): Promise<Set<string> | undefined> {
     // Only cards and turns from before asking: one that starts meanwhile may postdate the answer.
     const earlier = [...this.pending.keys()];
     const turnsBefore = new Map(this.turns);
+    const attachmentGeneration = this.attachmentGeneration;
+    const gatewayGeneration = this.gateway.generation;
+    for (const stored of new Set([...this.activityRevisions.keys(), ...this.activeByStored.keys(),
+      ...this.runtimeByStored.keys(), ...this.turns.keys(), ...[...this.pending.values()].map((entry) => entry.approval.conversationId)])) {
+      this.activityRevisions.set(stored, revision);
+    }
+    const current = (stored: string) => this.activityRevisions.get(stored) === revision ||
+      (!this.activityRevisions.has(stored) && this.latestActivityPoll === revision);
     let result: { sessions?: Array<{ id?: string; session_key?: string; status?: string }> };
     try {
-      result = await this.gateway.call('session.active_list', {}, 15_000);
+      result = await this.call('session.active_list', {}, 15_000);
     } catch {
+      return undefined;
+    }
+    // A retired runtime cannot restore readiness or clear the replacement's cards and turn.
+    if (attachmentGeneration !== this.attachmentGeneration || gatewayGeneration !== this.gateway.generation ||
+        this.gateway.state !== 'ready' || this.attaching.size > 0) return undefined;
+    try {
+      for (const session of result.sessions ?? []) {
+        const stored = session.session_key;
+        if (!stored) continue;
+        const runtime = this.runtimeByStored.get(stored);
+        if (this.resolveChat(stored) !== stored || (runtime && runtime !== session.id)) return undefined;
+      }
+    } catch (err) {
+      this.log.warn({ err: err instanceof Error ? err.message : String(err) }, "couldn't confirm Hermes activity identity");
       return undefined;
     }
     const seen = new Set<string>();
@@ -754,7 +871,8 @@ export class HermesAdapter implements HermesSource {
     const notIdle = new Set<string>();
     for (const s of result.sessions ?? []) {
       const stored = s.session_key;
-      if (!stored) continue;
+      if (!stored || !current(stored)) continue;
+      this.activityRevisions.set(stored, revision);
       seen.add(stored);
       const active = s.status !== 'idle';
       if (active) {
@@ -762,30 +880,36 @@ export class HermesAdapter implements HermesSource {
         if (s.id) notIdle.add(s.id);
       }
       if (this.activeByStored.get(stored) !== s.status) {
-        this.activeByStored.set(stored, s.status ?? 'idle');
+        if (s.status) this.activeByStored.set(stored, s.status);
+        else this.activeByStored.delete(stored);
         this.publishSummary(stored);
       }
       // Listed means live, so attaching is a warm resume. Attach to chats open on a phone (to
       // stream), chats waiting on you (started elsewhere, e.g. the desktop app), and live chats
       // whose cards need checking against a snapshot (after a reconnect).
       const wanted = this.watched.has(stored) || (active && (s.status === 'waiting' || this.approvalsFor(stored).length > 0));
-      if (wanted && !this.runtimeByStored.has(stored)) void this.ensureAttached(stored).catch(() => {});
+      if (wanted && !this.runtimeByStored.has(stored)) {
+        this.options.background.run(() => {
+          void this.ensureAttached(stored).catch(() => {});
+        });
+      }
     }
     for (const stored of [...this.activeByStored.keys()]) {
-      if (!seen.has(stored)) {
+      if (current(stored) && !seen.has(stored)) {
         this.activeByStored.delete(stored);
         this.publishSummary(stored);
       }
     }
     for (const id of earlier) {
       const entry = this.pending.get(id);
-      if (!entry) continue;
+      if (!entry || !current(entry.approval.conversationId)) continue;
       const runtime = this.runtimeByStored.get(entry.approval.conversationId);
       if (!notIdle.has(entry.approval.conversationId) && !(runtime && notIdle.has(runtime))) this.removePending(id);
     }
     // Same for a turn we saw start: if Hermes shows the chat idle or doesn't list it (it was
     // killed mid-turn), no message.complete will come; close the turn, or it stays "running".
     for (const [stored, turn] of turnsBefore) {
+      if (!current(stored)) continue;
       if (this.turns.get(stored) !== turn) continue;
       const runtime = this.runtimeByStored.get(stored);
       if (notIdle.has(stored) || (runtime && notIdle.has(runtime))) continue;
@@ -794,6 +918,11 @@ export class HermesAdapter implements HermesSource {
       this.publishSummary(stored);
     }
     return seen;
+  }
+
+  /** New submissions and gateway activity invalidate older polls for this chat. */
+  private noteActivity(stored: string): void {
+    this.activityRevisions.set(stored, ++this.activityRevision);
   }
 
   /**
@@ -806,8 +935,28 @@ export class HermesAdapter implements HermesSource {
     const runtime = this.runtimeByStored.get(stored);
     if (runtime) return runtime;
     if (this.gateway.state !== 'ready') return undefined;
-    const live = await this.refreshActive();
-    return live?.has(stored) ? this.ensureAttached(stored) : undefined;
+    const generation = this.gateway.generation;
+    void this.refreshActive();
+    let poll = this.activityPoll!;
+    for (;;) {
+      const live = await poll.result;
+      if (this.gateway.state !== 'ready' || generation !== this.gateway.generation) return undefined;
+      const attached = this.runtimeByStored.get(stored);
+      if (attached) return attached;
+      // Keep this call's open intent while a newer poll owns live membership.
+      // Joining its read does not give background polling permission to attach.
+      if (this.activityPoll !== poll) { poll = this.activityPoll!; continue; }
+      if (poll.attachmentGeneration !== this.attachmentGeneration || this.attaching.size > 0) {
+        // Another chat's resume invalidated this read. Keep the open pending until
+        // attachments settle, then verify membership again before resuming this chat.
+        await Promise.allSettled([...this.attaching.values()]);
+        if (this.gateway.state !== 'ready' || generation !== this.gateway.generation) return undefined;
+        if (this.activityPoll === poll) void this.refreshActive();
+        poll = this.activityPoll!;
+        continue;
+      }
+      return live?.has(stored) && this.activityRevisions.get(stored) === poll.revision ? this.ensureAttached(stored) : undefined;
+    }
   }
 
   /** Soon after a turn ends or a session stops, check what Hermes still has open. */
@@ -821,7 +970,7 @@ export class HermesAdapter implements HermesSource {
 
   // ---- one conversation -----------------------------------------------------
 
-  async getConversation(stored: string): Promise<ConversationDetail> {
+  async getConversation(stored: string, deliberateOpen = false): Promise<ConversationDetail> {
     this.requireCredentials();
     const [page] = await Promise.all([
       this.auth
@@ -835,34 +984,41 @@ export class HermesAdapter implements HermesSource {
         }),
       // History comes from the REST API, which only reads. Attach just to stream, and only if
       // live; never to a sub-agent's run (it's never live on its own anyway).
-      this.subagents.has(stored) || this.delegateRuns.has(stored) ? undefined : this.attachIfLive(stored).catch(() => undefined),
+      this.subagents.has(stored) || this.delegateRuns.has(stored) ? undefined
+        : deliberateOpen ? this.attachIfLive(stored).catch(() => undefined)
+        : this.options.background.run(() => this.attachIfLive(stored).catch(() => undefined)),
       this.rows.has(stored) ? undefined : this.loadRow(stored),
     ]);
     const items = mergeByTime(messagesToItems(page.messages ?? []), this.commandItems.get(stored) ?? []);
     const turn = this.turns.get(stored);
     if (turn?.reasoningId) items.push({ kind: 'reasoning', id: turn.reasoningId, text: turn.reasoningText, streaming: true });
     if (turn?.assistantId) items.push({ kind: 'assistant', id: turn.assistantId, text: turn.assistantText, streaming: true });
-    return { conversation: this.summaryFor(stored), items, approvals: this.approvalsFor(stored) };
+    return { conversation: this.summaryFor(stored), items, approvals: this.approvalsFor(stored),
+      ...(this.options.background.role === 'shadow' ? { needsOpen: !this.runtimeByStored.has(stored) && !this.subagents.has(stored) && !this.delegateRuns.has(stored) } : {}) };
   }
 
-  private async loadRow(stored: string): Promise<void> {
+  private async loadRow(stored: string, required = false): Promise<void> {
     try {
       const row = await this.auth.json<HermesSessionRow>(`/api/sessions/${encodeURIComponent(stored)}`);
-      if (!row?.id) return;
+      if (!row?.id || (required && row.id !== stored)) {
+        if (required) throw new UserFacingError('Hermes recipient identity is unknown.', 503);
+        return;
+      }
       // Only the detail row says whether a chat is a delegate_task run; keep just that of its config.
       if (isDelegateRun(row)) this.delegateRuns.add(row.id);
       const { model_config: _config, ...rest } = row;
       this.rows.set(row.id, rest);
-    } catch {
+    } catch (err) {
+      if (required) throw this.userError(err);
       // title falls back to "New chat"
     }
   }
 
   /** A delegate_task run: the parent's agent runs it, so it's read-only here. */
-  private async isSubagent(stored: string): Promise<boolean> {
+  private async isSubagent(stored: string, forDelivery = false): Promise<boolean> {
     if (this.subagents.has(stored) || this.delegateRuns.has(stored)) return true;
-    if (this.listCache?.ids.includes(stored) || this.runtimeByStored.has(stored)) return false;
-    if (!this.rows.has(stored)) await this.loadRow(stored);
+    if (this.listCache?.ids.includes(stored) || (!forDelivery && this.runtimeByStored.has(stored))) return false;
+    if (forDelivery || !this.rows.has(stored)) await this.loadRow(stored, forDelivery);
     return this.delegateRuns.has(stored);
   }
 
@@ -879,7 +1035,7 @@ export class HermesAdapter implements HermesSource {
     }
     this.watched.add(stored);
     // Stream it now if it's live; if it becomes live later, refreshActive attaches it then.
-    this.attachIfLive(stored).catch((err) => this.log.warn({ err: String(err) }, 'hermes attach failed'));
+    this.options.background.run(() => this.attachIfLive(stored).catch((err) => this.log.warn({ err: String(err) }, 'hermes attach failed')));
   }
 
   /**
@@ -893,19 +1049,36 @@ export class HermesAdapter implements HermesSource {
     if (runtime) return Promise.resolve(runtime);
     let attaching = this.attaching.get(stored);
     if (!attaching) {
+      this.attachmentGeneration++;
       attaching = (async () => {
+        checkDeviceSignal();
+        await this.gateway.enableServerRequests();
         // The cards we had before the snapshot: it says which of them Hermes still has open.
         const earlier = this.approvalsFor(stored).map((a) => a.id);
-        const snap = await this.gateway.call<ResumeSnapshot>(
+        const snap = await this.call<ResumeSnapshot>(
           'session.resume',
           { session_id: stored, cols: 100, omit_messages: true },
           60_000,
         );
+        checkDeviceSignal();
         this.bind(stored, snap.session_id);
-        this.applySnapshot(stored, snap, earlier);
-        if (snap.auto_continue && purpose !== 'send') await this.cancelRerun(stored, snap.session_id);
+        const current = str(snap.info?.stored_session_id) ?? stored;
+        if (current !== stored) this.moveConversation(stored, current, snap.session_id);
+        this.applySnapshot(current, snap, earlier);
+        const frames = this.attachmentFrames.get(snap.session_id) ?? [];
+        this.attachmentFrames.delete(snap.session_id);
+        withDeviceSignal(undefined, () => {
+          for (const frame of frames) {
+            if ('event' in frame) this.onEvent(frame.event);
+            else this.onRequest(frame.request, frame.generation);
+          }
+        });
+        if (snap.auto_continue && purpose !== 'send') await this.cancelRerun(current, snap.session_id);
         return snap.session_id;
-      })().finally(() => this.attaching.delete(stored));
+      })().finally(() => {
+        this.attaching.delete(stored);
+        if (!this.attaching.size) this.attachmentFrames.clear();
+      });
       this.attaching.set(stored, attaching);
     }
     return attaching;
@@ -924,7 +1097,7 @@ export class HermesAdapter implements HermesSource {
    */
   private async cancelRerun(stored: string, runtime: string): Promise<void> {
     try {
-      await this.gateway.call('session.interrupt', { session_id: runtime }, 15_000);
+      await this.call('session.interrupt', { session_id: runtime }, 15_000);
     } catch (err) {
       this.log.warn({ err: err instanceof Error ? err.message : String(err) }, "couldn't cancel Hermes' re-run of a lost turn");
       return;
@@ -934,12 +1107,13 @@ export class HermesAdapter implements HermesSource {
         kind: 'notice',
         id: `rerun-${this.nonce}-${Date.now()}`,
         level: 'info',
-        text: 'Hermes was about to re-run the turn that was interrupted. Signalbox cancelled that.',
+        text: 'Hermes was about to re-run the turn that was interrupted. Wayroost cancelled that.',
       },
     ]);
   }
 
   private bind(stored: string, runtime: string): void {
+    this.attachmentGeneration++;
     const previous = this.runtimeByStored.get(stored);
     if (previous && previous !== runtime) this.storedByRuntime.delete(previous);
     this.runtimeByStored.set(stored, runtime);
@@ -947,14 +1121,21 @@ export class HermesAdapter implements HermesSource {
   }
 
   private unbind(stored: string): void {
+    this.attachmentGeneration++;
+    this.noteActivity(stored);
     const runtime = this.runtimeByStored.get(stored);
     if (runtime) this.storedByRuntime.delete(runtime);
     this.runtimeByStored.delete(stored);
+    this.activeByStored.delete(stored);
   }
 
   private applySnapshot(stored: string, snap: ResumeSnapshot, earlier: string[] = []): void {
+    this.noteActivity(stored);
     if (snap.info) this.noteSettings(stored, snap.info);
-    if (snap.running) this.activeByStored.set(stored, snap.status ?? 'working');
+    if (snap.running === true || snap.running === false || snap.status) {
+      this.activeByStored.set(stored, snap.running && (!snap.status || snap.status === 'idle') ? 'working'
+        : snap.status ?? (snap.running ? 'working' : 'idle'));
+    } else this.activeByStored.delete(stored); // A new runtime must prove its own readiness.
     const inflight = snap.inflight?.assistant;
     if (snap.running && typeof inflight === 'string' && inflight) {
       const turn = this.startTurn(stored);
@@ -994,7 +1175,14 @@ export class HermesAdapter implements HermesSource {
       // Staged files would be consumed by whatever prompt comes next; don't let a running turn take them.
       throw new UserFacingError('Hermes is still working on this chat. Wait for it to finish, or stop it, before sending files.', 409);
     }
+    checkDeviceSignal();
     await this.submitPrompt(stored, { text, attachments });
+  }
+
+  async sendMessageWhenIdle(stored: string, text: string, beforeSubmit?: () => Promise<void>): Promise<void> {
+    this.requireReady();
+    await this.requireNotSubagent(stored);
+    await this.submitPrompt(stored, { text, whenIdle: true, beforeSubmit });
   }
 
   private isBusy(stored: string): boolean {
@@ -1004,21 +1192,39 @@ export class HermesAdapter implements HermesSource {
   /** Upload any files, send the prompt, and show the user's message. */
   private async submitPrompt(
     stored: string,
-    prompt: { text: string; display?: string; attachments?: Attachment[] },
+    prompt: { text: string; display?: string; attachments?: Attachment[]; whenIdle?: boolean; beforeSubmit?: () => Promise<void> },
   ): Promise<void> {
     const attachments = prompt.attachments ?? [];
     const submit = async () => {
       // A prompt that follows at once starts before any re-run Hermes scheduled. Uploads come
       // first, so with files the re-run is cancelled instead: it could start, and take them.
-      const runtime = await this.ensureAttached(stored, attachments.length ? 'act' : 'send');
+      stored = this.resolveChat(stored);
+      const runtime = await this.ensureAttached(stored, attachments.length || prompt.whenIdle ? 'act' : 'send');
+      stored = this.resolveChat(stored);
       const staged = await this.stageAttachments(runtime, attachments);
+      // The bridge keeps this delivery cancellable through attachment and stale-runtime retries.
+      if (prompt.beforeSubmit) await prompt.beforeSubmit();
+      stored = this.resolveChat(stored);
+      if (prompt.whenIdle) {
+        const summary = this.summaryOf(stored);
+        if (this.resolveChat(stored) !== stored || this.runtimeByStored.get(stored) !== runtime ||
+            !summary || summary.status !== 'idle' || summary.pendingApprovals > 0) {
+          throw new UserFacingError('Hermes recipient is busy, awaiting approval, or its readiness is unknown.', 503);
+        }
+      }
+      checkDeviceSignal();
+      this.noteActivity(stored);
+      this.activeByStored.set(stored, 'working');
+      this.publishSummary(stored);
       try {
-        return await this.gateway.call<{ status?: string; user_row_id?: number }>(
+        return await this.call<{ status?: string; user_row_id?: number }>(
           'prompt.submit',
           { session_id: runtime, text: composePrompt(prompt.text, staged) },
           30_000,
         );
       } catch (err) {
+        // Refresh readiness after a failed submission (the bridge's delivery runs only in primary).
+        this.scheduleActiveCheck();
         await this.detachImages(runtime, staged.images);
         throw err;
       }
@@ -1028,6 +1234,7 @@ export class HermesAdapter implements HermesSource {
       result = await submit();
     } catch (err) {
       if (err instanceof RpcError && (err.code === 4001 || err.code === 4007)) {
+        stored = this.resolveChat(stored);
         this.unbind(stored);
         result = await submit().catch((e) => {
           throw this.userError(e);
@@ -1036,6 +1243,7 @@ export class HermesAdapter implements HermesSource {
         throw this.userError(err);
       }
     }
+    stored = this.resolveChat(stored);
     const id = result.user_row_id ? `m${result.user_row_id}` : `u-${this.nonce}-${Date.now()}`;
     this.publishItems(stored, [
       {
@@ -1046,8 +1254,6 @@ export class HermesAdapter implements HermesSource {
         ...(attachments.length ? { attachments: attachments.map((a) => ({ name: a.name, kind: a.kind })) } : {}),
       },
     ]);
-    this.activeByStored.set(stored, 'working');
-    this.publishSummary(stored);
   }
 
   /**
@@ -1062,14 +1268,14 @@ export class HermesAdapter implements HermesSource {
       for (const file of attachments) {
         const base64 = file.bytes.toString('base64');
         if (file.kind === 'image') {
-          const result = await this.gateway.call<{ path?: unknown }>(
+          const result = await this.call<{ path?: unknown }>(
             'image.attach_bytes',
             { session_id: runtime, content_base64: base64, filename: imageFileName(file) },
             60_000,
           );
           if (typeof result.path === 'string') staged.images.push(result.path);
         } else {
-          const result = await this.gateway.call<{ ref_text?: unknown }>(
+          const result = await this.call<{ ref_text?: unknown }>(
             'file.attach',
             { session_id: runtime, name: file.name, path: '', data_url: `data:${file.mimeType};base64,${base64}` },
             120_000,
@@ -1091,7 +1297,7 @@ export class HermesAdapter implements HermesSource {
   }
 
   private async detachImages(runtime: string, paths: string[]): Promise<void> {
-    await Promise.allSettled(paths.map((path) => this.gateway.call('image.detach', { session_id: runtime, path }, 10_000)));
+    await Promise.allSettled(paths.map((path) => this.call('image.detach', { session_id: runtime, path }, 10_000)));
   }
 
   // ---- images agents show -----------------------------------------------------
@@ -1149,7 +1355,7 @@ export class HermesAdapter implements HermesSource {
     const key = runtime ?? '';
     const hit = this.modelOptions.get(key);
     if (hit && Date.now() - hit.at < MODEL_OPTIONS_TTL_MS) return hit.options;
-    const options = await this.gateway.call<ModelOptions>(
+    const options = await this.call<ModelOptions>(
       'model.options',
       { ...(runtime ? { session_id: runtime } : {}), explicit_only: true },
       30_000,
@@ -1168,7 +1374,7 @@ export class HermesAdapter implements HermesSource {
     let options: ModelOptions;
     try {
       // Opening a chat shows these; a chat that isn't live isn't resumed for them.
-      runtime = await this.attachIfLive(stored);
+      runtime = this.runtimeByStored.get(stored) ?? await this.options.background.run(() => this.attachIfLive(stored));
       options = await this.fetchModelOptions(runtime);
     } catch (err) {
       throw this.userError(err);
@@ -1224,7 +1430,7 @@ export class HermesAdapter implements HermesSource {
     try {
       if (change.control === 'model') {
         const [provider, model] = JSON.parse(change.value) as [string, string];
-        const result = await this.gateway.call<Record<string, unknown>>(
+        const result = await this.call<Record<string, unknown>>(
           'config.set',
           {
             session_id: runtime,
@@ -1243,7 +1449,7 @@ export class HermesAdapter implements HermesSource {
         this.publishSummary(stored);
         notice = result.deferred === true ? 'Takes effect on the next turn.' : str(result.warning);
       } else {
-        const result = await this.gateway.call<Record<string, unknown>>(
+        const result = await this.call<Record<string, unknown>>(
           'config.set',
           { session_id: runtime, key: 'reasoning', value: change.value },
           30_000,
@@ -1279,9 +1485,9 @@ export class HermesAdapter implements HermesSource {
     this.requireReady();
     await this.requireNotSubagent(stored);
     // A chat that isn't live gets the general menu rather than being resumed for it.
-    const runtime = await this.attachIfLive(stored).catch((err) => {
+    const runtime = this.runtimeByStored.get(stored) ?? await this.options.background.run(() => this.attachIfLive(stored).catch((err) => {
       throw this.userError(err);
-    });
+    }));
     return catalogCommands(await this.fetchCatalog(runtime), { allowSafety: this.allowSafety() });
   }
 
@@ -1300,7 +1506,7 @@ export class HermesAdapter implements HermesSource {
     if (hit && Date.now() - hit.at < CATALOG_TTL_MS) return hit.catalog;
     let catalog: HermesCatalog;
     try {
-      catalog = await this.gateway.call<HermesCatalog>('commands.catalog', runtime ? { session_id: runtime } : {}, 30_000);
+      catalog = await this.call<HermesCatalog>('commands.catalog', runtime ? { session_id: runtime } : {}, 30_000);
     } catch (err) {
       throw this.userError(err);
     }
@@ -1358,8 +1564,8 @@ export class HermesAdapter implements HermesSource {
         // The desktop app's /stop: end the reply, then background processes. Nothing runs in
         // a chat that isn't live, and resuming it to stop it could start a re-run.
         const runtime = await this.attachIfLive(stored);
-        if (runtime) await this.gateway.call('session.interrupt', { session_id: runtime }, 15_000);
-        await this.gateway.call('process.stop', {}, 15_000).catch(() => undefined);
+        if (runtime) await this.call('session.interrupt', { session_id: runtime }, 15_000);
+        await this.call('process.stop', {}, 15_000).catch(() => undefined);
         return {
           output: runtime
             ? 'Stopped the reply and any background processes.'
@@ -1374,7 +1580,7 @@ export class HermesAdapter implements HermesSource {
     const timeout = LONG_COMMANDS.has(cmd.name) ? 11 * 60_000 : 3 * 60_000;
     let result: DispatchResult;
     try {
-      result = await this.gateway.call<DispatchResult>(
+      result = await this.call<DispatchResult>(
         'slash.exec',
         { session_id: runtime, command: `${cmd.name}${cmd.arg ? ` ${cmd.arg}` : ''}` },
         timeout,
@@ -1384,7 +1590,7 @@ export class HermesAdapter implements HermesSource {
       // retries any command error that way. Connection problems aren't retried.
       if (!(err instanceof RpcError) || err.code === -1 || err.code === -2) throw err;
       try {
-        result = await this.gateway.call<DispatchResult>(
+        result = await this.call<DispatchResult>(
           'command.dispatch',
           { session_id: runtime, name: cmd.name, arg: cmd.arg },
           timeout,
@@ -1437,10 +1643,10 @@ export class HermesAdapter implements HermesSource {
   private async titleCommand(stored: string, title: string): Promise<CommandOutcome> {
     const runtime = await this.ensureAttached(stored);
     if (!title) {
-      const current = await this.gateway.call<{ title?: unknown }>('session.title', { session_id: runtime }, 15_000);
+      const current = await this.call<{ title?: unknown }>('session.title', { session_id: runtime }, 15_000);
       return { output: str(current.title) ? `Title: ${current.title}` : 'This chat has no title yet.' };
     }
-    const result = await this.gateway.call<{ title?: unknown }>('session.title', { session_id: runtime, title }, 15_000);
+    const result = await this.call<{ title?: unknown }>('session.title', { session_id: runtime, title }, 15_000);
     const saved = str(result.title) ?? title;
     const row = this.rows.get(stored) ?? { id: stored };
     row.title = saved;
@@ -1500,7 +1706,7 @@ export class HermesAdapter implements HermesSource {
       // Nothing runs in a chat that isn't live, and resuming it to stop it could start a re-run.
       const runtime = await this.attachIfLive(stored);
       if (!runtime) return;
-      await this.gateway.call('session.interrupt', { session_id: runtime }, 15_000);
+      await this.call('session.interrupt', { session_id: runtime }, 15_000);
     } catch (err) {
       throw this.userError(err);
     }
@@ -1515,6 +1721,7 @@ export class HermesAdapter implements HermesSource {
     options: HermesCreateOptions = {},
   ): Promise<CreateResult> {
     this.requireReady();
+    await this.gateway.enableServerRequests();
     // A picked model is checked before the chat exists, so a bad pick leaves nothing behind.
     let chosen: [string, string] | undefined;
     if (options.model !== undefined) {
@@ -1531,7 +1738,7 @@ export class HermesAdapter implements HermesSource {
     let runtime: string;
     let folderNotice: string | undefined;
     try {
-      const created = await this.gateway.call<{ session_id: string; stored_session_id: string; info?: { cwd?: unknown } }>(
+      const created = await this.call<{ session_id: string; stored_session_id: string; info?: { cwd?: unknown } }>(
         'session.create',
         { cols: 100, ...(cwd ? { cwd } : {}) },
         60_000,
@@ -1555,7 +1762,7 @@ export class HermesAdapter implements HermesSource {
       let result: Record<string, unknown>;
       try {
         // For this chat only, like the chat's own model control; Hermes' default stays.
-        result = await this.gateway.call<Record<string, unknown>>(
+        result = await this.call<Record<string, unknown>>(
           'config.set',
           {
             session_id: runtime,
@@ -1594,6 +1801,7 @@ export class HermesAdapter implements HermesSource {
       this.publishSummary(stored);
       return { id: stored, command: result, ...(folderNotice ? { notice: folderNotice } : {}) };
     }
+    checkDeviceSignal();
     await this.submitPrompt(stored, { text, attachments });
     if (options.title) await this.nameChat(stored, options.title);
     return { id: stored, ...(folderNotice ? { notice: folderNotice } : {}) };
@@ -1606,7 +1814,7 @@ export class HermesAdapter implements HermesSource {
   private async nameChat(stored: string, title: string): Promise<void> {
     try {
       const runtime = await this.ensureAttached(stored);
-      const result = await this.gateway.call<{ title?: unknown }>('session.title', { session_id: runtime, title }, 15_000);
+      const result = await this.call<{ title?: unknown }>('session.title', { session_id: runtime, title }, 15_000);
       const row = this.rows.get(stored) ?? { id: stored };
       row.title = str(result.title) ?? title;
       this.rows.set(stored, row);
@@ -1618,6 +1826,7 @@ export class HermesAdapter implements HermesSource {
 
   async respondToApproval(stored: string, approvalId: string, answer: ApprovalAnswer): Promise<void> {
     await this.requireNotSubagent(stored);
+    checkDeviceSignal();
     const entry = this.pending.get(approvalId);
     if (!entry || entry.approval.conversationId !== stored) {
       throw new UserFacingError('That request is no longer waiting.', 409);
@@ -1672,12 +1881,14 @@ export class HermesAdapter implements HermesSource {
    * Hermes' error text is neither shown nor logged, in case it quotes the answer.
    */
   private async answerRequest(entry: PendingRequest, result: Record<string, unknown>, sensitive = false): Promise<void> {
+    checkDeviceSignal();
     if (entry.generation !== null && this.gateway.respond(entry.srq, result, entry.generation)) return;
     this.requireReady();
     let reply: { status?: string };
     try {
-      reply = await this.gateway.call<{ status?: string }>('request.answer', { id: entry.srq, result }, 30_000);
+      reply = await this.call<{ status?: string }>('request.answer', { id: entry.srq, result }, 30_000);
     } catch (err) {
+      checkDeviceSignal();
       if (!sensitive) throw this.userError(err);
       const unreachable = err instanceof RpcError && (err.code === -1 || err.code === -2);
       throw new UserFacingError(
@@ -1709,10 +1920,14 @@ export class HermesAdapter implements HermesSource {
       throw err;
     }
     this.secrets.writeHermes({ username, password });
-    this.auth.reset();
-    this.statusValue = { source: 'hermes', state: 'disconnected' };
-    this.gateway.stop();
-    this.start();
+    // The saved configuration owns the shared gateway and timers, not the device
+    // that saved it. User actions continue to carry their own device signal.
+    withDeviceSignal(undefined, () => {
+      this.auth.reset();
+      this.statusValue = { source: 'hermes', state: 'disconnected' };
+      this.gateway.stop();
+      this.start();
+    });
     return this.statusValue;
   }
 
@@ -1720,6 +1935,7 @@ export class HermesAdapter implements HermesSource {
     this.secrets.clearHermes();
     this.auth.reset();
     this.gateway.stop();
+    this.attachmentGeneration++;
     this.runtimeByStored.clear();
     this.storedByRuntime.clear();
     for (const id of [...this.pending.keys()]) this.removePending(id);
@@ -1731,11 +1947,23 @@ export class HermesAdapter implements HermesSource {
 
   // ---- gateway traffic ------------------------------------------------------
 
+  /** A resume reply and its next frames can arrive before the awaiting caller binds. */
+  private bufferAttachmentFrame(runtime: string, frame: AttachmentFrame): void {
+    if (!this.attaching.size) return;
+    const frames = this.attachmentFrames.get(runtime) ?? [];
+    frames.push(frame);
+    this.attachmentFrames.set(runtime, frames);
+  }
+
   /** `generation`: the connection a live request arrived on; null for one restored from a snapshot. */
   private onRequest(request: Pick<ServerRequest, 'id' | 'method' | 'params'>, generation: number | null): void {
     const runtime = String(request.params.session_id ?? '');
     const stored = this.storedByRuntime.get(runtime);
-    if (!stored) return; // not a session we're attached to
+    if (!stored) {
+      this.bufferAttachmentFrame(runtime, { request, generation });
+      return;
+    }
+    this.noteActivity(stored);
 
     if (request.method === 'approval') {
       const existing = this.pending.get(request.id);
@@ -1825,10 +2053,11 @@ export class HermesAdapter implements HermesSource {
 
   /** Hermes continues this chat under a new stored id (context compression); follow it. */
   private moveConversation(from: string, to: string, runtime: string): void {
+    this.chatIdentity.record(from, to);
+    this.noteActivity(from);
+    this.noteActivity(to);
     this.runtimeByStored.delete(from);
     this.bind(to, runtime);
-    this.movedTo.set(from, to);
-    if (this.movedTo.size > 200) this.movedTo.delete(this.movedTo.keys().next().value!);
 
     const turn = this.turns.get(from);
     if (turn) this.turns.set(to, turn);
@@ -1902,14 +2131,23 @@ export class HermesAdapter implements HermesSource {
     let stored =
       this.storedByRuntime.get(event.session_id) ??
       (event.type === 'session.title' ? str(payload.session_id) : undefined);
-    if (!stored) return;
+    if (!stored) {
+      this.bufferAttachmentFrame(event.session_id, { event });
+      return;
+    }
 
     // After compressing context, Hermes continues the chat under a new stored id.
     const continuation = event.type === 'session.info' ? str(payload.stored_session_id) : undefined;
     if (continuation && continuation !== stored && this.storedByRuntime.get(event.session_id) === stored) {
-      this.moveConversation(stored, continuation, event.session_id);
+      try {
+        this.moveConversation(stored, continuation, event.session_id);
+      } catch (err) {
+        this.log.warn({ err: err instanceof Error ? err.message : String(err) }, "couldn't persist Hermes chat continuation");
+        return;
+      }
       stored = continuation;
     }
+    this.noteActivity(stored);
 
     const text = typeof payload.text === 'string' ? payload.text : '';
 
@@ -2022,7 +2260,9 @@ export class HermesAdapter implements HermesSource {
         return;
       case 'session.reclaimed':
         this.unbind(stored);
-        if (this.watched.has(stored)) void this.attachIfLive(stored).catch(() => {});
+        this.options.background.run(() => {
+          if (this.watched.has(stored)) void this.attachIfLive(stored).catch(() => {});
+        });
         return;
       case 'error':
         this.publishItems(stored, [
@@ -2140,6 +2380,12 @@ export class HermesAdapter implements HermesSource {
     }
   }
 
+  /** All RPC actions, including attachment uploads and command retries, share the request signal. */
+  private call<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs = 30_000, signal = deviceSignal()): Promise<T> {
+    checkDeviceSignal(signal);
+    return this.gateway.call<T>(method, params, timeoutMs, signal);
+  }
+
   private requireReady(): void {
     this.requireCredentials();
     if (this.gateway.state !== 'ready') {
@@ -2148,8 +2394,10 @@ export class HermesAdapter implements HermesSource {
   }
 
   private userError(err: unknown): UserFacingError {
+    checkDeviceSignal();
     if (err instanceof UserFacingError) return err;
-    if (err instanceof HermesAuthError) return new UserFacingError(err.message);
+    if (transientFailure(err)) return new UserFacingError("Couldn't reach Hermes. Try again in a moment.", 503);
+    if (err instanceof HermesAuthError) return new UserFacingError(err.message, err.status ?? (err.kind === 'unavailable' ? 503 : 502));
     if (err instanceof RpcError) {
       const messages: Record<number, string> = {
         4001: 'This Hermes chat was closed. Reopen it and try again.',
@@ -2159,7 +2407,9 @@ export class HermesAdapter implements HermesSource {
         4130: 'This chat is too large to open here.',
         5035: 'Hermes is restarting. Try again in a moment.',
       };
-      return new UserFacingError(messages[err.code] ?? `Hermes: ${err.message}`);
+      const missing = err.code === 4007 || /session not found|stored (?:chat|session).*not found/i.test(err.message);
+      const unavailable = err.code === -1 || err.code === -2 || err.code === 5035;
+      return new UserFacingError(messages[err.code] ?? `Hermes: ${err.message}`, missing ? 404 : unavailable ? 503 : 502);
     }
     this.log.error({ err: String(err) }, 'unexpected hermes error');
     return new UserFacingError('Something went wrong talking to Hermes.');

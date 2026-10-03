@@ -1,6 +1,6 @@
 // End-to-end check of the *built* server against the real local Hermes and
 // Paseo, with a local stand-in for Cloudflare Access (own JWKS + an "edge"
-// proxy that stamps the JWT). Read-only: it only loads the inbox.
+// proxy that stamps the JWT). Read-only: it only loads Home, the chats and Settings.
 //   npm run build && npx tsx scripts/e2e-local.ts <output-dir>
 import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -8,11 +8,12 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { chromium } from 'playwright-core';
 import { createLocalAccess, startEdge, startJwksServer } from './lib/local-access.js';
+import { pairingSocketPath, requestRecoveryCode } from '../server/src/pairing-socket.js';
 
 const OUT = resolve(process.argv[2] ?? 'e2e-shots');
-const APP_PORT = 8797;
-const EDGE_PORT = 8798;
-const JWKS_PORT = 8799;
+const APP_PORT = 8897;
+const EDGE_PORT = 8898;
+const JWKS_PORT = 8899;
 mkdirSync(OUT, { recursive: true });
 
 const access = await createLocalAccess({ issuer: `http://127.0.0.1:${JWKS_PORT}`, aud: 'local-e2e' });
@@ -43,14 +44,20 @@ const browser = await chromium.launch({ executablePath: process.env.CHROME ?? '/
 try {
   // Direct hits on the app without the edge must be refused.
   await new Promise((r) => setTimeout(r, 1500));
-  const direct = await fetch(`http://127.0.0.1:${APP_PORT}/api/me`, { headers: { 'x-signalbox-request': '1' } });
+  const direct = await fetch(`http://127.0.0.1:${APP_PORT}/api/me`, { headers: { 'x-wayroost-request': '1' } });
   if (direct.status !== 401) problems.push(`direct request without token returned ${direct.status}`);
 
   const context = await browser.newContext({ viewport: { width: 393, height: 852 }, deviceScaleFactor: 2, colorScheme: 'dark', isMobile: true, hasTouch: true });
   const page = await context.newPage();
   page.on('console', (m) => m.type() === 'error' && problems.push(`console: ${m.text()}`));
   page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));
-  await page.goto(`http://127.0.0.1:${EDGE_PORT}/`);
+  // Pair this browser with a recovery code, as root would with pair-code.
+  const { code } = await requestRecoveryCode(pairingSocketPath(join(dir, 'state')), 'phone');
+  await page.goto(`http://127.0.0.1:${EDGE_PORT}/pair#${code}`);
+  await page.click('.pair-card button[type="submit"]');
+  // A paired browser lands on Home; the inbox is the Chats page.
+  await page.waitForSelector('.home-tile', { timeout: 20_000 });
+  await page.goto(`http://127.0.0.1:${EDGE_PORT}/chats`);
   await page.waitForSelector('.row', { timeout: 20_000 });
   await page.waitForTimeout(1500);
   const rows = await page.locator('.row').count();
@@ -64,7 +71,7 @@ try {
   await page.screenshot({ path: join(OUT, 'e2e-projects.png') });
   await page.click('.view-toggle button:has-text("Recent")');
   await page.click('button[aria-label="Settings"]');
-  await page.waitForSelector('.sheet');
+  await page.waitForSelector('.page-settings');
   await page.screenshot({ path: join(OUT, 'e2e-settings.png') });
 } finally {
   await browser.close();

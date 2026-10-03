@@ -9,10 +9,14 @@ import { completeSentences, speechPieces } from './text';
 export interface ReaderOutput {
   /** Speech for a piece of text (POST /api/voice/speak). */
   speak(text: string): Promise<ArrayBuffer>;
+  stream?(text: string, signal: AbortSignal, fallback: () => void): AsyncIterable<ArrayBuffer | 'reset'>;
+  reset?(piece: symbol): void;
+  fallback?(): void;
   /** Queue a clip after what's already queued; resolves once it's scheduled. */
-  play(audio: ArrayBuffer): Promise<void>;
+  play(audio: ArrayBuffer, piece: symbol): Promise<void>;
   /** Clips queued or playing. */
   pending(): number;
+  bufferedSeconds?(): number;
   /** Resolves the next time pending() may have changed. */
   changed(): Promise<void>;
 }
@@ -22,6 +26,7 @@ export const MAX_SPOKEN = 4000;
 export const MORE_ON_SCREEN = "There's more on screen.";
 /** Clips fetched or queued ahead of the one playing. */
 const AHEAD = 2;
+const STREAM_AHEAD_SECONDS = 1.5;
 /** Signalbox is reading for other pages too (429): try a piece again after this. */
 const RETRY_MS = 800;
 const RETRY = Symbol('retry');
@@ -38,7 +43,8 @@ interface Place {
 
 interface Fetch {
   text: string;
-  audio: Promise<ArrayBuffer | null | typeof RETRY>;
+  piece: symbol;
+  audio: Promise<ArrayBuffer | AsyncIterable<ArrayBuffer | 'reset'> | null | typeof RETRY>;
 }
 
 export class ReplyReader {
@@ -53,6 +59,9 @@ export class ReplyReader {
   private turnOver = false;
   private stopped = false;
   private finished = false;
+  private readonly abort = new AbortController();
+  private fallbackNotified = false;
+  private readonly streams = new Set<AsyncIterator<ArrayBuffer | 'reset'>>();
 
   constructor(
     private readonly out: ReaderOutput,
@@ -112,6 +121,8 @@ export class ReplyReader {
   }
 
   stop(): void {
+    this.abort.abort();
+    for (const stream of this.streams) void stream.return?.().catch(() => {});
     this.stopped = true;
     this.texts = [];
     this.fetches = [];
@@ -149,11 +160,12 @@ export class ReplyReader {
   private request(): void {
     while (this.texts.length && this.fetches.length < AHEAD) {
       const text = this.texts.shift()!;
-      this.fetches.push({ text, audio: this.fetch(text) });
+      this.fetches.push({ text, piece: Symbol('speech piece'), audio: this.fetch(text) });
     }
   }
 
-  private fetch(text: string): Promise<ArrayBuffer | null | typeof RETRY> {
+  private fetch(text: string): Fetch['audio'] {
+    if (this.out.stream) return this.prefetch(text);
     return this.out.speak(text).then(
       (audio) => {
         this.failures = 0;
@@ -165,6 +177,40 @@ export class ReplyReader {
         return null;
       },
     );
+  }
+
+  private async prefetch(text: string): Fetch['audio'] {
+    const iterator = this.out.stream!(text, this.abort.signal, () => {
+      if (!this.active || this.fallbackNotified) return;
+      this.fallbackNotified = true;
+      this.out.fallback?.();
+    })[Symbol.asyncIterator]();
+    this.streams.add(iterator);
+    try {
+      // Starting next() eagerly opens the following piece's POST during playback.
+      const first = await iterator.next();
+      const streams = this.streams;
+      return (async function* () {
+        try {
+          if (!first.done) yield first.value;
+          while (!first.done) {
+            const next = await iterator.next();
+            if (next.done) break;
+            yield next.value;
+          }
+        } finally { streams.delete(iterator); await iterator.return?.(); }
+      })();
+    } catch (err) {
+      this.streams.delete(iterator);
+      void iterator.return?.().catch(() => {});
+      if ((err as { status?: number } | null)?.status === 429) return RETRY;
+      this.failures += 1;
+      return null;
+    }
+  }
+
+  private full(streaming: boolean): boolean {
+    return streaming && this.out.bufferedSeconds ? this.out.bufferedSeconds() >= STREAM_AHEAD_SECONDS : this.out.pending() >= AHEAD;
   }
 
   private async pump(): Promise<void> {
@@ -189,12 +235,27 @@ export class ReplyReader {
           return;
         }
         if (!audio) continue;
-        while (this.active && this.out.pending() >= AHEAD) await this.out.changed();
+        const streaming = Symbol.asyncIterator in audio;
+        while (this.active && this.full(streaming)) await this.out.changed();
         if (!this.active) return;
         try {
-          await this.out.play(audio);
-        } catch {
-          // A clip the browser can't decode: skip it.
+          if (Symbol.asyncIterator in audio) {
+            for await (const clip of audio) {
+              if (!this.active) return;
+              if (clip === 'reset') { this.out.reset?.(next.piece); continue; }
+              while (this.active && this.full(true)) await this.out.changed();
+              if (!this.active) return;
+              await this.out.play(clip, next.piece);
+            }
+          } else await this.out.play(audio, next.piece);
+          this.failures = 0;
+        } catch (err) {
+          if ((err as { status?: number }).status === 429) {
+            this.fetches.unshift({ ...next, audio: this.fetch(next.text) });
+            await new Promise(resolve => setTimeout(resolve, RETRY_MS));
+          }
+          else this.failures += 1;
+          if (this.failures >= 2) { this.end("Couldn't read the reply aloud."); return; }
         }
       }
     } finally {

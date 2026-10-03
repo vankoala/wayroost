@@ -1,12 +1,12 @@
-Signalbox
-Copyright 2026 vankoala and the Signalbox contributors
+Wayroost
+Copyright 2026 vankoala and the Wayroost contributors
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 -------------------------------------------------------------------------------
 Adapted work
 
-Parts of Signalbox follow logic from Paseo (https://github.com/getpaseo/paseo),
+Parts of Wayroost follow logic from Paseo (https://github.com/getpaseo/paseo),
 Copyright (c) 2025-present Mohamed Boudra, licensed under the Apache License,
 Version 2.0:
 
@@ -17,7 +17,7 @@ Version 2.0:
   * server/src/paseo/normalize.ts builds answers to multi-question permission
     requests the way the Paseo app's question form does.
 
-Parts of Signalbox are adapted from Hermes Agent
+Parts of Wayroost are adapted from Hermes Agent
 (https://github.com/NousResearch/hermes-agent), Copyright (c) 2025 Nous
 Research, licensed under the MIT License (reproduced below):
 
@@ -53,15 +53,15 @@ Hermes Agent license:
   SOFTWARE.
 
 -------------------------------------------------------------------------------
-Projects Signalbox talks to (not included in this repository)
+Projects Wayroost talks to (not included in this repository)
 
   * Hermes Agent (https://github.com/NousResearch/hermes-agent)
     Copyright (c) 2025 Nous Research. MIT License.
-    Signalbox connects to the Hermes dashboard's HTTP and WebSocket APIs.
+    Wayroost connects to the Hermes dashboard's HTTP and WebSocket APIs.
 
   * Paseo (https://github.com/getpaseo/paseo)
     Copyright (c) 2025-present Mohamed Boudra. Apache License 2.0.
-    Signalbox uses the published @getpaseo/client and @getpaseo/protocol
+    Wayroost uses the published @getpaseo/client and @getpaseo/protocol
     packages to talk to the Paseo daemon.
 
 -------------------------------------------------------------------------------
@@ -72,7 +72,7 @@ Inspiration
     with the Hermes dashboard, and inspired this project.
 
 -------------------------------------------------------------------------------
-Signalbox is an independent project. It is not affiliated with or endorsed by
+Wayroost is an independent project. It is not affiliated with or endorsed by
 Nous Research, the Paseo project, the Hermes Conduit project, or Cloudflare,
 Inc. Cloudflare is a trademark of Cloudflare, Inc. Other product names and
 trademarks belong to their owners. They are used only to describe
