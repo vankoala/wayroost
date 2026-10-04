@@ -28,7 +28,6 @@ import time
 import urllib.request
 from pathlib import Path
 
-BRIDGE = "http://127.0.0.1:19012/bridge/v1/note_run"
 # The installer puts the runtime next to this hook; source checks use helper/.
 _runtime_dir = Path(__file__).resolve().parent
 if not (_runtime_dir / "wayroost_runtime.py").is_file():
@@ -37,9 +36,10 @@ sys.path.insert(0, str(_runtime_dir))
 try:
     if not (_runtime_dir / "wayroost_runtime.py").is_file():
         raise ImportError("Wayroost runtime is missing")
-    from wayroost_runtime import BackgroundGate, env as runtime_env  # noqa: E402
+    from wayroost_runtime import BackgroundGate, bridge_url, env as runtime_env  # noqa: E402
 except ImportError:
     BackgroundGate = None
+    bridge_url = None
 
     def runtime_env(suffix, default=None, environ=None):
         environ = os.environ if environ is None else environ
@@ -102,6 +102,9 @@ def last_assistant_text(transcript_path):
 
 
 def post(body):
+    if bridge_url is None:
+        return
+    url = bridge_url()
     try:
         with open(TOKEN_FILE, encoding="ascii") as f:
             token = f.read().strip()
@@ -109,7 +112,7 @@ def post(body):
         return
     if not re.fullmatch(r"[A-Za-z0-9_-]{32,512}", token):
         return
-    request = urllib.request.Request(BRIDGE, data=json.dumps(body).encode(), method="POST",
+    request = urllib.request.Request(f"{url}/bridge/v1/note_run", data=json.dumps(body).encode(), method="POST",
                                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback only, never a proxy
     with opener.open(request, timeout=1.0) as response:

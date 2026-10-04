@@ -49,6 +49,7 @@ done
 # stdin, never by pasting them into its source. Commands:
 #   edit <hermes|pi|opencode> <add|remove> <file> <wrapper> <bridge url or ""> <stamp> <dry 0|1>
 #   token <install|remove> <file> <stamp> <dry 0|1>     (install reads the token on stdin)
+#   bridge-url <add|remove> <file> <url> <stamp> <dry 0|1> (launch reporters' loopback address)
 #   plugin <source dir> <plugin dir> <stamp> <dry 0|1>  (copy the Hermes plugin in)
 #   plugin-state <config.yaml> <name>                   (prints on, off or unknown)
 #   backup <file> <stamp>                               (before running a Hermes command that edits it)
@@ -468,6 +469,25 @@ def token(mode, path, stamp, dry):
     return CHANGED
 
 
+def bridge_url(mode, path, url, stamp, dry):
+    """Keep the launch reporters on the same loopback port as the MCP wrapper."""
+    exists = os.path.exists(path)
+    if mode == "remove":
+        if not exists:
+            say(f"{path} isn't there.")
+            return NOTHING
+        return commit(path, read_text(path), None, stamp, dry, diff=False)
+    match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})", url)
+    if not match or not 1 <= int(match[1]) <= 65535:
+        raise RuntimeError("The bridge URL must be an HTTP address on 127.0.0.1 with a valid port")
+    old = read_text(path) if exists else None
+    new = url + "\n"
+    if old == new:
+        say(f"{path} is up to date.")
+        return NOTHING
+    return commit(path, old, new, stamp, dry, diff=False)
+
+
 # ---- the Hermes plugin -----------------------------------------------------------------
 
 def files_in(root):
@@ -606,6 +626,8 @@ cmd = sys.argv[1]
 try:
     if cmd == "token":
         sys.exit(token(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1"))
+    if cmd == "bridge-url":
+        sys.exit(bridge_url(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6] == "1"))
     if cmd == "plugin":
         sys.exit(plugin(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1"))
     if cmd == "plugin-state":
@@ -729,6 +751,8 @@ if (( REMOVE )); then
 else
   run_step "token" helper token install "$UHOME/.config/signalbox/bridge-token" "$STAMP" "$DRY_RUN" <"$TOKEN_SRC"
 fi
+
+run_step "bridge URL" helper bridge-url "$MODE" "$UHOME/.config/signalbox/bridge-url" "http://127.0.0.1:$PORT" "$STAMP" "$DRY_RUN"
 
 echo "==> Hermes"
 if user_has "$UHOME/.hermes/config.yaml"; then

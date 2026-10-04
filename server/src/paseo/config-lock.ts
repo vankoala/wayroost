@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 
 /** All Wayroost Paseo-config writers use this lock, including the owner helper. */
-export async function withPaseoConfigLock<T>(configPath: string, stateDir: string, write: () => Promise<T>): Promise<T> {
+export async function withPaseoConfigLock<T>(configPath: string, stateDir: string, write: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
   const directory = realpathSync(dirname(configPath));
   let lockPath = join(directory, `${basename(configPath)}.wayroost.lock`);
   try { accessSync(directory, constants.W_OK); }
@@ -20,9 +21,19 @@ export async function withPaseoConfigLock<T>(configPath: string, stateDir: strin
     // the parent retains the lock until finally closes its descriptor.
     await new Promise<void>((resolve, reject) => {
       const child = spawn('/usr/bin/flock', ['--exclusive', '--timeout', '4', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] });
-      child.once('error', reject);
-      child.once('exit', code => code === 0 ? resolve() : reject(new Error('Paseo configuration is locked; retry the Safety change.')));
+      const abort = () => { child.kill('SIGKILL'); };
+      const cleanup = () => signal?.removeEventListener('abort', abort);
+      child.once('error', error => { cleanup(); reject(error); });
+      child.once('exit', code => {
+        cleanup();
+        if (signal?.aborted) reject(signal.reason);
+        else if (code === 0) resolve();
+        else reject(new Error('Paseo configuration is locked; retry the Safety change.'));
+      });
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
     });
+    signal?.throwIfAborted();
     return await write();
   } finally { closeSync(fd); }
 }

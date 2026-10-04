@@ -17,7 +17,9 @@ export const WorkerApprovalsStatus = z.object({
 export type WorkerApprovalsStatus = z.infer<typeof WorkerApprovalsStatus>;
 export interface WorkerApprovalsApi {
   status(): Promise<WorkerApprovalsStatus>;
-  setEnabled(enabled: boolean): Promise<WorkerApprovalsStatus>;
+  setEnabled(enabled: boolean, signal?: AbortSignal, authorize?: () => Promise<void>): Promise<WorkerApprovalsStatus>;
+  /** Hold new writes until acknowledged cancellation and device revocation finish. */
+  cancelPending?(signal: AbortSignal): Promise<() => void>;
 }
 
 export function pendingWorkerApprovals(): WorkerApprovalsStatus {
@@ -29,5 +31,5 @@ export function pendingWorkerApprovals(): WorkerApprovalsStatus {
 }
 
 export interface PaseoConfigWriter {
-  setCloudAgentEnabled(id: CloudAgentId, enabled: boolean): Promise<void>;
+  setCloudAgentEnabled(id: CloudAgentId, enabled: boolean, signal?: AbortSignal, authorize?: () => Promise<void>): Promise<void>;
 }

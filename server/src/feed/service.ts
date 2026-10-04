@@ -18,6 +18,7 @@ import { UserFacingError, type HermesSource } from '../sources.js';
 import { oneLine, type CardInput, type FeedStore, type StoredSettings } from './store.js';
 import type { PushMessage, PushSender, PushSubscriptionInput } from './push.js';
 import { shadowBackground, type BackgroundGate } from '../background.js';
+import type { Devices } from '../devices.js';
 
 // For you: Hermes' pulse (the 7am brief and the daytime checks) posts cards
 // through the bridge listener; you act on them here. "Do it" starts a Hermes
@@ -234,10 +235,18 @@ export class Feed {
     return this.deps.push.publicKey();
   }
 
-  addDevice(input: PushSubscriptionInput): number {
+  bindDevices(devices: Devices | undefined): void {
+    this.deps.push?.bindDevices(devices);
+  }
+
+  revokeDevice(deviceId: string): void {
+    this.deps.push?.revokeDevice(deviceId);
+  }
+
+  addDevice(input: PushSubscriptionInput, deviceId: string): number {
     if (!this.deps.push) throw new UserFacingError('Phone notifications need Wayroost on https.', 409);
     try {
-      return this.deps.push.add(input, this.now());
+      return this.deps.push.add(input, deviceId, this.now());
     } catch (err) {
       if (err instanceof RangeError) {
         throw new UserFacingError(`That browser can't get notifications here (${err.message}).`, 400);
@@ -247,8 +256,8 @@ export class Feed {
     }
   }
 
-  removeDevice(endpoint: string): number {
-    return this.deps.push?.remove(endpoint) ?? 0;
+  removeDevice(endpoint: string, deviceId: string): number {
+    return this.deps.push?.remove(endpoint, deviceId) ?? 0;
   }
 
   async testPush(): Promise<{ sent: number }> {

@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
 import { shadowBackground, type BackgroundGate } from '../background.js';
+import type { Devices } from '../devices.js';
 
 // Phone notifications (Web Push). Signalbox signs each request to the browser's
 // push service with its own key (VAPID, RFC 8292) and encrypts the message so
@@ -55,6 +56,7 @@ export interface PushMessage {
 }
 
 interface Device {
+  deviceId: string;
   endpoint: string;
   p256dh: string;
   auth: string;
@@ -128,6 +130,7 @@ export class PushSender {
   private file: PushFile;
   private readonly key: KeyObject;
   private persisted = false;
+  private paired: Pick<Devices, 'get' | 'signal'> | undefined;
 
   constructor(
     stateDir: string,
@@ -148,7 +151,15 @@ export class PushSender {
         const vapid = { kty: 'EC', crv: 'P-256', d: raw.vapid.d, x: raw.vapid.x, y: raw.vapid.y };
         const key = createPrivateKey({ key: vapid, format: 'jwk' });
         this.persisted = true;
-        return [{ vapid, devices: Array.isArray(raw.devices) ? raw.devices : [] }, key];
+        const stored = Array.isArray(raw.devices) ? raw.devices : [];
+        // Older subscriptions have no pairing to authorize them; browsers subscribe again.
+        const devices = stored.filter((device) => typeof device?.deviceId === 'string' && /^dv_[a-f0-9]{24}$/.test(device.deviceId));
+        const file = { vapid, devices };
+        if (devices.length !== stored.length) this.background.run(() => {
+          try { this.write(file); }
+          catch (err) { this.log.warn({ err: (err as Error).name }, 'could not remove unpaired push subscriptions'); }
+        });
+        return [file, key];
       }
     } catch (err) {
       // First start, or an unusable file: a new key (phones subscribe again) beats not starting.
@@ -190,19 +201,25 @@ export class PushSender {
     return Buffer.concat([Buffer.from([4]), x, y]).toString('base64url');
   }
 
+  bindDevices(devices: Pick<Devices, 'get' | 'signal'> | undefined): void {
+    this.paired = devices;
+  }
+
   devices(): number {
-    return this.file.devices.length;
+    return this.file.devices.filter((device) => this.paired?.get(device.deviceId)).length;
   }
 
   /** Remember a browser's subscription (replacing one with the same endpoint). Returns the device count. */
-  add(input: PushSubscriptionInput, now = Date.now()): number {
+  add(input: PushSubscriptionInput, deviceId: string, now = Date.now()): number {
     checkDeviceSignal();
+    if (!this.paired?.get(deviceId)) throw new RangeError('device is no longer paired');
     const problem = endpointProblem(input.endpoint);
     if (problem) throw new RangeError(problem);
     const p256dh = Buffer.from(input.keys.p256dh, 'base64url');
     const auth = Buffer.from(input.keys.auth, 'base64url');
     if (p256dh.length !== 65 || p256dh[0] !== 4 || auth.length !== 16) throw new RangeError('malformed keys');
     const device: Device = {
+      deviceId,
       endpoint: input.endpoint,
       p256dh: p256dh.toString('base64url'),
       auth: auth.toString('base64url'),
@@ -215,14 +232,21 @@ export class PushSender {
     return this.file.devices.length;
   }
 
-  remove(endpoint: string): number {
+  remove(endpoint: string, deviceId?: string): number {
     checkDeviceSignal();
-    const devices = this.file.devices.filter((d) => d.endpoint !== endpoint);
+    const devices = this.file.devices.filter((d) => d.endpoint !== endpoint || (deviceId !== undefined && d.deviceId !== deviceId));
     if (devices.length !== this.file.devices.length) {
       this.file = { ...this.file, devices };
       this.write(this.file);
     }
     return devices.length;
+  }
+
+  revokeDevice(deviceId: string): void {
+    const devices = this.file.devices.filter((device) => device.deviceId !== deviceId);
+    if (devices.length === this.file.devices.length) return;
+    this.file = { ...this.file, devices };
+    this.write(this.file);
   }
 
   private authorization(endpoint: string, now: number): string {
@@ -243,13 +267,14 @@ export class PushSender {
     if (payload.length > MAX_PAYLOAD) throw new RangeError('notification too large');
     let sent = 0;
     let failed = 0;
-    const gone: string[] = [];
+    const gone: Device[] = [];
     await Promise.all(
       this.file.devices.map(async (device) => {
-        if (endpointProblem(device.endpoint)) {
-          gone.push(device.endpoint);
+        if (!this.paired?.get(device.deviceId) || endpointProblem(device.endpoint)) {
+          gone.push(device);
           return;
         }
+        const recipient = this.paired.signal(device.deviceId);
         try {
           const body = encryptPayload(
             payload,
@@ -269,11 +294,12 @@ export class PushSender {
             },
             body,
             redirect: 'error',
-            signal: actionSignal(AbortSignal.timeout(SEND_TIMEOUT_MS)),
+            signal: actionSignal(actionSignal(AbortSignal.timeout(SEND_TIMEOUT_MS), recipient)),
           });
           // Nothing to read in the answer: let the connection go.
           await res.body?.cancel().catch(() => {});
-          if (res.status === 404 || res.status === 410) gone.push(device.endpoint);
+          checkDeviceSignal(recipient);
+          if (res.status === 404 || res.status === 410) gone.push(device);
           else if (res.ok) sent += 1;
           else {
             failed += 1;
@@ -285,7 +311,13 @@ export class PushSender {
         }
       }),
     );
-    for (const endpoint of gone) this.remove(endpoint);
-    return { sent, failed, removed: gone.length };
+    let removed = 0;
+    for (const device of gone) {
+      // Registration can replace this record while another send is pending.
+      if (!this.file.devices.includes(device)) continue;
+      this.remove(device.endpoint);
+      removed += 1;
+    }
+    return { sent, failed, removed };
   }
 }

@@ -1,12 +1,14 @@
 import { DaemonClient, type WebSocketLike } from '@getpaseo/client/internal/daemon-client';
 import WebSocket from 'ws';
 import type { SafetyDaemon } from './safety-setting.js';
+import { waitWithAbort } from './abort.js';
 
 /** Uses the supported client API, including password authentication, never a shell or CLI. */
 export function createSafetyDaemon(url: string, password?: string): SafetyDaemon {
   const target = new URL(url);
   if (target.pathname === '/') target.pathname = '/ws';
-  async function call<T>(work: (client: DaemonClient) => Promise<T>): Promise<T> {
+  async function call<T>(work: (client: DaemonClient) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
     // close() permanently disposes the SDK client, so each call owns one instance.
     const client = new DaemonClient({
       url: target.toString(), clientId: 'wayroost-safety-helper', clientType: 'cli', appVersion: '0.9.2',
@@ -16,18 +18,18 @@ export function createSafetyDaemon(url: string, password?: string): SafetyDaemon
     });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await Promise.race([
-        (async () => { await client.connect(); return work(client); })(),
+      return await waitWithAbort(Promise.race([
+        (async () => { await client.connect(); signal?.throwIfAborted(); return work(client); })(),
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Paseo Safety request timed out.')), 5_000); }),
-      ]);
+      ]), signal);
     } finally {
       clearTimeout(timer);
       await client.close();
     }
   }
   return {
-    providers: () => call(async client => (await client.getProvidersSnapshot()).entries.map(entry => entry.provider)),
-    effectiveProviders: () => call(async client => (await client.getDaemonConfig()).config.providers),
-    reload: () => call(client => client.reloadDaemonConfig()),
+    providers: signal => call(async client => (await client.getProvidersSnapshot()).entries.map(entry => entry.provider), signal),
+    effectiveProviders: signal => call(async client => (await client.getDaemonConfig()).config.providers, signal),
+    reload: signal => call(client => client.reloadDaemonConfig(), signal),
   };
 }

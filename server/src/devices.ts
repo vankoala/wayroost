@@ -1,6 +1,6 @@
 import { checkDeviceSignal } from './security/device-signal.js';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { closeSync, constants, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { DEVICE_KINDS, type DeviceInfo, type DeviceKind, type DeviceScope } from '../../shared/protocol.js';
@@ -75,6 +75,14 @@ const StoreFile = z
   .strict();
 
 export class DevicesFileError extends Error {}
+
+export class DevicesPersistenceError extends DevicesFileError {
+  readonly committed = true;
+  constructor() {
+    super('Device store was replaced, but persistence could not be confirmed.');
+    this.name = 'DevicesPersistenceError';
+  }
+}
 
 /** Why a pairing attempt was refused. `invalid` covers wrong, expired and used codes alike. */
 export type PairRefusal = 'locked' | 'rate-limited' | 'invalid' | 'full';
@@ -229,18 +237,22 @@ export class Devices {
 
   /**
    * Writes the store. Changes to the device list pass the list they're about
-   * to make (`devices`) and apply it in memory only once it's on disk: a
-   * failed write then leaves both as they were, never a device that's gone
-   * here but comes back after a restart (or the other way round).
+   * to make (`devices`). Before replacement, a failure leaves live state alone.
+   * After replacement, live state follows the new file even if persistence
+   * cannot be confirmed, and the caller receives a committed error.
    */
-  private save(devices: Iterable<StoredDevice> = this.devices.values(), pairingLocked = this.locked): void {
+  private save(devices: Iterable<StoredDevice> = this.devices.values(), pairingLocked = this.locked, apply = () => {}): void {
     checkDeviceSignal();
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
     const file = { version: 1, devices: [...devices], pairingLocked };
     const tmp = join(this.stateDir, `.${FILE}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
     const data = Buffer.from(`${JSON.stringify(file, null, 2)}\n`);
-    const fd = openSync(tmp, 'wx', 0o600);
+    let fd: number | undefined;
+    let directory: number | undefined;
+    let renamed = false;
     try {
+      directory = openSync(this.stateDir, constants.O_RDONLY | constants.O_DIRECTORY);
+      fd = openSync(tmp, 'wx', 0o600);
       // A write can take less than it's given (a nearly full disk): keep going
       // until every byte is there, or fail, before the file replaces the store.
       for (let at = 0; at < data.length; ) {
@@ -250,16 +262,28 @@ export class Devices {
       }
       fsyncSync(fd);
       closeSync(fd);
+      fd = undefined;
       renameSync(tmp, this.path);
+      renamed = true;
+      fsyncSync(directory);
+      closeSync(directory);
+      directory = undefined;
     } catch (err) {
-      try {
-        closeSync(fd);
-      } catch {
-        // Already closed.
+      for (const handle of [fd, directory]) if (handle !== undefined) {
+        try {
+          closeSync(handle);
+        } catch {
+          // Already closed.
+        }
+      }
+      if (renamed) {
+        apply();
+        throw new DevicesPersistenceError();
       }
       rmSync(tmp, { force: true });
       throw err;
     }
+    apply();
   }
 
   /** The device list with `device` put in (or replaced) or, given an id, taken out. */
@@ -296,17 +320,15 @@ export class Devices {
 
   /**
    * Notes that a device was used. True when its cookie should be renewed (at
-   * most hourly). Saved before it's applied, like every other change: a failed
-   * write leaves lastSeen as it was, so the next request tries (and renews) again
-   * instead of finding the hour already used up.
+   * most hourly). If replacement fails, lastSeen stays as it was, so the next
+   * request tries (and renews) again instead of finding the hour already used up.
    */
   touch(id: string): boolean {
     const device = this.devices.get(id);
     const now = this.now();
     if (!device || now - device.lastSeen < TOUCH_EVERY_MS) return false;
     const seen = { ...device, lastSeen: now };
-    this.save(this.staged(seen));
-    this.devices.set(id, seen);
+    this.save(this.staged(seen), this.locked, () => this.devices.set(id, seen));
     return true;
   }
 
@@ -314,8 +336,7 @@ export class Devices {
     const device = this.devices.get(id);
     if (!device) return undefined;
     const renamed = { ...device, name: DeviceName.parse(name) };
-    this.save(this.staged(renamed));
-    this.devices.set(id, renamed);
+    this.save(this.staged(renamed), this.locked, () => this.devices.set(id, renamed));
     return view(renamed);
   }
 
@@ -325,20 +346,19 @@ export class Devices {
    */
   revoke(id: string): boolean {
     if (!this.devices.has(id)) return false;
-    // On disk first: if that fails the device stays paired, here and after a
-    // restart, and the caller gets the error (nothing half-revoked).
-    this.save(this.staged(id));
-    this.devices.delete(id);
-    this.signals.get(id)?.abort();
-    this.signals.delete(id);
-    for (const [key, open] of this.codes) if (open.issuer === id) this.codes.delete(key);
-    for (const listener of this.revokeListeners) {
-      try {
-        listener(id);
-      } catch {
-        // A listener must not stop the others.
+    this.save(this.staged(id), this.locked, () => {
+      this.devices.delete(id);
+      this.signals.get(id)?.abort();
+      this.signals.delete(id);
+      for (const [key, open] of this.codes) if (open.issuer === id) this.codes.delete(key);
+      for (const listener of this.revokeListeners) {
+        try {
+          listener(id);
+        } catch {
+          // A listener must not stop the others.
+        }
       }
-    }
+    });
     return true;
   }
 
@@ -375,8 +395,7 @@ export class Devices {
       lastSeen: now,
       secretHash: sha256(secret).toString('hex'),
     };
-    this.save(this.staged(device));
-    this.devices.set(id, device);
+    this.save(this.staged(device), this.locked, () => this.devices.set(id, device));
     return { device: view(device), cookie: `${id}.${secret}` };
   }
 
@@ -439,11 +458,14 @@ export class Devices {
     return this.locked;
   }
 
-  /** Saved before it's applied: if the save fails, pairing stays locked. */
+  /** Pairing stays locked if the store cannot be replaced. */
   unlockPairing(): void {
-    if (this.locked) this.save(undefined, false);
-    this.locked = false;
-    this.failures = [];
-    this.attempts = [];
+    const apply = () => {
+      this.locked = false;
+      this.failures = [];
+      this.attempts = [];
+    };
+    if (this.locked) this.save(undefined, false, apply);
+    else apply();
   }
 }

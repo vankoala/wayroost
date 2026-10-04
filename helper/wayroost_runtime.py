@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -19,6 +20,21 @@ def env(suffix: str, default=None, environ=None):
             print(f"Wayroost: {legacy} is deprecated; use {name}.", file=sys.stderr)
         return environ[legacy]
     return default
+
+
+def bridge_url() -> str:
+    """The installed bridge address, with environment overrides and loopback-only validation."""
+    url = env("BRIDGE_URL")
+    if url is None:
+        path = Path.home() / ".config" / "signalbox" / "bridge-url"
+        try:
+            url = path.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            url = "http://127.0.0.1:19012"
+    match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})/?", url)
+    if not match or not 1 <= int(match[1]) <= 65535:
+        raise ValueError("The bridge URL must be an HTTP address on 127.0.0.1 with a valid port")
+    return url.rstrip("/")
 
 
 def configured_role(default_config=None) -> str:

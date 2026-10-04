@@ -59,7 +59,9 @@ contains 'DISPLAY rescue key ONCE on /dev/tty only'
 plan "$REPO/deploy/install-supervisor.sh"
 contains '"statusOnly": true'
 # npm 10 refuses one file loaded as both user and global config.
-contains 'NPM_CONFIG_USERCONFIG=/dev/null'; absent 'NPM_CONFIG_GLOBALCONFIG=/dev/null'
+contains 'NPM_CONFIG_USERCONFIG=/dev/null'
+contains "NPM_CONFIG_GLOBALCONFIG=$ROOT/opt/wayroost/supervisor/.npm-no-globalconfig"
+absent 'NPM_CONFIG_GLOBALCONFIG=/dev/null'
 contains "WRITE $ROOT/etc/wayroost/components.local.json mode=0600 owner=root:root"
 contains '"id": "main-model"'; contains '"url": "http://127.0.0.1:19001/health"'
 plan "$REPO/deploy/install-supervisor.sh" --enable-actions
@@ -110,6 +112,9 @@ contains 'groupdel wayroost (only if neither Wayroost unit remains and the group
 echo 'PASS supervisor removal: stops own unit, removes own files, keys require explicit purge'
 
 plan "$REPO/deploy/install-wayroost-server.sh"
+contains 'NPM_CONFIG_USERCONFIG=/dev/null'
+contains "NPM_CONFIG_GLOBALCONFIG=$ROOT/opt/wayroost/server/.npm-no-globalconfig"
+absent 'NPM_CONFIG_GLOBALCONFIG=/dev/null'
 contains "install -d -m 0755 -o root -g root -- $ROOT/opt/wayroost/server"
 contains "WRITE $ROOT/etc/wayroost/config.json mode=0600 owner=root:root"
 contains '"role": "shadow"'; contains '"host": "127.0.0.1"'; contains '"port": 8881'

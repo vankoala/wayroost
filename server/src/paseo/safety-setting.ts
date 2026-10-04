@@ -7,6 +7,7 @@ import { ProviderOverridesSchema } from '@getpaseo/protocol/provider-config';
 import { pendingWorkerApprovals, type PaseoConfigWriter, type WorkerApprovalsApi, type WorkerApprovalsStatus } from '../../../shared/safety.js';
 import { CLOUD_AGENT_IDS, type CloudAgentId } from '../../../shared/protocol.js';
 import { withPaseoConfigLock } from './config-lock.js';
+import { waitWithAbort } from './abort.js';
 import { applyApprovalsToMe, BUILTIN_PROVIDER_IDS, undoApprovalsToMe, withRoleProviders, type Providers } from './safety-config.js';
 
 const Tools = z.object({ enabled: z.boolean().optional(), disabledTools: z.array(z.string()).optional() }).passthrough();
@@ -21,9 +22,9 @@ const CONFIG_MAX_BYTES = 2 * 1024 * 1024;
 const STATE_MAX_BYTES = 16 * 1024 * 1024;
 
 export interface SafetyDaemon {
-  providers(): Promise<string[]>;
-  effectiveProviders(): Promise<Providers>;
-  reload(): Promise<{ appliedPaths: string[]; restartRequiredPaths: string[]; overrideControlledPaths: string[] }>;
+  providers(signal?: AbortSignal): Promise<string[]>;
+  effectiveProviders(signal?: AbortSignal): Promise<Providers>;
+  reload(signal?: AbortSignal): Promise<{ appliedPaths: string[]; restartRequiredPaths: string[]; overrideControlledPaths: string[] }>;
 }
 
 function policyMatches(desired: Providers, effective: Providers, uncovered: string[], accounted: ReadonlySet<string>): boolean {
@@ -51,14 +52,17 @@ const serializedWithinLimit = (value: unknown, maxBytes: number): string => {
 };
 
 /** Private files, written whole in the same directory; no path comes from an RPC request. */
-function atomicSafetyWrite(path: string, value: unknown, maxBytes: number, expectedRevision?: string): boolean {
+function atomicSafetyWrite(path: string, value: unknown, maxBytes: number, expectedRevision?: string, signal?: AbortSignal): boolean {
+  signal?.throwIfAborted();
   const temporary = `${path}.${randomUUID()}.tmp`;
   let fd: number | undefined;
   let commit: SafetyWriteError['commit'] = 'uncommitted';
   try {
     try {
       const contents = serializedWithinLimit(value, maxBytes);
+      signal?.throwIfAborted();
       fd = openSync(temporary, 'wx', 0o600);
+      signal?.throwIfAborted();
       writeFileSync(fd, contents);
       fsyncSync(fd);
       closeSync(fd);
@@ -68,6 +72,7 @@ function atomicSafetyWrite(path: string, value: unknown, maxBytes: number, expec
         try { if (privateSnapshot(path, maxBytes).revision !== expectedRevision) return false; }
         catch (err) { if (err instanceof SafetyConflictError) return false; throw err; }
       }
+      signal?.throwIfAborted();
       commit = 'uncertain';
       renameSync(temporary, path);
       commit = 'replaced';
@@ -126,14 +131,15 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
     return next;
   }
   reconcile(): Promise<WorkerApprovalsStatus> { return this.run(); }
-  setEnabled(enabled: boolean): Promise<WorkerApprovalsStatus> { return this.run(enabled); }
+  setEnabled(enabled: boolean, signal?: AbortSignal, authorize?: () => Promise<void>): Promise<WorkerApprovalsStatus> { return this.run(enabled, signal, authorize); }
 
-  private run(enabled?: boolean): Promise<WorkerApprovalsStatus> {
-    return this.enqueue(() => this.apply(enabled));
+  private run(enabled?: boolean, signal?: AbortSignal, authorize?: () => Promise<void>): Promise<WorkerApprovalsStatus> {
+    return this.enqueue(() => this.apply(enabled, signal, authorize), signal);
   }
 
-  private enqueue<T>(work: () => Promise<T>): Promise<T> {
+  private enqueue<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const next = this.queue.then(() => {
+      signal?.throwIfAborted();
       this.result = { ...pendingWorkerApprovals(), enabled: this.state.enabled };
       return withPaseoConfigLock(this.configPath, this.stateDir, async () => {
         // Another helper instance may have saved a choice or backup since construction.
@@ -143,18 +149,20 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
         }
         if (this.firstRead) { this.state.reloadPending = true; this.firstRead = false; }
         return work();
-      });
+      }, signal);
     });
     this.queue = next.catch(() => {});
-    return next;
+    return waitWithAbort(next, signal);
   }
 
-  setCloudAgentEnabled(id: CloudAgentId, enabled: boolean): Promise<void> {
+  setCloudAgentEnabled(id: CloudAgentId, enabled: boolean, signal?: AbortSignal, authorize?: () => Promise<void>): Promise<void> {
     return this.enqueue(async () => {
       if (!CLOUD_AGENT_IDS.includes(id)) throw new Error('Unknown cloud agent.');
-      this.recoverPrepared();
+      if (authorize) await waitWithAbort(authorize(), signal);
+      signal?.throwIfAborted();
+      this.recoverPrepared(signal);
       const pending = { ...this.state, reloadPending: true };
-      atomicSafetyWrite(this.statePath, pending, STATE_MAX_BYTES);
+      atomicSafetyWrite(this.statePath, pending, STATE_MAX_BYTES, undefined, signal);
       this.state = pending;
       for (let attempt = 0; attempt < 3; attempt++) {
         const snapshot = privateSnapshot(this.configPath);
@@ -163,34 +171,38 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
         const candidate = { ...config, agents: { ...config.agents, providers: {
           ...providers, [id]: { ...providers[id], enabled },
         } } };
-        if (!atomicSafetyWrite(this.configPath, candidate, CONFIG_MAX_BYTES, snapshot.revision)) continue;
+        if (!atomicSafetyWrite(this.configPath, candidate, CONFIG_MAX_BYTES, snapshot.revision, signal)) continue;
         const written = privateSnapshot(this.configPath);
         if (written.contents !== serialized(candidate)) throw new Error('Paseo configuration conflict after switching the cloud agent.');
-        const reload = await this.daemon.reload();
+        const reload = await waitWithAbort(this.daemon.reload(signal), signal);
         const affectsProvider = (path: string) => path === 'agents' || path === 'agents.providers' || path.startsWith(`agents.providers.${id}`);
         if (reload.restartRequiredPaths.some(affectsProvider) || reload.overrideControlledPaths.some(affectsProvider)) {
           throw new Error('Paseo has not applied the cloud agent switch.');
         }
-        const effective = await this.daemon.effectiveProviders();
+        const effective = await waitWithAbort(this.daemon.effectiveProviders(signal), signal);
         if ((effective[id]?.enabled ?? true) !== enabled || privateSnapshot(this.configPath).revision !== written.revision) {
           throw new Error('Paseo configuration or policy changed while verifying the cloud agent switch.');
         }
         return;
       }
       throw new Error('Paseo configuration conflict: the cloud agent switch changed on all three attempts.');
-    });
+    }, signal);
   }
 
-  private async apply(enabled?: boolean): Promise<WorkerApprovalsStatus> {
+  private async apply(enabled?: boolean, signal?: AbortSignal, authorize?: () => Promise<void>): Promise<WorkerApprovalsStatus> {
     let offered: string[];
-    try { offered = await this.daemon.providers(); }
+    try { offered = await waitWithAbort(this.daemon.providers(signal), signal); }
     catch {
+      signal?.throwIfAborted();
       // Discovery failed before checking the current config and live policy.
       this.result = { ...pendingWorkerApprovals(), enabled: this.state.enabled, reload: 'failed', message: 'Paseo could not be reached. The saved choice has not changed; its configuration and policy have not been confirmed.' };
       return this.result;
     }
+    // Discovery and queue waits precede the caller's final authorization.
+    if (authorize) await waitWithAbort(authorize(), signal);
+    signal?.throwIfAborted();
     let policy: ReturnType<WorkerApprovalsSetting['writePolicy']>;
-    try { policy = this.writePolicy(offered, enabled); }
+    try { policy = this.writePolicy(offered, enabled, signal); }
     catch (err) {
       this.result = { ...pendingWorkerApprovals(), enabled: this.state.enabled, message: err instanceof Error ? err.message : undefined };
       if (err instanceof SafetyConflictError) return this.result;
@@ -201,40 +213,41 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
     try {
       // The daemon can change independently of the file, even after a confirmed
       // reload. Reconcile its live policy before reporting a settled setting.
-      let effective = this.state.reloadPending ? undefined : await this.daemon.effectiveProviders();
+      let effective = this.state.reloadPending ? undefined : await waitWithAbort(this.daemon.effectiveProviders(signal), signal);
       if (effective && !policyMatches(providers, effective, uncovered, accounted)) {
-        atomicSafetyWrite(this.statePath, { ...this.state, reloadPending: true }, STATE_MAX_BYTES);
+        atomicSafetyWrite(this.statePath, { ...this.state, reloadPending: true }, STATE_MAX_BYTES, undefined, signal);
         this.state.reloadPending = true;
       }
       if (this.state.reloadPending) {
-        const reload = await this.daemon.reload();
+        const reload = await waitWithAbort(this.daemon.reload(signal), signal);
         const affectsPolicy = (path: string) => path === 'agents' || path === 'agents.providers' || path.startsWith('agents.providers.');
         if (reload.restartRequiredPaths.some(affectsPolicy) || reload.overrideControlledPaths.some(affectsPolicy)) {
           return { ...this.result, message: 'The policy was saved, but Paseo has not applied it. A restart or removal of an override is required.' };
         }
         // appliedPaths lists changes, so a restart or lost response can yield a
         // successful no-op. Confirm the live policy, including limits removed by undo.
-        effective = await this.daemon.effectiveProviders();
+        effective = await waitWithAbort(this.daemon.effectiveProviders(signal), signal);
       }
       if (!effective || !policyMatches(providers, effective, uncovered, accounted)) {
         return { ...this.result, message: 'The policy was saved, but Paseo\'s effective provider policy differs. The helper will retry.' };
       }
       if (this.state.reloadPending) {
-        atomicSafetyWrite(this.statePath, { ...this.state, reloadPending: false }, STATE_MAX_BYTES);
+        atomicSafetyWrite(this.statePath, { ...this.state, reloadPending: false }, STATE_MAX_BYTES, undefined, signal);
         this.state.reloadPending = false;
-        effective = await this.daemon.effectiveProviders();
+        effective = await waitWithAbort(this.daemon.effectiveProviders(signal), signal);
       }
       // Read disk after the last awaited daemon call and state write. An owner
       // edit invalidates confirmation even when the daemon returned an old snapshot.
       const configCurrent = privateSnapshot(this.configPath).revision === configRevision;
       if (!configCurrent || !policyMatches(providers, effective, uncovered, accounted)) {
-        atomicSafetyWrite(this.statePath, { ...this.state, reloadPending: true }, STATE_MAX_BYTES);
+        atomicSafetyWrite(this.statePath, { ...this.state, reloadPending: true }, STATE_MAX_BYTES, undefined, signal);
         this.state.reloadPending = true;
         return { ...this.result, message: 'Paseo configuration or policy changed during verification. The setting is not confirmed; the helper will retry.' };
       }
     } catch {
+      signal?.throwIfAborted();
       if (!this.state.reloadPending) {
-        atomicSafetyWrite(this.statePath, { ...this.state, reloadPending: true }, STATE_MAX_BYTES);
+        atomicSafetyWrite(this.statePath, { ...this.state, reloadPending: true }, STATE_MAX_BYTES, undefined, signal);
         this.state.reloadPending = true;
       }
       return { ...this.result, reload: 'failed', message: 'The policy was saved. Paseo policy verification or reload failed; the helper will retry.' };
@@ -321,7 +334,7 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
     return { config, current, uncovered, providers, changed, backup, deferred, accounted };
   }
 
-  private recoverPrepared(): void {
+  private recoverPrepared(signal?: AbortSignal): void {
     const prepared = this.state.prepared;
     if (!prepared) return;
     const currentRevision = revision(privateContents(this.configPath));
@@ -330,12 +343,12 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
     }
     const { prepared: _prepared, ...saved } = this.state;
     const recovered = { ...saved, backup: currentRevision === prepared.afterRevision ? prepared.committedBackup : prepared.previousBackup };
-    atomicSafetyWrite(this.statePath, recovered, STATE_MAX_BYTES);
+    atomicSafetyWrite(this.statePath, recovered, STATE_MAX_BYTES, undefined, signal);
     this.state = recovered;
   }
 
-  private writePolicy(offered: string[], enabled?: boolean): { providers: Providers; uncovered: string[]; accounted: ReadonlySet<string>; chosen: boolean; configRevision: string } {
-    this.recoverPrepared();
+  private writePolicy(offered: string[], enabled?: boolean, signal?: AbortSignal): { providers: Providers; uncovered: string[]; accounted: ReadonlySet<string>; chosen: boolean; configRevision: string } {
+    this.recoverPrepared(signal);
     const original = this.state;
     const chosen = enabled ?? original.enabled;
     // Cooperating writers share the lock. Retry edits by other writers from fresh content.
@@ -356,14 +369,15 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
         beforeRevision: revision(contents), afterRevision: revision(candidateContents),
         previousBackup: original.backup, committedBackup: committed.backup,
       } } : saved;
-      atomicSafetyWrite(this.statePath, prepared, STATE_MAX_BYTES);
+      atomicSafetyWrite(this.statePath, prepared, STATE_MAX_BYTES, undefined, signal);
       this.state = prepared;
       let written: boolean;
       try {
         written = changed
-          ? atomicSafetyWrite(this.configPath, candidate, CONFIG_MAX_BYTES, snapshot.revision)
+          ? atomicSafetyWrite(this.configPath, candidate, CONFIG_MAX_BYTES, snapshot.revision, signal)
           : privateSnapshot(this.configPath).revision === snapshot.revision;
       } catch (err) {
+        signal?.throwIfAborted();
         let uncommitted = !changed || (err instanceof SafetyWriteError && err.commit === 'uncommitted');
         if (err instanceof SafetyWriteError && err.commit === 'uncertain') {
           try { uncommitted = privateSnapshot(this.configPath).revision === snapshot.revision; }
@@ -371,7 +385,7 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
         }
         if (uncommitted) {
           const restored = { ...saved, backup: original.backup };
-          atomicSafetyWrite(this.statePath, restored, STATE_MAX_BYTES);
+          atomicSafetyWrite(this.statePath, restored, STATE_MAX_BYTES, undefined, signal);
           this.state = restored;
         }
         throw err;
@@ -379,7 +393,7 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
       if (!written) {
         // No policy was replaced: discard the speculative undo record before retrying.
         const pending = { ...original, enabled: chosen, reloadPending: true };
-        atomicSafetyWrite(this.statePath, pending, STATE_MAX_BYTES);
+        atomicSafetyWrite(this.statePath, pending, STATE_MAX_BYTES, undefined, signal);
         this.state = pending;
         continue;
       }
@@ -387,7 +401,7 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
       // Keep both undo records on conflict, including records an undo would clear.
       const conflict = (message: string): never => {
         const retained = { ...saved, backup: { ...original.backup, ...committed.backup }, reloadPending: true };
-        atomicSafetyWrite(this.statePath, retained, STATE_MAX_BYTES);
+        atomicSafetyWrite(this.statePath, retained, STATE_MAX_BYTES, undefined, signal);
         this.state = retained;
         throw new SafetyConflictError(message);
       };
@@ -403,13 +417,13 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
         return conflict('Paseo configuration conflict during verification. The setting is not confirmed; its undo backup was kept.');
       }
       if (changed || !chosen) {
-        atomicSafetyWrite(this.statePath, committed, STATE_MAX_BYTES);
+        atomicSafetyWrite(this.statePath, committed, STATE_MAX_BYTES, undefined, signal);
         this.state = committed;
       }
       return { providers, uncovered, accounted, chosen, configRevision: writtenSnapshot.revision };
     }
     const pending = { ...original, enabled: chosen, reloadPending: true };
-    atomicSafetyWrite(this.statePath, pending, STATE_MAX_BYTES);
+    atomicSafetyWrite(this.statePath, pending, STATE_MAX_BYTES, undefined, signal);
     this.state = pending;
     throw new SafetyConflictError('Paseo configuration conflict: the file changed on all three attempts. The choice was saved; retry the Safety change.');
   }

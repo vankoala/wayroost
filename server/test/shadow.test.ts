@@ -13,6 +13,8 @@ import { PushSender } from '../src/feed/push.js';
 import { Feed } from '../src/feed/service.js';
 import { FeedStore } from '../src/feed/store.js';
 import { EventHub } from '../src/hub.js';
+import { Devices } from '../src/devices.js';
+import { seedDevices, TEST_PHONE } from './helpers.js';
 import { SafetyCommandsSetting } from '../src/hermes/safety.js';
 import { Lineage } from '../src/lineage.js';
 import { AgentTimelineMirror, type MirrorSink } from '../src/paseo/mirror.js';
@@ -104,8 +106,8 @@ describe.each(roles)('%s background effects', (role) => {
     const item = store.ingest('brief', [card]).created[0]!;
     expect((await feed.act(item.id, 'do')).chat?.id).toBe('fake-created-chat');
     expect(hermes.createConversation).toHaveBeenCalledOnce();
-    feed.addDevice({ endpoint: 'https://fcm.googleapis.com/fake-device', keys: { p256dh: 'fake', auth: 'fake' } });
-    feed.removeDevice('https://fcm.googleapis.com/fake-device');
+    feed.addDevice({ endpoint: 'https://fcm.googleapis.com/fake-device', keys: { p256dh: 'fake', auth: 'fake' } }, TEST_PHONE.id);
+    feed.removeDevice('https://fcm.googleapis.com/fake-device', TEST_PHONE.id);
     expect(push.add).toHaveBeenCalledOnce();
     expect(push.remove).toHaveBeenCalledOnce();
     expect(await feed.testPush()).toEqual({ sent: 1 });
@@ -318,11 +320,13 @@ describe.each(roles)('%s background effects', (role) => {
 
   it('gates Web Push posts and dead subscription removal', async () => {
     const state = dir();
+    seedDevices(state);
     const fetch = vi.fn(async () => new Response(null, { status: 410 }));
     const push = new PushSender(state, 'https://wayroost.example.com', quiet, fetch as never, background);
+    push.bindDevices(new Devices(state));
     const browser = createECDH('prime256v1');
     browser.generateKeys();
-    push.add({ endpoint: 'https://fcm.googleapis.com/fake-device', keys: { p256dh: browser.getPublicKey().toString('base64url'), auth: Buffer.alloc(16).toString('base64url') } });
+    push.add({ endpoint: 'https://fcm.googleapis.com/fake-device', keys: { p256dh: browser.getPublicKey().toString('base64url'), auth: Buffer.alloc(16).toString('base64url') } }, TEST_PHONE.id);
     const before = readFileSync(join(state, 'push.json'), 'utf8');
     const result = await push.send({ title: 'Wayroost', body: 'Demo', url: '/', tag: 'fake-tag', ttl: 60, urgency: 'normal' });
     expect(fetch).toHaveBeenCalledTimes(on ? 1 : 0);

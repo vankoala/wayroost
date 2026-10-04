@@ -417,6 +417,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const { config, verifier, hub, sources } = deps;
   if (config.access && !verifier) throw new Error('Cloudflare Access is configured but no token verifier was given');
   const devices = config.devices.enabled ? (deps.devices ?? new Devices(config.stateDir)) : undefined;
+  deps.feed?.bindDevices(devices);
   const app = Fastify({
     ...(config.tls ? { https: listenerTls(config.tls, process.env, wayroostEnv('DEV_ALLOW_LOOPBACK') === '1') } : {}),
     logger: deps.logger ?? { level: 'info' },
@@ -426,6 +427,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     logController: new LogController({ disableRequestLogging: true }),
     return503OnClosing: true,
   });
+  const stopPushRevokeWatch = devices?.onRevoke((id) => withDeviceSignal(undefined, () => deps.feed?.revokeDevice(id)));
+  app.addHook('onClose', async () => stopPushRevokeWatch?.());
   const changes: string[] = [];
   CHANGE_ROUTES.set(app, changes);
   const checkLiveChange = (req: FastifyRequest): void => {
@@ -662,7 +665,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const store = pairing();
     const { id } = DeviceParams.parse(req.params);
     requireSelfOrDesktop(req, id);
-    if (!store.revoke(id)) throw new UserFacingError('That device is no longer paired.', 404);
+    const release = await deps.workerApprovals?.cancelPending?.(store.signal(id));
+    try {
+      requireSelfOrDesktop(req, id);
+      changeDevice(req);
+      if (!store.revoke(id)) throw new UserFacingError('That device is no longer paired.', 404);
+    } finally { release?.(); }
     if (req.device?.id === id) reply.header('set-cookie', clearedDeviceCookie(secureCookie(req)));
     req.log.warn({ device: id, by: req.device?.id }, 'device revoked');
     return { ok: true };
@@ -1141,10 +1149,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get('/api/push/key', async () => ({ publicKey: feed().pushKey() }));
 
-  app.post('/api/push/devices', async (req) => ({ devices: feed().addDevice(PushSubscriptionInput.parse(req.body)) }));
+  app.post('/api/push/devices', async (req) => ({ devices: feed().addDevice(PushSubscriptionInput.parse(req.body), changeDevice(req).id) }));
 
   app.post('/api/push/devices/remove', async (req) => ({
-    devices: feed().removeDevice(PushEndpointBody.parse(req.body).endpoint),
+    devices: feed().removeDevice(PushEndpointBody.parse(req.body).endpoint, changeDevice(req).id),
   }));
 
   app.post('/api/push/test', async () => feed().testPush());

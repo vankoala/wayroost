@@ -42,9 +42,10 @@ sys.path.insert(0, str(_runtime_dir))
 try:
     if not (_runtime_dir / "wayroost_runtime.py").is_file():
         raise ImportError("Wayroost runtime is missing")
-    from wayroost_runtime import BackgroundGate, env as runtime_env  # noqa: E402
+    from wayroost_runtime import BackgroundGate, bridge_url, env as runtime_env  # noqa: E402
 except ImportError:
     BackgroundGate = None
+    bridge_url = None
 
     def runtime_env(suffix, default=None, environ=None):
         environ = os.environ if environ is None else environ
@@ -79,7 +80,6 @@ def on_pre_tool_call(tool_name: Any = "", args: Any = None, session_id: Any = ""
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.ASCII)
 _LAUNCH_VARS = (b"WAYROOST_LAUNCHER", b"SIGNALBOX_LAUNCHER", b"HERMES_SESSION_ID", b"PASEO_AGENT_ID")
-_BRIDGE_URL = "http://127.0.0.1:19012"
 _reported = False
 
 
@@ -129,11 +129,14 @@ def _bridge_token() -> Optional[str]:
 
 
 def _post(tool: str, body: Dict[str, Any], timeout: float = 1.0) -> None:
+    if bridge_url is None:
+        return
+    url = bridge_url()
     token = _bridge_token()
     if not token:
         return
     request = urllib.request.Request(
-        f"{_BRIDGE_URL}/bridge/v1/{tool}",
+        f"{url}/bridge/v1/{tool}",
         data=json.dumps(body).encode(),
         method="POST",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},

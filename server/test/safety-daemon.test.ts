@@ -79,3 +79,23 @@ it('closes failed effective-config reads and retries with a fresh authenticated 
   expect(DaemonClient).toHaveBeenCalledTimes(2);
   for (const client of fake.clients) expect(client.close).toHaveBeenCalledOnce();
 });
+
+it.each(['connect', 'getProvidersSnapshot'] as const)('closes cancelled discovery during %s and skips later SDK work', async stage => {
+  const stalled = fake.freshClient();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  if (stage === 'connect') stalled.connect.mockImplementationOnce(() => gate);
+  else stalled.getProvidersSnapshot.mockImplementationOnce(async () => { await gate; return { entries: [] }; });
+  fake.createClient.mockReturnValueOnce(stalled);
+  const controller = new AbortController();
+  const daemon = createSafetyDaemon('ws://127.0.0.1:8896');
+  const outcome = daemon.providers(controller.signal).catch(error => error);
+  try {
+    await vi.waitFor(() => expect(stalled[stage]).toHaveBeenCalledOnce());
+    controller.abort();
+    await vi.waitFor(() => expect(stalled.close).toHaveBeenCalledOnce(), { timeout: 500 });
+    expect(await outcome).toMatchObject({ name: 'AbortError' });
+  } finally { release(); await outcome; }
+  if (stage === 'connect') expect(stalled.getProvidersSnapshot).not.toHaveBeenCalled();
+  expect(await daemon.providers()).toEqual(['demo-plugin']);
+});

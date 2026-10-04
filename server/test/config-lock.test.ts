@@ -100,3 +100,25 @@ it('refuses a symlink lock without invoking the writer', async () => {
   expect(writer).not.toHaveBeenCalled();
   expect(fs.readFileSync(f.path, 'utf8')).toBe(JSON.stringify({ owner: 'demo-original' }));
 });
+
+it('cancels a lock waiter and never runs its writer after the holder releases', async () => {
+  const f = fixture();
+  const controller = new AbortController();
+  const writer = vi.fn(async () => 'written');
+  let outcome: Promise<unknown> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await withPaseoConfigLock(f.path, f.root, async () => {
+      outcome = withPaseoConfigLock(f.path, f.root, writer, controller.signal).catch(error => error);
+      controller.abort();
+      const result = await Promise.race([
+        outcome,
+        new Promise(resolve => { timer = setTimeout(() => resolve('not cancelled'), 1000); }),
+      ]);
+      expect(result).toMatchObject({ name: 'AbortError' });
+      expect(writer).not.toHaveBeenCalled();
+    });
+  } finally { clearTimeout(timer); await outcome; }
+  expect(writer).not.toHaveBeenCalled();
+  expect(spawnSync('/usr/bin/flock', ['--nonblock', f.lock, '/bin/true']).status).toBe(0);
+});

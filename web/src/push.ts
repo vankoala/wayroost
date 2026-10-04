@@ -43,7 +43,12 @@ export async function pushState(): Promise<PushState> {
   if (Notification.permission === 'denied') return 'denied';
   const registration = await navigator.serviceWorker.getRegistration('/');
   const subscription = await registration?.pushManager.getSubscription();
-  return subscription ? 'on' : 'off';
+  if (!subscription) return 'off';
+  try {
+    const json = subscription.toJSON() as { endpoint: string; keys: { p256dh: string; auth: string } };
+    await api.pushAddDevice({ endpoint: json.endpoint, keys: json.keys, label: deviceLabel() });
+    return 'on';
+  } catch { return 'off'; }
 }
 
 /** Ask for permission and subscribe this browser. Call it straight from a tap. */

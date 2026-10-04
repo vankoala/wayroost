@@ -49,6 +49,23 @@ function largePolicyFixture() {
   return { ...f, ownerTool };
 }
 
+it('checks cancellation immediately before publishing a prepared write', async () => {
+  const f = fixture(true);
+  const beforeConfig = fs.readFileSync(f.configPath);
+  const beforeState = fs.readFileSync(f.statePath);
+  const controller = new AbortController();
+  vi.mocked(fs.writeFileSync).mockImplementationOnce((...args) => {
+    actual.writeFileSync(...args);
+    controller.abort();
+  });
+  await expect(f.setting.setEnabled(false, controller.signal)).rejects.toThrow();
+  expect(fs.readFileSync(f.configPath)).toEqual(beforeConfig);
+  expect(fs.readFileSync(f.statePath)).toEqual(beforeState);
+  expect(fs.renameSync).not.toHaveBeenCalled();
+  expect(f.daemon.reload).not.toHaveBeenCalled();
+  expect(fs.readdirSync(f.root).filter(name => name.endsWith('.tmp'))).toEqual([]);
+});
+
 it('keeps a large undo backup readable across status, cloud writes, restart and undo', async () => {
   const f = largePolicyFixture();
   expect(await f.setting.setEnabled(true)).toMatchObject({ enabled: true, config: 'written', reload: 'applied' });

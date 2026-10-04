@@ -7,10 +7,11 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Approval, ScheduleJob, ScheduleList, ServerEvent } from '../../shared/protocol.js';
 import { buildBridgeServer } from '../src/bridge/server.js';
 import { EventHub } from '../src/hub.js';
+import { Devices } from '../src/devices.js';
 import { encryptPayload, endpointProblem, PushSender } from '../src/feed/push.js';
 import { BRIEF_JOB, Feed, SCOUT_JOB, SCOUT_SCHEDULES } from '../src/feed/service.js';
 import { CardInput, FeedStore } from '../src/feed/store.js';
-import { apiHeaders, makeApp, makeKeys, makeToken, postHeaders, type Keys } from './helpers.js';
+import { apiHeaders, makeApp, makeKeys, makeToken, postHeaders, seedDevices, TEST_PHONE, type Keys } from './helpers.js';
 
 const dir = () => mkdtempSync(join(tmpdir(), 'sb-feed-'));
 const quietLog = { info() {}, warn() {}, error() {} };
@@ -256,6 +257,8 @@ describe('Web Push', () => {
 
   it('signs with VAPID, encrypts for each device, and forgets devices that are gone', async () => {
     const state = dir();
+    seedDevices(state);
+    const devices = new Devices(state);
     const calls: Array<{ url: string; headers: Record<string, string>; body: Buffer }> = [];
     let status = 201;
     const fetchStub = (async (url: string, init: RequestInit) => {
@@ -263,11 +266,12 @@ describe('Web Push', () => {
       return new Response(null, { status });
     }) as unknown as typeof fetch;
     const push = new PushSender(state, 'https://wayroost.example.com', quietLog, fetchStub, new BackgroundGate('primary'));
+    push.bindDevices(devices);
     const phone = browser();
-    expect(push.add(phone.subscription())).toBe(1);
-    expect(() => push.add({ ...phone.subscription('https://evil.example/x') })).toThrow('not a known push service');
+    expect(push.add(phone.subscription(), TEST_PHONE.id)).toBe(1);
+    expect(() => push.add({ ...phone.subscription('https://evil.example/x') }, TEST_PHONE.id)).toThrow('not a known push service');
     expect(() =>
-      push.add({ endpoint: 'https://fcm.googleapis.com/x', keys: { p256dh: 'A'.repeat(87), auth: phone.auth.toString('base64url') } }),
+      push.add({ endpoint: 'https://fcm.googleapis.com/x', keys: { p256dh: 'A'.repeat(87), auth: phone.auth.toString('base64url') } }, TEST_PHONE.id),
     ).toThrow('malformed keys');
 
     const message = { title: 'Hermes needs you', body: 'Run a shell command', url: '/c/hermes/x', tag: 't', ttl: 60, urgency: 'high' as const, topic: 'approvals' };
@@ -297,6 +301,7 @@ describe('Web Push', () => {
 
     // The same key after a restart; a device the service says is gone is dropped.
     const reloaded = new PushSender(state, 'https://wayroost.example.com', quietLog, fetchStub, new BackgroundGate('primary'));
+    reloaded.bindDevices(devices);
     expect(reloaded.publicKey()).toBe(push.publicKey());
     status = 410;
     expect(await reloaded.send(message, now)).toEqual({ sent: 0, failed: 0, removed: 1 });
