@@ -7,6 +7,7 @@ import {
   type CleanupPreview,
   type CloudAgentId,
   type CloudAgentsStatus,
+  type ProjectConfigReport,
   type SafetyCommandsStatus,
   type WorkerUpdatesStatus,
   type TaskList,
@@ -56,6 +57,11 @@ import {
   type VoiceStatus,
 } from '../../shared/protocol';
 import type { WorkerApprovalsStatus } from '../../shared/safety';
+import type { NotificationSettingsView } from '../../shared/protocol';
+import { SETTINGS_API, type RecentChange, type SettingsApplyResponse, type SettingsNotificationsWriteBody, type SettingsSection } from '../../shared/settings.js';
+import type { SettingsChecksResponse } from '../../shared/settings-checks.js';
+import type { DrainRestartComponent } from '../../shared/settings.js';
+import type { SettingsCredentialPayload, SettingsRefusal, SettingsRestartPayload, SettingsSectionPayload, SettingsUsagePayload } from './settingsModel.js';
 import { isApprovalDetail, isApprovalSnapshot } from '../../shared/approval-validation';
 import { approvalKey, convKey, getAuthenticationGeneration, markUnpaired, setState, toast, withEarlyItems } from './store';
 import { ApiError, beginAuthenticatedRequest, checkAuthentication, checkAuthenticationGeneration, reportAuthenticationAnomaly } from './authentication';
@@ -69,6 +75,15 @@ export interface Upload {
 }
 
 export { ApiError, markUnpaired };
+
+let notificationSettingsSaves: Promise<void> = Promise.resolve();
+
+/** Both settings editors read and save shared preferences one at a time. */
+export function serializeNotificationSettingsSave<T>(save: () => Promise<T>): Promise<T> {
+  const saved = notificationSettingsSaves.then(save);
+  notificationSettingsSaves = saved.then(() => {}, () => {});
+  return saved;
+}
 
 export async function request<T>(method: string, path: string, body?: unknown, validate?: (value: unknown) => value is T): Promise<T> {
   const generation = beginAuthenticatedRequest(method === 'POST' && path === '/api/pair');
@@ -100,10 +115,10 @@ export async function request<T>(method: string, path: string, body?: unknown, v
     parsed = false;
     return undefined;
   });
-  const data = (raw ?? {}) as { error?: string };
+  const data = (raw ?? {}) as { error?: string; code?: string };
   checkAuthenticationGeneration(generation);
   if (!res.ok) {
-    throw new ApiError(data.error ?? `Request failed (${res.status})`, 'http', res.status);
+    throw new ApiError(data.error ?? (data.code ? `Settings change refused: ${data.code.replaceAll('_', ' ')}.` : `Request failed (${res.status})`), 'http', res.status);
   }
   if (!parsed && authenticationEndpoint(path)) reportAuthenticationAnomaly(generation);
   if (!parsed) throw new ApiError("Can't reach Wayroost. Check your connection.", 'network');
@@ -122,6 +137,34 @@ function processResponse<T>(generation: number, process: () => T): T {
     reportAuthenticationAnomaly(generation);
     throw error;
   }
+}
+
+/**
+ * The settings routes answer a refusal with a fixed code in the body, whatever the HTTP status;
+ * return the body as it is, so each page words the code itself. Transport and authentication
+ * failures still throw.
+ */
+async function settingsCall<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const generation = beginAuthenticatedRequest(false);
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method,
+      headers: { [REQUEST_MARKER_HEADER]: '1', ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'manual',
+    });
+  } catch {
+    throw new ApiError("Can't reach Wayroost. Check your connection.", 'network');
+  }
+  await checkAuthentication(res, generation, authenticationEndpoint(path));
+  const raw: unknown = await res.json().catch(() => undefined);
+  checkAuthenticationGeneration(generation);
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new ApiError("Can't reach Wayroost. Check your connection.", 'network');
+  if (!res.ok && (!('status' in raw) || raw.status !== 'refused')) throw new ApiError('This PC did not answer. Try again.', 'http', res.status);
+  return raw as T;
 }
 
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
@@ -314,6 +357,9 @@ export const api = {
       ...(input.confirmModel ? { confirmModel: true } : {}),
     }),
   paseoOptions: () => request<PaseoOptions>('GET', '/api/paseo/options'),
+  /** What a folder's own files would let an agent do there, before it starts (names, never content). */
+  projectConfig: (path: string, provider: string) =>
+    request<ProjectConfigReport>('POST', '/api/project-config', { path, provider }),
   /** Whether a folder for a new chat exists (asked through Paseo, which runs as you). */
   folderStatus: (path: string) => request<{ status: FolderStatus }>('GET', `/api/folders?path=${encodeURIComponent(path)}`),
   /** Make a new folder, one level below an existing one; Paseo lists it as a project too. */
@@ -362,6 +408,32 @@ export const api = {
     push?: { approvals?: boolean; cards?: boolean };
     removeLessLike?: string;
   }) => request<FeedSettings>('PUT', '/api/feed/settings', patch),
+  notificationSettings: () => request<NotificationSettingsView>('GET', '/api/settings/notifications'),
+  /** Settings, sections and all: rows for the pages below. A refusal comes back as a fixed code, not a throw. */
+  settingsSection: (section: SettingsSection) => settingsCall<SettingsSectionPayload>('GET', SETTINGS_API.section(section)),
+  settingsChanges: () => settingsCall<{ changes: RecentChange[] }>('GET', SETTINGS_API.changes),
+  settingsApply: (body: { operation: string; params: Record<string, unknown>; expected?: unknown; confirm?: string }) =>
+    settingsCall<SettingsApplyResponse>('POST', SETTINGS_API.apply, body),
+  settingsUndo: (body: { change: string; confirm?: string }) =>
+    settingsCall<SettingsApplyResponse>('POST', SETTINGS_API.undo, body),
+  settingsUsage: () => settingsCall<SettingsUsagePayload>('GET', SETTINGS_API.usage),
+  settingsChecks: () => settingsCall<SettingsChecksResponse | SettingsRefusal>('GET', SETTINGS_API.checks),
+  /** The field never echoes the key back: the answer is the timing, or a fixed code. */
+  settingsCredentialSet: (provider: string, secret: string) =>
+    settingsCall<SettingsCredentialPayload>('PUT', SETTINGS_API.credential(provider), { secret }),
+  settingsCredentialRemove: (provider: string) =>
+    settingsCall<SettingsCredentialPayload>('DELETE', SETTINGS_API.credential(provider)),
+  settingsCredentialTest: (provider: string, backend: string) =>
+    settingsCall<SettingsCredentialPayload>('POST', SETTINGS_API.credentialTest(provider), { backend }),
+  settingsRestartRun: (id: string) => settingsCall<SettingsRestartPayload>('GET', `/api/settings/restart/${encodeURIComponent(id)}`),
+  settingsRestart: (component: DrainRestartComponent, when: 'idle' | 'now', confirm?: string) =>
+    settingsCall<SettingsRestartPayload>('POST', SETTINGS_API.restart, { component, when, ...(confirm ? { confirm } : {}) }),
+  setNotificationSettings: async (body: SettingsNotificationsWriteBody): Promise<NotificationSettingsView> => {
+    const result = await request<SettingsApplyResponse>('PUT', '/api/settings/notifications', body);
+    if (result.status !== 'applied') throw new ApiError(result.status === 'refused'
+      ? `Settings change refused: ${result.code.replaceAll('_', ' ')}.` : 'This settings change needs confirmation.', 'http');
+    return api.notificationSettings();
+  },
   pushKey: () => request<{ publicKey: string }>('GET', '/api/push/key'),
   pushAddDevice: (subscription: { endpoint: string; keys: { p256dh: string; auth: string }; label?: string }) =>
     request<{ devices: number }>('POST', '/api/push/devices', subscription),

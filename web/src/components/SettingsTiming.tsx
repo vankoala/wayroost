@@ -1,6 +1,7 @@
 const LABELS = {
   now: 'Applies now',
   'next-chat': 'From the next chat',
+  'next-alert': 'From the next alert',
   restart: 'Needs a restart',
 };
 

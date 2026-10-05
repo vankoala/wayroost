@@ -225,7 +225,7 @@ it.each([true, false].flatMap(enabled => ['unrelated', 'policy', 'missing'].map(
   if (change === 'unrelated') expect(f.read().unrelated).toBe('demo-post-write-edit');
 });
 
-it('returns an unconfirmed API response for a post-write conflict, then verifies recovery', async () => {
+it('returns an unconfirmed conflict result, then verifies recovery through the read API', async () => {
   const f = fixture();
   let edited = false;
   vi.mocked(fs.renameSync).mockImplementation((from, to) => {
@@ -238,9 +238,8 @@ it('returns an unconfirmed API response for a post-write conflict, then verifies
   const { app } = await makeApp(keys, { workerApprovals: f.setting });
   try {
     const token = await makeToken(keys);
-    const response = await app.inject({ method: 'PUT', url: '/api/worker-approvals', headers: postHeaders(token), payload: { enabled: true } });
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ enabled: true, config: 'pending', reload: 'pending', application: 'pending', message: expect.stringContaining('conflict') });
+    const response = await f.setting.setEnabled(true);
+    expect(response).toMatchObject({ enabled: true, config: 'pending', reload: 'pending', application: 'pending', message: expect.stringContaining('conflict') });
     expect(f.daemon.reload).not.toHaveBeenCalled();
     expect(f.state().backup.pi.before.disabledTools).toEqual(['kill_agent']);
     const recovered = await app.inject({ url: '/api/worker-approvals', headers: apiHeaders(token) });

@@ -88,13 +88,13 @@ describe('startup configuration', () => {
     const credential = join(credentials, 'supervisor-server-key');
     config({ socket, ...(fallback ? { keyFile: devKey } : {}) });
     writeFileSync(credential, `${KEY}\n`, { mode: 0o600 });
-    expect(loadStartupConfig(path, { CREDENTIALS_DIRECTORY: credentials }).supervisor).toEqual({ socket, keyFile: credential });
+    expect(loadStartupConfig(path, { CREDENTIALS_DIRECTORY: credentials }).supervisor).toEqual({ socket, keyFile: credential, expectedStatusOnly: true });
   });
 
   it('uses the dev key only without a configured credentials directory', () => {
     const socket = join(root, 'supervisor.sock');
     config({ socket, keyFile: devKey });
-    expect(loadStartupConfig(path, {}).supervisor).toEqual({ socket, keyFile: devKey });
+    expect(loadStartupConfig(path, {}).supervisor).toEqual({ socket, keyFile: devKey, expectedStatusOnly: true });
     config({ socket });
     expect(() => loadStartupConfig(path, {})).toThrow(/supervisor needs its key/);
   });

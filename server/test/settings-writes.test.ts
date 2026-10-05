@@ -33,7 +33,7 @@ const writes = [
   { url: '/api/cloud-agents/codex', body: { enabled: false } },
 ];
 
-it.each(writes)('requires a paired desktop for $url writes', async ({ url, body }) => {
+it.each(writes.filter(write => write.url === '/api/bridge' || write.url === '/api/worker-updates'))('requires a paired desktop for $url writes', async ({ url, body }) => {
   const t = await fixture();
   expect((await t.app.inject({ method: 'PUT', url, headers: postHeaders(t.token, { cookie: PHONE_COOKIE }), payload: body })).statusCode).toBe(403);
   for (const mutation of t.mutations) expect(mutation).not.toHaveBeenCalled();

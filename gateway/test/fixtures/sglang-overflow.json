@@ -1,0 +1,1 @@
+{"error":{"message":"The input (70000 tokens) is longer than the model's context length (65536 tokens).","type":"BadRequestError","code":400}}

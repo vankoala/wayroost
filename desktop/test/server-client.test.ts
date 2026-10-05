@@ -2,22 +2,60 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Session } from 'electron';
 import type { Approval, ListResponse } from '../../shared/protocol.js';
 import { handshakeStatus, networkFailure, ServerClient, socketCloseAction, socketCloseLoss, type LiveSocket } from '../src/server-client.js';
+import { json as snapshot, routedApproval } from './authentication-fixture.js';
 import { approvalById, approvalKey, onceOption } from '../src/approvals.js';
 
 const approval: Approval = { id: 'demo-approval', source: 'hermes', conversationId: 'demo:chat', kind: 'permission', title: 'Run the demo check.', detail: 'npm test', options: [{ id: 'once', label: 'Allow once', kind: 'allow' }, { id: 'deny', label: 'Deny', kind: 'deny' }], createdAt: 0 };
 async function fixture() {
-  const fetch = vi.fn(async () => new Response(JSON.stringify({ role: 'primary', notifications: true, conversations: [], approvals: [approval], statuses: [] })));
-  const notify = vi.fn(); const changed = vi.fn(); const removed = vi.fn();
-  const client = new ServerClient('http://127.0.0.1:8896', { fetch } as unknown as Session, { notify, changed, removed });
-  fetch.mockResolvedValueOnce(new Response(JSON.stringify({ device: { id: 'demo-device', kind: 'desktop' } })));
+  const fetch = vi.fn(async () => snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [approval], statuses: [] }));
+  const notify = vi.fn(); const notification = vi.fn(); const changed = vi.fn(); const removed = vi.fn();
+  const client = new ServerClient('http://127.0.0.1:8896', { fetch } as unknown as Session, { notify, notification, changed, removed });
+  fetch.mockResolvedValueOnce(snapshot({ device: { id: 'demo-device', kind: 'desktop' } }));
   await client.revalidateAuthentication(0); fetch.mockClear();
-  return { client, fetch, notify, changed, removed };
+  return { client, fetch, notify, notification, changed, removed };
 }
 describe('desktop server client', () => {
+  it('does not toast approvals from snapshots or upserts without a server route', async () => {
+    const { client, fetch, notify } = await fixture();
+    fetch.mockResolvedValueOnce(snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [approval], statuses: [], approvalNotifications: [] }));
+    await client.refresh();
+    client.receive({ type: 'approval_upsert', approval });
+    expect(client.approvals.size).toBe(1); expect(notify).not.toHaveBeenCalled(); client.stop();
+  });
+
+  it('shows a routed finished alert once, including over the native socket', async () => {
+    const { client, notification } = await fixture();
+    await client.refresh();
+    let socket!: LiveSocket;
+    client.connect(() => (socket = { onopen: null, onmessage: null, onerror: null, onclose: null, close: vi.fn() }));
+    socket.onopen?.({});
+    const alert = { event: 'agent-finished' as const, source: 'hermes' as const, title: 'The task finished', url: '/c/hermes/demo', at: 1 };
+    socket.onmessage?.({ data: JSON.stringify({ type: 'notification', notification: alert }) });
+    client.receive({ type: 'notification', notification: alert });
+    expect(notification).toHaveBeenCalledExactlyOnceWith(alert); client.stop();
+  });
+
+  it.each(['/\t/example.com/', '/\u0000/example.com/', '//example.com/', '/\\example.com/', 'https://example.com/'])(
+    'rejects routed alerts with unsafe local URLs: %j', async (url) => {
+      const { client, notification } = await fixture();
+      await client.refresh();
+      client.receive({ type: 'notification', notification: { event: 'agent-finished', source: 'hermes', title: 'A task finished', url, at: 1 } });
+      expect(notification).not.toHaveBeenCalled();
+      expect(client.authenticationBlocked).toBe(true); client.stop();
+    },
+  );
+
+  it('rejects a routed approval whose identity differs from the authenticated pending request', async () => {
+    const { client, fetch, notify } = await fixture();
+    const alert = routedApproval({ ...approval, createdAt: 99 });
+    fetch.mockResolvedValueOnce(snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [approval], statuses: [], approvalNotifications: [alert] }));
+    await client.refresh();
+    expect(notify).not.toHaveBeenCalled(); client.stop();
+  });
   it('reports an answer only for a snapshot that landed', async () => {
     const answered = vi.fn();
     let fail = true;
-    const fetch = vi.fn(async (url: string) => { if (url.endsWith('/api/me')) return new Response(JSON.stringify({ device: { id: 'demo-device', kind: 'desktop' } })); if (fail) throw new Error('offline'); return new Response(JSON.stringify({ role: 'primary', notifications: true, conversations: [], approvals: [], statuses: [] })); });
+    const fetch = vi.fn(async (url: string) => { if (url.endsWith('/api/me')) return snapshot({ device: { id: 'demo-device', kind: 'desktop' } }); if (fail) throw new Error('offline'); return snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [], statuses: [] }); });
     const client = new ServerClient('http://127.0.0.1:8896', { fetch } as unknown as Session, { notify: vi.fn(), changed: vi.fn(), removed: vi.fn(), answered });
     await client.revalidateAuthentication(0);
     await expect(client.refresh()).rejects.toThrow(); expect(answered).not.toHaveBeenCalled();
@@ -43,6 +81,8 @@ describe('desktop server client', () => {
     const other: Approval = { ...approval, conversationId: 'demo-session', title: 'Something else.' };
     // Toasts need a snapshot that says the server is a primary allowing them.
     await client.refresh(); client.receive({ type: 'approval_upsert', approval }); client.receive({ type: 'approval_upsert', approval: other });
+    fetch.mockResolvedValueOnce(snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [approval, other], statuses: [] }));
+    await client.refresh();
     expect(client.approvals.size).toBe(2); expect(notify).toHaveBeenCalledTimes(2);
     expect(approvalById(client.approvals.values(), approval.id)).toBeUndefined();
     await client.allowOnce(approvalKey(other));
@@ -51,10 +91,13 @@ describe('desktop server client', () => {
   it('closes resolved toasts and toasts a reused id again', async () => {
     const { client, notify, removed, fetch } = await fixture();
     await client.refresh();
-    fetch.mockResolvedValueOnce(new Response(JSON.stringify({ role: 'primary', notifications: true, conversations: [], approvals: [], statuses: [] })));
+    fetch.mockResolvedValueOnce(snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [], statuses: [] }));
     await client.refresh();
     expect(removed).toHaveBeenCalledWith(approvalKey(approval));
-    client.receive({ type: 'approval_upsert', approval: { ...approval, title: 'A new request, same id.', createdAt: 5 } });
+    const again = { ...approval, title: 'A new request, same id.', createdAt: 5 };
+    client.receive({ type: 'approval_upsert', approval: again });
+    fetch.mockResolvedValueOnce(snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [again], statuses: [] }));
+    await client.refresh();
     expect(notify).toHaveBeenCalledTimes(2);
     client.receive({ type: 'approval_removed', source: approval.source, conversationId: 'demo:other', approvalId: approval.id });
     expect(client.approvals.size).toBe(1); expect(removed).toHaveBeenCalledTimes(1);
@@ -64,7 +107,7 @@ describe('desktop server client', () => {
     await client.refresh();
     // Answered and asked again while the socket was down: the snapshot has the same key, a new createdAt.
     const again = { ...approval, title: 'A new request, same id.', createdAt: 9 };
-    fetch.mockResolvedValueOnce(new Response(JSON.stringify({ role: 'primary', notifications: true, conversations: [], approvals: [again], statuses: [] })));
+    fetch.mockResolvedValueOnce(snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [again], statuses: [] }));
     await client.refresh();
     expect(removed).toHaveBeenCalledWith(approvalKey(approval));
     expect(notify).toHaveBeenCalledTimes(2); expect(notify).toHaveBeenLastCalledWith(again);
@@ -81,7 +124,7 @@ describe('desktop server client', () => {
     const replies: Array<() => void> = [];
     fetch.mockImplementation(() => new Promise<Response>((resolve) => {
       const approvals = fetch.mock.calls.length === 1 ? [] : [b];
-      replies.push(() => resolve(new Response(JSON.stringify({ role: 'primary', notifications: true, conversations: [], approvals, statuses: [] }))));
+      replies.push(() => resolve(snapshot({ role: 'primary', notifications: true, conversations: [], approvals, statuses: [] })));
     }));
     const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
     // A toast activation refreshes directly while a socket hint (B was just asked) refreshes too.
@@ -94,7 +137,7 @@ describe('desktop server client', () => {
     expect(notify).toHaveBeenCalledWith(b); expect(removed).not.toHaveBeenCalled();
     // An unreadable approval body suspends queued snapshots until main checks identity.
     fetch.mockResolvedValueOnce(new Response('{'));
-    fetch.mockImplementationOnce(async () => new Response(JSON.stringify({ role: 'primary', notifications: true, conversations: [], approvals: [], statuses: [] })));
+    fetch.mockImplementationOnce(async () => snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [], statuses: [] }));
     const failed = client.refresh().catch((error: unknown) => error); const next = client.refresh().catch((error: unknown) => error);
     expect(await failed).toBeInstanceOf(Error); expect(await next).toBeInstanceOf(Error);
     expect(client.authenticationBlocked).toBe(true); client.stop();
@@ -129,8 +172,8 @@ describe('desktop server client', () => {
   });
   it('keeps future pairing and presence routes behind the interface', async () => {
     const { client, fetch } = await fixture();
-    fetch.mockResolvedValueOnce(new Response(JSON.stringify({ device: { id: 'demo-device', kind: 'desktop' } })));
-    fetch.mockResolvedValueOnce(new Response(JSON.stringify({ device: { id: 'demo-device', kind: 'desktop' } })));
+    fetch.mockResolvedValueOnce(snapshot({ device: { id: 'demo-device', kind: 'desktop' } }));
+    fetch.mockResolvedValueOnce(snapshot({ device: { id: 'demo-device', kind: 'desktop' } }));
     await client.pair('demo-code', 'Demo desktop');
     expect(fetch).toHaveBeenCalledWith('http://127.0.0.1:8896/api/pair', expect.objectContaining({ body: '{"code":"demo-code","name":"Demo desktop"}' }));
     await client.presence('locked');
@@ -156,7 +199,7 @@ describe('desktop server client', () => {
 
 describe('shadow desktop notification policy', () => {
   const policySnapshot = (policy: Pick<ListResponse, 'role' | 'notifications'>, approvals: Approval[] = [approval]) =>
-    new Response(JSON.stringify({ ...policy, conversations: [], approvals, statuses: [] }));
+    snapshot({ ...policy, conversations: [], approvals, statuses: [] });
 
   it.each([
     { role: 'shadow', notifications: false }, { role: 'shadow', notifications: true },
@@ -199,7 +242,7 @@ describe('shadow desktop notification policy', () => {
     client.suspend(client.pairingGeneration);
     expect(client.shadow).toBe(false);
     expect(client.approvals.size).toBe(0);
-    fetch.mockResolvedValueOnce(new Response(JSON.stringify({ device: { id: 'demo-device', kind: 'desktop' } })));
+    fetch.mockResolvedValueOnce(snapshot({ device: { id: 'demo-device', kind: 'desktop' } }));
     await client.revalidateAuthentication(client.pairingGeneration);
     // Verified again, but no snapshot yet: an event alone toasts nothing.
     client.receive({ type: 'approval_upsert', approval: { ...approval, createdAt: 9 } });
@@ -233,11 +276,11 @@ describe('native socket refusals and reconnects', () => {
   ] as const;
   async function socketFixture() {
     vi.useFakeTimers();
-    let identity: () => Response = () => new Response(JSON.stringify({ device: { id: 'demo-device', kind: 'desktop' } }));
+    let identity: () => Response = () => snapshot({ device: { id: 'demo-device', kind: 'desktop' } });
     const identityChecks: number[] = [];
     let begin = 0;
     const fetch = vi.fn(async (url: string) => {
-      if (!url.endsWith('/api/me')) return new Response(JSON.stringify({ role: 'primary', notifications: true, conversations: [], approvals: [approval], statuses: [] }));
+      if (!url.endsWith('/api/me')) return snapshot({ role: 'primary', notifications: true, conversations: [], approvals: [approval], statuses: [] });
       identityChecks.push(Date.now() - begin); return identity();
     });
     const handlers = { notify: vi.fn(), changed: vi.fn(), removed: vi.fn(), unpaired: vi.fn(), paired: vi.fn() };
@@ -334,7 +377,7 @@ describe('native socket refusals and reconnects', () => {
       setIdentity(() => { throw new TypeError('Demo offline'); });
       await vi.advanceTimersByTimeAsync(16000);
       expect(identityChecks).toHaveLength(5); expect(client.authenticationState).toBe('unverified'); expect(sockets).toHaveLength(2);
-      setIdentity(() => new Response(JSON.stringify({ device: { id: 'demo-device', kind: 'desktop' } })));
+      setIdentity(() => snapshot({ device: { id: 'demo-device', kind: 'desktop' } }));
       await vi.advanceTimersByTimeAsync(30000);
       expect(client.authenticationState).toBe('verified'); expect(sockets).toHaveLength(2);
       await vi.advanceTimersByTimeAsync(2000);
@@ -362,7 +405,7 @@ describe('native socket refusals and reconnects', () => {
       setIdentity(unpairedIdentity);
       sockets[0]!.onclose?.({ code: 4403 }); await vi.advanceTimersByTimeAsync(1000);
       expect(client.authenticationState).toBe('unpaired');
-      setIdentity(() => new Response(JSON.stringify({ device: { id: 'demo-device', kind: 'desktop' } })));
+      setIdentity(() => snapshot({ device: { id: 'demo-device', kind: 'desktop' } }));
       await client.pair('demo-code', 'Demo desktop');
       expect(client.authenticationState).toBe('verified'); expect(sockets).toHaveLength(2);
     } finally { client.stop(); }

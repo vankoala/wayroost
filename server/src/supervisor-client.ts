@@ -18,6 +18,15 @@ import type {
 import { UserFacingError } from './sources.js';
 import { parseSupervisorKey } from './supervisor-key.js';
 import type { Logger } from './hermes/adapter.js';
+import {
+  CONFIG_ROUTES, configRequestStatusRequestSchema, configRequestStatusResultSchema, type ConfigRequestStatusResult, configReadRequestSchema, configReadResultSchema, configApplyRequestSchema, configUndoRequestSchema,
+  configWriteResultSchema, credentialWriteRequestSchema, credentialWriteResultSchema, credentialTestRequestSchema,
+  credentialTestResultSchema, drainRestartRequestSchema, drainRestartResultSchema, usageSummaryRequestSchema,
+  usageSummaryResultSchema, configVerbsStatusSchema,
+  type ConfigReadRequest, type ConfigReadResult, type ConfigApplyRequest, type ConfigUndoRequest, type ConfigWriteResult,
+  type CredentialWriteRequest, type CredentialTestRequest, type DrainRestartRequest, type UsageSummaryRequest,
+} from '../../shared/supervisor-config.js';
+import { projectScanRequestSchema, projectScanResultSchema, checksObserveResultSchema, type ProjectScanRequest, type ProjectScanResult, type ChecksObserveResult } from '../../shared/supervisor-observations.js';
 
 // The supervisor, from this server's side. It runs as root
 // and listens on a Unix socket that only this server may open; the key comes
@@ -107,6 +116,7 @@ const StatusSchema = z.object({
   busy: z.enum(['idle', 'busy', 'unknown']).optional(),
   running: ActionSummarySchema.optional(),
   at: z.number().default(0),
+  configVerbs: configVerbsStatusSchema.optional(),
 });
 const BusySchema = z.object({
   error: z.literal('busy'),
@@ -119,6 +129,7 @@ const AcceptedSchema = z.union([
 ]);
 const StreamEventSchema = z.union([
   z.object({ type: z.literal('status'), status: StatusSchema }).strict(),
+  z.object({ type: z.literal('usage_changed') }).strict(),
   z.object({ type: z.literal('action'), action: ActionSummarySchema }).strict(),
   z.object({ type: z.literal('line'), actionId: z.string().min(1).max(200), line: Line }).strict(),
 ]);
@@ -156,6 +167,17 @@ export interface SupervisorApi {
   action(id: string): Promise<ActionDetail | null>;
   /** Tell it what is running, so "when idle" knows when to go; false when it didn't take them. */
   reportBusy(counts: BusyCounts): Promise<boolean>;
+  configRequestStatus?(request: { requestId: string }): Promise<ConfigRequestStatusResult>;
+  configRead?(request: ConfigReadRequest): Promise<ConfigReadResult>;
+  configApply?(request: ConfigApplyRequest): Promise<ConfigWriteResult>;
+  configUndo?(request: ConfigUndoRequest): Promise<ConfigWriteResult>;
+  credentialWrite?(request: CredentialWriteRequest): Promise<z.infer<typeof credentialWriteResultSchema>>;
+  credentialTest?(request: CredentialTestRequest): Promise<z.infer<typeof credentialTestResultSchema>>;
+  drainRestart?(request: DrainRestartRequest): Promise<z.infer<typeof drainRestartResultSchema>>;
+  drainRestartRun?(id: string): Promise<z.infer<typeof drainRestartResultSchema>>;
+  projectScan?(request: ProjectScanRequest): Promise<ProjectScanResult>;
+  checksObserve?(): Promise<ChecksObserveResult>;
+  usageSummary?(request: UsageSummaryRequest): Promise<z.infer<typeof usageSummaryResultSchema>>;
 }
 
 interface Reply {
@@ -169,6 +191,11 @@ const NOT_RUNNING = 'The supervisor is not answering.';
 class SupervisorUnreachable extends Error {}
 /** It answered, but with more than any reply of the contract's can hold. */
 class SupervisorOversized extends Error {}
+
+/** The request may have committed; callers must observe settings without resending it. */
+export class SupervisorConfigUncertain extends Error {
+  constructor(readonly code: 'unavailable' | 'failed') { super(code); }
+}
 
 export interface SupervisorClientOptions {
   /** Reconnect back-off for the event stream; tests shorten it. */
@@ -255,6 +282,63 @@ export class SupervisorClient implements SupervisorApi {
     } catch {
       return undefined;
     }
+  }
+
+  private async configCall<T>(path: string, body: unknown, schema: z.ZodType<T>, write = false, method = 'POST'): Promise<T> {
+    let reply: Reply;
+    try { reply = await this.call(method, path, body, 35_000); }
+    catch {
+      if (write) throw new SupervisorConfigUncertain('unavailable');
+      return schema.parse({ ok: false, code: 'unavailable' });
+    }
+    if (reply.status === 401 || reply.status === 403) return schema.parse({ ok: false, code: 'not_permitted' });
+    if (reply.status === 404) return schema.parse({ ok: false, code: 'config_writes_off' });
+    const result = schema.safeParse(SupervisorClient.json(reply));
+    if (result.success && (reply.status >= 200 && reply.status < 300 || (result.data as { ok: boolean }).ok === false
+      || reply.status === 409 && path.startsWith(CONFIG_ROUTES.drainRestart) && drainRestartResultSchema.safeParse(result.data).success)) return result.data;
+    if (write) throw new SupervisorConfigUncertain('failed');
+    return schema.parse({ ok: false, code: 'failed' });
+  }
+
+  configRequestStatus(body: { requestId: string }): Promise<ConfigRequestStatusResult> {
+    return this.configCall(CONFIG_ROUTES.requestStatus, configRequestStatusRequestSchema.parse(body), configRequestStatusResultSchema);
+  }
+
+  configRead(body: ConfigReadRequest): Promise<ConfigReadResult> {
+    return this.configCall(CONFIG_ROUTES.read, configReadRequestSchema.parse(body), configReadResultSchema);
+  }
+
+
+  configApply(body: ConfigApplyRequest): Promise<ConfigWriteResult> {
+    return this.configCall(CONFIG_ROUTES.apply, configApplyRequestSchema.parse(body), configWriteResultSchema, true);
+  }
+
+  configUndo(body: ConfigUndoRequest): Promise<ConfigWriteResult> {
+    return this.configCall(CONFIG_ROUTES.undo, configUndoRequestSchema.parse(body), configWriteResultSchema, true);
+  }
+
+  credentialWrite(body: CredentialWriteRequest) {
+    return this.configCall(CONFIG_ROUTES.credential, credentialWriteRequestSchema.parse(body), credentialWriteResultSchema, true);
+  }
+
+  credentialTest(body: CredentialTestRequest) {
+    return this.configCall(CONFIG_ROUTES.credentialTest, credentialTestRequestSchema.parse(body), credentialTestResultSchema);
+  }
+
+  drainRestart(body: DrainRestartRequest) {
+    return this.configCall(CONFIG_ROUTES.drainRestart, drainRestartRequestSchema.parse(body), drainRestartResultSchema, true);
+  }
+  drainRestartRun(id: string) {
+    if (!z.uuid({ version: 'v4' }).safeParse(id).success) return Promise.resolve(drainRestartResultSchema.parse({ ok: false, code: 'invalid_parameters' }));
+    return this.configCall(CONFIG_ROUTES.drainRestartRun(id), undefined, drainRestartResultSchema, false, 'GET');
+  }
+  projectScan(body: ProjectScanRequest) {
+    return this.configCall(CONFIG_ROUTES.projectScan, projectScanRequestSchema.parse(body), projectScanResultSchema);
+  }
+  checksObserve() { return this.configCall(CONFIG_ROUTES.checksObserve, {}, checksObserveResultSchema); }
+
+  usageSummary(body: UsageSummaryRequest) {
+    return this.configCall(CONFIG_ROUTES.usage, usageSummaryRequestSchema.parse(body), usageSummaryResultSchema);
   }
 
   /** The supervisor's own plain sentence when it has one; ours otherwise. */

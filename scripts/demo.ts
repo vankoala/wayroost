@@ -2,8 +2,6 @@ import { BackgroundGate } from '../server/src/background.js';
 // Try Signalbox without Hermes, Paseo or Cloudflare: runs the real server with
 // demo data behind a local stand-in for Cloudflare Access.
 //   npm run build:web && npm run demo     then open http://127.0.0.1:8890
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { buildApp } from '../server/src/app.js';
 import { WorkerUpdatesSetting } from '../server/src/tasks/setting.js';
@@ -21,6 +19,9 @@ import { DemoSupervisor } from './demo-power.js';
 import { DemoWorkerApprovals } from './demo-safety.js';
 import { demoFeed } from './demo-feed.js';
 import { createLocalAccess, startEdge } from './lib/local-access.js';
+import { privateStateDir } from './lib/private-state-dir.js';
+import { Notifications } from '../server/src/notifications/service.js';
+import { NotificationSettingsStore } from '../server/src/notifications/settings.js';
 
 const PORT = Number(process.env.PORT ?? 8890);
 const APP_PORT = PORT + 1;
@@ -32,7 +33,7 @@ const config = parseConfig(
     listen: { host: '127.0.0.1', port: APP_PORT },
     publicOrigin: ORIGIN,
     access: { teamDomain: access.issuer, aud: access.aud, allowedEmails: [access.email] },
-    stateDir: mkdtempSync(join(tmpdir(), 'sb-demo-')),
+    stateDir: privateStateDir('sb-demo-'),
     staticDir: resolve('dist/web'),
   },
   { allowLocalDev: true },
@@ -42,6 +43,16 @@ const sources = { hermes: new DemoHermes(hub), paseo: new DemoPaseo(hub) };
 const bridge = await startDemoBridge(sources, hub);
 const feed = demoFeed(hub, sources.hermes, config.stateDir);
 feed.start();
+// Settings → Notifications: which alerts reach this PC's app and which reach a phone. The
+// demo's address is http, so there is no phone to ring and the page says so.
+const notifications = new Notifications({
+  settings: new NotificationSettingsStore(config.stateDir),
+  hub,
+  feed,
+  background: new BackgroundGate('primary'),
+  log: { info() {}, warn() {} },
+});
+feed.useRouting(notifications);
 // Sign in by pairing, as on a real install: the link below pairs this browser.
 const devices = new Devices(config.stateDir);
 // A pretend supervisor behind the real power routes: the status block and Status &
@@ -67,6 +78,7 @@ const app = await buildApp({
   whatsappRouting: demoHelper,
   phone: demoHelper,
   feed,
+  notifications,
   // Settings → Security reads this on every Settings screen; off, as on a fresh install.
   safetyCommands: new SafetyCommandsSetting(config.stateDir),
   workerApprovals: new DemoWorkerApprovals(),

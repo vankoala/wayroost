@@ -1,9 +1,9 @@
 import type { ListenerTls } from '../../lib/loopback-tls.js';
 import { readFileSync, statSync } from 'node:fs';
-import { BlockList, isIP } from 'node:net';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { SUPERVISOR_DEFAULTS } from '../../shared/supervisor.js';
+import { isLoopbackHost as isLoopback } from '../../shared/gateway.js';
 import { parseSupervisorKey } from './supervisor-key.js';
 import type { ServerRole } from './background.js';
 import { wayroostEnv } from './environment.js';
@@ -12,10 +12,6 @@ import { PRIMARY_STATE_DIR, SHADOW_STATE_DIR, validateStateDirectory } from './s
 // Everything here fails closed: a config that could expose the app, or talk to
 // anything other than local services, is rejected at startup.
 
-/** 127.0.0.0/8 and ::1; BlockList also matches IPv4-mapped IPv6 (::ffff:127.0.0.2). */
-const LOOPBACK = new BlockList();
-LOOPBACK.addSubnet('127.0.0.0', 8, 'ipv4');
-LOOPBACK.addAddress('::1', 'ipv6');
 const CLOUDFLARE_TEAM_RE = /^https:\/\/[a-z0-9][a-z0-9-]*\.cloudflareaccess\.com$/;
 export const DEFAULT_BRIDGE_PORT = 19012;
 export const DEFAULT_HELPER_PORT = 19013;
@@ -37,6 +33,31 @@ const absolutePath = (maxBytes: number) =>
     .regex(/^\/[^\u0000-\u001f\u007f]+$/, 'an absolute path without control characters')
     .refine((path) => Buffer.byteLength(path, 'utf8') <= maxBytes, `a path of at most ${maxBytes} bytes`);
 
+/** An http address on loopback only: what the gateway's roles and the phone answer on. */
+const loopbackHttp = z
+  .string()
+  .max(2048)
+  .refine((value) => {
+    try {
+      const url = new URL(value);
+      return url.protocol === 'http:' && isLoopback(url.hostname) && !url.username && !url.password && !url.search && !url.hash;
+    } catch {
+      return false;
+    }
+  }, 'an http address on a loopback address');
+const unitName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,200}\.service$/, 'a systemd unit name');
+const socketUnitName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,200}\.socket$/, 'a systemd socket unit name');
+
+/** Whether this PC's own time-zone database knows the name; a quiet-hours span needs a real zone. */
+function isKnownTimeZone(zone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-GB', { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const RawConfig = z
   .object({
     role: z.enum(['shadow', 'primary']).default('primary'),
@@ -48,6 +69,21 @@ const RawConfig = z
       .strict()
       .prefault({}),
     tls: z.object({ certFile: absolutePath(4096), keyFile: absolutePath(4096).optional() }).strict().optional(),
+    /**
+     * The local listener: a second loopback port for the paired desktop app on
+     * this PC, which the tunnel never targets. A PC-only setting needs the
+     * desktop app's request to arrive here. `pcOnlyWrites` stays off until the
+     * desktop app is confirmed to reach this port; until then PC-only settings
+     * are read-only on every device.
+     */
+    localListener: z
+      .object({
+        host: z.string().default('127.0.0.1'),
+        port: z.number().int().min(1).max(65535),
+        pcOnlyWrites: z.boolean().default(false),
+      })
+      .strict()
+      .optional(),
     /** Public origin users reach through the tunnel, e.g. https://wayroost.example.com. One entry of the origins below. */
     publicOrigin: z.url().optional(),
     /**
@@ -129,6 +165,51 @@ const RawConfig = z
       .strict()
       .prefault({}),
     /**
+     * Alerts: the owner's time zone, which quiet hours are read in. An IANA name as this
+     * PC knows it ("Europe/Berlin", "UTC"); unset means the PC's own zone.
+     */
+    notifications: z
+      .object({
+        timeZone: z
+          .string()
+          .regex(/^[A-Za-z][A-Za-z0-9_+-]{1,31}(?:\/[A-Za-z0-9_+-]{1,31}){0,2}$/, 'an IANA time zone name')
+          .refine(isKnownTimeZone, 'a time zone this PC knows')
+          .optional(),
+      })
+      .strict()
+      .prefault({}),
+    /** Select the settings pipeline for the earlier settings routes at startup. */
+    settings: z
+      .object({ legacyRoutesViaPipeline: z.boolean().default(false),
+        packBuildFile: absolutePath(4096).optional(),
+        agentStatus: z.object({ home: absolutePath(4096), binaries: z.object({
+          claude: absolutePath(4096).optional(), codex: absolutePath(4096).optional(), copilot: absolutePath(4096).optional(),
+        }).strict() }).strict().optional(),
+      })
+      .strict()
+      .prefault({}),
+    /**
+     * What the Checks page may look at directly on this PC: the role addresses,
+     * the gateway's units, the coder MCP's two scripts, the phone's health answers,
+     * Hermes' drain marker and the desktop switch's flag file. A check whose source
+     * isn't given here answers "unknown"; none of these paths is one Wayroost writes.
+     */
+    checks: z
+      .object({
+        roleAddresses: z
+          .object({ main: loopbackHttp, coder: loopbackHttp, fast: loopbackHttp })
+          .strict()
+          .optional(),
+        gatewayUnits: z.object({ service: unitName, socket: socketUnitName }).strict().optional(),
+        hermesGatewayUnit: unitName.optional(),
+        coderMcp: z.object({ original: absolutePath(4096), gatewayCopy: absolutePath(4096) }).strict().optional(),
+        phone: z.object({ server: loopbackHttp, bridge: loopbackHttp }).strict().optional(),
+        drainMarker: z.object({ path: absolutePath(4096), stateFile: absolutePath(4096).optional(), executorUnit: unitName.optional() }).strict().optional(),
+        switchFlagsFile: absolutePath(4096).optional(),
+      })
+      .strict()
+      .optional(),
+    /**
      * The supervisor: root's service on a Unix socket, which the
      * Status & power pages read and the power actions go through. Off when the
      * block is absent. In production its key comes as the systemd credential
@@ -137,6 +218,7 @@ const RawConfig = z
      */
     supervisor: z
       .object({
+        expectedStatusOnly: z.boolean().default(true),
         socket: absolutePath(SUPERVISOR_SOCKET_PATH_BYTES).default(SUPERVISOR_DEFAULTS.socket),
         keyFile: absolutePath(4096).optional(),
       })
@@ -163,9 +245,22 @@ export interface SiteOrigin {
   local: boolean;
 }
 
+/** What the Checks page may look at directly, besides what the settings reads answer. */
+export interface ChecksConfig {
+  roleAddresses?: Partial<Record<'main' | 'coder' | 'fast', string>>;
+  gatewayUnits?: { service: string; socket: string };
+  hermesGatewayUnit?: string;
+  coderMcp?: { original: string; gatewayCopy: string };
+  phone?: { server: string; bridge: string };
+  drainMarker?: { path: string; stateFile?: string };
+  switchFlagsFile?: string;
+}
+
 export interface AppConfig {
   role: ServerRole;
   listen: { host: string; port: number };
+  /** The desktop app's PC-only port, when configured; it serves the same app over the same TLS. */
+  localListener?: { host: string; port: number; pcOnlyWrites: boolean };
   tls?: ListenerTls;
   /** The main public origin: `publicOrigin`, else the first https:// origin, else the first origin. */
   publicOrigin: string;
@@ -187,10 +282,16 @@ export interface AppConfig {
   helper: { enabled: boolean; port: number };
   /** Voice mode: the speech service's Unix socket. */
   speech: { enabled: boolean; socket: string; cloudSocket: string };
-  /** For you (Hermes' pulse feed) and phone notifications. */
+  /** For you: cards from Hermes' pulse and phone notifications. */
   feed: { enabled: boolean };
+  /** Alerts: the owner's time zone for quiet hours; unset means this PC's own zone. */
+  notifications: { timeZone?: string };
+  settings: { legacyRoutesViaPipeline: boolean; packBuildFile?: string;
+    agentStatus?: { home: string; binaries: { claude?: string; codex?: string; copilot?: string } } };
+  /** What the Checks page may probe here; every absent source makes its rows unknown. */
+  checks?: ChecksConfig;
   /** The supervisor's Unix socket and key file; absent means the power API says it isn't running. */
-  supervisor?: { socket: string; keyFile: string };
+  supervisor?: { socket: string; keyFile: string; expectedStatusOnly?: boolean };
   stateDir: string;
   staticDir?: string;
 }
@@ -201,17 +302,6 @@ export class ConfigError extends Error {}
 function bare(hostname: string): string {
   const host = hostname.toLowerCase();
   return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
-}
-
-/**
- * A host this app may listen on or connect to: localhost, or a loopback IP
- * literal (any of 127.0.0.0/8, ::1, or an IPv4-mapped one).
- */
-function isLoopback(hostname: string): boolean {
-  const host = bare(hostname);
-  if (host === 'localhost') return true;
-  const family = isIP(host);
-  return family !== 0 && LOOPBACK.check(host, family === 4 ? 'ipv4' : 'ipv6');
 }
 
 /**
@@ -226,6 +316,9 @@ function isLocalHost(hostname: string): boolean {
   const host = bare(hostname).replace(/\.+$/, '');
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (host === '0.0.0.0' || host === '::' || host === '::ffff:0:0') return true;
+  // Browser-local mapped addresses are protected as origins, but cannot be listener or backend hosts.
+  const mapped = /^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(host);
+  if (mapped && (Number.parseInt(mapped[1]!, 16) >>> 8) === 127) return true;
   return isLoopback(host);
 }
 
@@ -285,6 +378,17 @@ function validateRawConfig(input: unknown): z.infer<typeof RawConfig> {
     throw new ConfigError(`Invalid config: ${z.prettifyError(parsed.error)}`);
   }
   return parsed.data;
+}
+
+/** One spelling per host, so an expanded IPv6 address matches its short form in an origin. */
+function canonicalHost(host: string): string {
+  const bare = host.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!bare.includes(':')) return bare;
+  try {
+    return new URL(`http://[${bare}]/`).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    return bare;
+  }
 }
 
 export function parseConfig(input: unknown, options: ParseOptions = {}): AppConfig {
@@ -401,6 +505,32 @@ export function parseConfig(input: unknown, options: ParseOptions = {}): AppConf
     throw new ConfigError('helper.port must differ from listen.port, bridge.port and cloudflared\'s metrics port');
   }
 
+  let localListener: AppConfig['localListener'];
+  if (raw.localListener) {
+    const local = raw.localListener;
+    if (!isLoopback(local.host)) {
+      throw new ConfigError('localListener.host must be a loopback address');
+    }
+    if (!raw.devices.enabled) {
+      throw new ConfigError('The local listener is for the paired desktop app; turn on device sign-in (devices.enabled)');
+    }
+    if ([raw.listen.port, raw.bridge.port, raw.helper.port, CLOUDFLARED_METRICS_PORT].includes(local.port)) {
+      throw new ConfigError("localListener.port must differ from listen.port, bridge.port, helper.port and cloudflared's metrics port");
+    }
+    if (role === 'shadow' && [19010, DEFAULT_BRIDGE_PORT, DEFAULT_HELPER_PORT].includes(local.port)) {
+      throw new ConfigError('Shadow localListener.port must not use a primary service port');
+    }
+    // The desktop app opens this port by its own origin, which must be a listed local one.
+    if (!origins.some((o) => {
+      const origin = new URL(o.origin);
+      const port = Number(origin.port || (origin.protocol === 'https:' ? 443 : 80));
+      return o.local && canonicalHost(origin.hostname) === canonicalHost(local.host) && port === local.port;
+    })) {
+      throw new ConfigError(`List the local listener's address in origins (for example https://127.0.0.1:${local.port})`);
+    }
+    localListener = { host: local.host, port: local.port, pcOnlyWrites: local.pcOnlyWrites };
+  }
+
   const allowedHosts = new Set([
     ...origins.map((o) => o.host),
     `127.0.0.1:${raw.listen.port}`,
@@ -422,12 +552,13 @@ export function parseConfig(input: unknown, options: ParseOptions = {}): AppConf
         `The supervisor needs its key: the systemd credential ${SUPERVISOR_KEY_CREDENTIAL}, or supervisor.keyFile in development`,
       );
     }
-    supervisor = { socket: raw.supervisor.socket, keyFile };
+    supervisor = { socket: raw.supervisor.socket, keyFile, expectedStatusOnly: raw.supervisor.expectedStatusOnly };
   }
 
   return {
     role,
     listen: raw.listen,
+    ...(localListener ? { localListener } : {}),
     ...(raw.tls ? { tls: raw.tls } : {}),
     publicOrigin: primary.origin,
     origins,
@@ -441,6 +572,9 @@ export function parseConfig(input: unknown, options: ParseOptions = {}): AppConf
     helper: { enabled: raw.helper.enabled, port: raw.helper.port },
     speech: { enabled: raw.speech.enabled, socket: raw.speech.socket, cloudSocket: raw.speech.cloudSocket },
     feed: { enabled: raw.feed.enabled },
+    notifications: raw.notifications.timeZone ? { timeZone: raw.notifications.timeZone } : {},
+    settings: raw.settings,
+    ...(raw.checks ? { checks: raw.checks } : {}),
     ...(supervisor ? { supervisor } : {}),
     stateDir,
     ...(raw.staticDir ? { staticDir: raw.staticDir } : {}),
@@ -466,7 +600,7 @@ export function loadStartupConfig(path: string, env: NodeJS.ProcessEnv = process
     allowLocalDev: wayroostEnv('DEV_ALLOW_LOOPBACK', env) === '1',
     ...(credential ? { supervisorKeyCredential: credential } : {}),
   });
-  const desktopListener = parsed.role === 'shadow' || (parsed.devices.enabled && parsed.origins.some(origin => origin.local));
+  const desktopListener = parsed.role === 'shadow' || parsed.localListener !== undefined || (parsed.devices.enabled && parsed.origins.some(origin => origin.local));
   if (desktopListener && !parsed.tls && wayroostEnv('DEV_ALLOW_LOOPBACK', env) !== '1') throw new ConfigError('Installed listeners require TLS; HTTP is only available with WAYROOST_DEV_ALLOW_LOOPBACK=1 in development.');
   if (parsed.tls?.keyFile && wayroostEnv('DEV_ALLOW_LOOPBACK', env) !== '1') throw new ConfigError('Installed TLS keys must use LoadCredential, not tls.keyFile.');
   return parsed;

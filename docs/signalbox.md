@@ -249,6 +249,7 @@ covered in [docs/setup.md](setup.md).
 | [docs/bridge.md](bridge.md) | The optional project bridge: the tools agents get, who's calling, delivery and replies, limits, pausing, setup and upgrading. |
 | [docs/voice.md](voice.md) | Optional voice mode: talking and listening, how it works, setup, privacy and security. |
 | [docs/for-you.md](for-you.md) | Optional For you: cards from Hermes' brief and daytime checks, proactivity and quiet hours, phone notifications, the card routes, privacy and security. |
+| [docs/notifications.md](notifications.md) | Alerts: the rules per event and source, where a desktop's presence sends them, quiet hours in your own time zone, the app's toasts, and where those settings live. |
 | [docs/skills.md](skills.md) | Settings → Skills: every agent's skills kept the same everywhere, the safety rules, the marketplace, setup. |
 | [docs/development.md](development.md) | Code layout, commands, test suites, the Paseo compatibility harness. |
 | [SECURITY.md](../SECURITY.md) | Threat model, security layers, known limits, reporting a vulnerability. |

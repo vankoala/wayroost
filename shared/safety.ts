@@ -1,5 +1,16 @@
 import { z } from 'zod';
 import type { CloudAgentId } from './protocol.js';
+import { settingValueSchema, type SettingValue } from './settings.js';
+
+export const WORKER_APPROVAL_TOOLS = ['respond_to_permission', 'set_agent_mode', 'update_agent'] as const;
+
+/** Preserve other tool choices while changing whether workers may answer approvals. */
+export function workerApprovalTools(value: unknown, enabled: boolean): Record<string, SettingValue> {
+  const tools = z.record(z.string(), settingValueSchema).parse(value ?? {});
+  const disabled = z.array(z.string()).parse(tools.disabledTools ?? []);
+  return { ...tools, disabledTools: enabled ? [...new Set([...disabled, ...WORKER_APPROVAL_TOOLS])]
+    : disabled.filter(tool => !(WORKER_APPROVAL_TOOLS as readonly string[]).includes(tool)) };
+}
 
 export const WorkerApprovalsWrite = z.object({ enabled: z.boolean() }).strict();
 export type WorkerApprovalsWrite = z.infer<typeof WorkerApprovalsWrite>;

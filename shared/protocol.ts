@@ -1,6 +1,7 @@
 // Contract between the signalbox server and the browser. Both Hermes and
 // Paseo are normalized into these shapes so the UI treats them the same way.
 
+import type { NotificationEvent, NotificationSource, SettingsNotificationsBody, SettingsChangedEvent, UsageChangedEvent } from './settings.js';
 import type { ActionSummary, SupervisorStatus } from './supervisor.js';
 
 export type Source = 'hermes' | 'paseo';
@@ -15,6 +16,7 @@ export interface SourceStatus {
 }
 
 export type ConversationStatus = 'idle' | 'running' | 'needs_approval' | 'error';
+export type TurnOutcome = 'complete' | 'error' | 'interrupted';
 
 export interface ConversationSummary {
   source: Source;
@@ -234,7 +236,8 @@ export type ServerEvent =
   /** `email`: the Cloudflare Access identity, when the request came through Access. `device`: the paired device. */
   | { type: 'hello'; email?: string; device?: DeviceInfo; statuses: SourceStatus[] }
   | { type: 'source_status'; status: SourceStatus }
-  | { type: 'conversation_upsert'; conversation: ConversationSummary }
+  /** A live turn's outcome is explicit; an idle conversation alone does not establish success. */
+  | { type: 'conversation_upsert'; conversation: ConversationSummary; turnOutcome?: TurnOutcome }
   | { type: 'conversation_removed'; source: Source; id: string }
   /**
    * The conversation continues under a new id (Hermes starts a continuation
@@ -259,6 +262,15 @@ export type ServerEvent =
   | { type: 'power_action'; action: ActionSummary }
   /** One progress line from the running action ("Main model loading…"). */
   | { type: 'power_line'; actionId: string; line: string }
+  /**
+   * An alert the server decided the app should show: the rules, the PC's presence and
+   * quiet hours picked it, so the app only has to show it.
+   */
+  | { type: 'notification'; notification: AppNotification }
+  /** Settings changed (applied, undone or failed): pages showing those sections read them again. */
+  | SettingsChangedEvent
+  /** Model usage moved on: usage pills read their summary again. */
+  | UsageChangedEvent
   | { type: 'pong' };
 
 /** Browser → server messages on /ws. */
@@ -379,6 +391,8 @@ export const PAIR_PATH = '/pair';
 export interface ListResponse {
   role?: 'primary' | 'shadow';
   notifications?: boolean;
+  /** Pending approvals the server currently routes to an app toast. */
+  approvalNotifications?: AppNotification[];
   conversations: ConversationSummary[];
   approvals: Approval[];
   statuses: SourceStatus[];
@@ -416,6 +430,24 @@ export interface HermesOptions {
 
 /** A folder typed for a new chat, as the machine sees it (checked through the Paseo daemon). */
 export type FolderStatus = 'exists' | 'missing' | 'missing-parent' | 'not-a-folder' | 'unknown';
+
+/**
+ * One thing a folder's own files let an agent do there, said plainly. Wayroost reads the folder as
+ * its owner before an agent starts in it; the card names files, never what is inside them.
+ */
+export interface ProjectConfigNotice {
+  /** One sentence, in the words a person reads before starting the agent. */
+  text: string;
+  /** The files behind it, relative to the folder (up to four, then a count). */
+  files: string[];
+}
+
+/** What Wayroost found before starting an agent in a folder. `notices` is empty when there is nothing to say. */
+export interface ProjectConfigReport {
+  notices: ProjectConfigNotice[];
+  /** Set when the folder could not be read at all; the card says so rather than looking clean. */
+  unreadable?: true;
+}
 
 export interface CreateResponse {
   source: Source;
@@ -1041,13 +1073,45 @@ export interface FeedActionResult {
   chat?: { source: Source; id: string };
 }
 
+// ---- Notifications -----------------------------------------------------------------
+//
+// The server decides where each alert goes (see the rules in shared/settings.ts). This
+// is the half it decided to show in the app; the phone's push goes over Web Push
+// instead and never appears here.
+
+/** One alert for the app: plain text and a link, nothing else. */
+export interface AppNotification {
+  /** The event the rules are written against, so the app can group or ignore by kind. */
+  event: NotificationEvent;
+  source: NotificationSource;
+  title: string;
+  /** At most a line of plain text; the chat or page it points at holds the rest. */
+  body?: string;
+  /** Opened when it is tapped (a path on this Wayroost). */
+  url: string;
+  /** Epoch ms of the alert. */
+  at: number;
+  /** The exact pending request, checked against an authenticated snapshot before native actions. */
+  approval?: Pick<Approval, 'id' | 'source' | 'conversationId' | 'createdAt'>;
+}
+
+/** What a settings page shows: the rules as stored, and what this server can actually do. */
+export interface NotificationSettingsView extends SettingsNotificationsBody {
+  pushAvailable: boolean;
+  pushDevices: number;
+  /** Where the next alert would be routed, from the desktop's latest report. */
+  presence: PresenceState | 'gone';
+  /** The quiet hours are read in the site file's time zone, not this machine's. */
+  timeZoneConfigured: boolean;
+}
+
 // ---- Status & power (the supervisor) ---------------------------------------------
 //
 // The supervisor (shared/supervisor.ts) is the only thing that starts and stops
 // services on the PC. This server watches it over a Unix socket, caches what it
 // says, and answers for the phone: every power action from a phone needs a
-// confirm tap first. The desktop app reports presence (active/idle/locked) so
-// later releases can route alerts by it; M1 only records and shows it. Who asks
+// confirm tap first. The desktop app reports presence (active/idle/locked), which
+// routes alerts: one that must reach a phone when nobody is at the keyboard. Who asks
 // is always a paired device (DeviceKind above).
 
 export const PRESENCE_STATES = ['active', 'idle', 'locked'] as const;

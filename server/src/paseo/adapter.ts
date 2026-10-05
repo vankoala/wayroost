@@ -233,7 +233,7 @@ export class PaseoAdapter implements PaseoSource {
   private api: PaseoApi | undefined;
   /** The agent list stream; the daemon assigns its id and forgets it when the socket drops. */
   private agentSubscription: OwnedSubscription<unknown> | undefined;
-  /** Permission and sub-agent delivery; recreated on each connection. */
+  /** Approvals, turn outcomes and sub-agent delivery; recreated on each connection. */
   private eventSubscription: OwnedSubscription<unknown> | undefined;
   private eventUnsubscribe: (() => void) | undefined;
   private connectionGeneration = 0;
@@ -245,6 +245,7 @@ export class PaseoAdapter implements PaseoSource {
   private readonly mirrorReaders = new Map<AgentTimelineMirror, number>();
   private readonly watched = new Set<string>();
   private readonly lastPublished = new Map<string, string>();
+  private readonly lastTurnOutcome = new Map<string, string>();
   private readonly labels = new Map<string, string>();
   /** clientMessageId → the files sent with that message. */
   private readonly sentFiles = new Map<string, AttachmentRef[]>();
@@ -442,7 +443,7 @@ export class PaseoAdapter implements PaseoSource {
   private subscribeEvents(api: PaseoApi): OwnedSubscription<unknown> {
     this.dropEventSubscription();
     const subscription = api.observeEvents([
-      'agent_permission_request', 'agent_permission_resolved', 'agent.provider_subagents.update',
+      'agent_permission_request', 'agent_permission_resolved', 'agent.provider_subagents.update', 'agent_attention_required',
     ]);
     this.eventSubscription = subscription;
     this.eventUnsubscribe = subscription.subscribe({
@@ -452,6 +453,7 @@ export class PaseoAdapter implements PaseoSource {
           if (m.type === 'agent_permission_request') this.addPermission(m.payload.agentId, m.payload.request);
           else if (m.type === 'agent_permission_resolved') this.removePermission(m.payload.requestId);
           else if (m.type === 'agent.provider_subagents.update') this.onSubagentUpdate(m.payload);
+          else if (m.type === 'agent_attention_required') this.onTurnOutcome(m.payload);
         } catch (err) {
           this.log.error({ err: message(err) }, 'paseo event handler failed');
         }
@@ -460,7 +462,7 @@ export class PaseoAdapter implements PaseoSource {
         if (this.eventSubscription !== subscription) return;
         this.dropEventSubscription(subscription);
         this.log.warn({ err: message(err) }, 'paseo event subscription failed');
-        this.setStatus('error', "Couldn't subscribe to Paseo approvals and sub-agents.");
+        this.setStatus('error', "Couldn't subscribe to Paseo alerts and sub-agents.");
       },
     });
     return subscription;
@@ -638,6 +640,17 @@ export class PaseoAdapter implements PaseoSource {
     for (const [id, row] of this.subagents) if (row.agentId === agentId) this.publishSubagent(id);
   }
 
+  /** Live attention outcomes distinguish completed turns from reloads and canceled turns. */
+  private onTurnOutcome(outcome: Extract<SessionOutboundMessage, { type: 'agent_attention_required' }>['payload']): void {
+    const { agentId, reason, timestamp } = outcome;
+    if (reason === 'permission' || !this.agents.has(agentId)) return;
+    const key = `${timestamp}/${reason}`;
+    if (this.lastTurnOutcome.get(agentId) === key) return;
+    this.lastTurnOutcome.set(agentId, key);
+    this.hub.publish({ type: 'conversation_upsert', conversation: this.summaryFor(agentId),
+      turnOutcome: reason === 'finished' ? 'complete' : 'error' });
+  }
+
   /**
    * Keep an agent's latest snapshot, noting when it starts or stops running.
    * Only changes to or from a live `running` count: not reloads, resumes, closed →
@@ -661,6 +674,7 @@ export class PaseoAdapter implements PaseoSource {
     this.lastActive.delete(agentId);
     this.placements.delete(agentId);
     this.lastPublished.delete(agentId);
+    this.lastTurnOutcome.delete(agentId);
     this.dropMirror(agentId);
     this.commandLists.delete(agentId);
     this.startedBy.delete(agentId);

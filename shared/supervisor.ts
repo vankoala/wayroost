@@ -1,7 +1,10 @@
 // Contract between the supervisor (root, inside the engine room) and its callers:
 // the Wayroost server over a Unix socket, and the desktop app's rescue path over
 // 127.0.0.1. The supervisor runs fixed verbs on registry targets only; it never
-// takes a command line, a path or a shell string from a caller.
+// takes a command line, a path or a shell string from a caller. The config
+// verbs' contracts are in supervisor-config.ts.
+
+import type { ConfigVerbsStatus } from './supervisor-config.js';
 
 /** Every action the supervisor accepts. update and rollback come with M4. */
 export type SupervisorVerb = 'start' | 'stop' | 'restart' | 'hold' | 'release' | 'switch-model' | 'diagnostics';
@@ -82,6 +85,11 @@ export interface SupervisorStatus {
   busy?: 'idle' | 'busy' | 'unknown';
   /** The lifecycle action that's running, if any (only one runs at a time). */
   running?: ActionSummary;
+  /**
+   * Present only on a supervisor with the config verbs. The stack launcher
+   * writes through config.apply only when it's here and configWrites is on.
+   */
+  configVerbs?: ConfigVerbsStatus;
   /** Epoch ms of this snapshot. */
   at: number;
 }
@@ -122,6 +130,7 @@ export interface ActionDetail extends ActionSummary {
 export type SupervisorEvent =
   | { type: 'status'; status: SupervisorStatus }
   | { type: 'action'; action: ActionSummary }
+  | { type: 'usage_changed' }
   | { type: 'line'; actionId: string; line: string };
 
 /** 409 body when a lifecycle action is already running. */

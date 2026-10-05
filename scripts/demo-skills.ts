@@ -36,8 +36,8 @@ const everywhere = { hermes: 'yes', pi: 'yes', claude: 'yes', codex: 'yes', open
 function demoList(): SkillInfo[] {
   return [
     {
-      name: 'research-to-doc',
-      description: 'Research a question across the web and local files, then deliver a sourced document. Markdown by default; PDF, DOCX, XLSX or CSV on request.',
+      name: 'notes-to-report',
+      description: 'Turn a question and a folder of notes into a short sourced report. Markdown by default; other formats on request.',
       platforms: [],
       origin: 'shared',
       places: {
@@ -51,8 +51,8 @@ function demoList(): SkillInfo[] {
       updatedAt: ago(12),
     },
     {
-      name: 'flight-search',
-      description: 'Use when finding, pricing or comparing flights: cheapest flight to X, nonstops in March, flexible dates, or checking an airline’s own price and bag rules.',
+      name: 'trip-planner',
+      description: 'Use when planning a trip: dates, routes and a short comparison of the options.',
       platforms: ['linux'],
       origin: 'shared',
       places: { shared: { state: 'source', updatedAt: ago(60 * 26) }, claude: { state: 'same', updatedAt: ago(60 * 26) } },
@@ -61,8 +61,8 @@ function demoList(): SkillInfo[] {
       updatedAt: ago(60 * 26),
     },
     {
-      name: 'paseo',
-      description: 'Paseo reference for managing projects, workspaces, workspace scripts, agents, schedules, and heartbeats.',
+      name: 'project-helper',
+      description: 'Reference for organising projects, their workspaces and scripts.',
       platforms: [],
       origin: 'shared',
       places: {
@@ -111,11 +111,11 @@ class DemoSkillsHelper implements SkillsHelperApi {
       places: PLACES,
       apps: APPS,
       events: [
-        { at: ago(1), kind: 'synced', name: 'paseo', place: 'win-agents' },
-        { at: ago(12), kind: 'changed', name: 'research-to-doc', place: 'claude' },
-        { at: ago(90), kind: 'changed', name: 'research-to-doc', place: 'shared' },
+        { at: ago(1), kind: 'synced', name: 'project-helper', place: 'win-agents' },
+        { at: ago(12), kind: 'changed', name: 'notes-to-report', place: 'claude' },
+        { at: ago(90), kind: 'changed', name: 'notes-to-report', place: 'shared' },
         { at: ago(200), kind: 'added', name: 'meal-planner', place: 'hermes' },
-        { at: ago(60 * 26), kind: 'added', name: 'flight-search', place: 'shared' },
+        { at: ago(60 * 26), kind: 'added', name: 'trip-planner', place: 'shared' },
       ],
     };
   }

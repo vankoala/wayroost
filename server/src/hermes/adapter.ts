@@ -22,6 +22,7 @@ import type {
   SourceStatus,
   ThreadActionResult,
   TimelineItem,
+  TurnOutcome,
 } from '../../../shared/protocol.js';
 import type { Attachment } from '../attachments.js';
 import { canonicalFolder, isBareFolder, within } from '../bridge/project.js';
@@ -791,12 +792,12 @@ export class HermesAdapter implements HermesSource {
     return this.startedBy.get(stored) ?? this.options.lineage?.startedBy(`hermes:${stored}`);
   }
 
-  private publishSummary(stored: string): void {
+  private publishSummary(stored: string, turnOutcome?: TurnOutcome): void {
     const conversation = this.summaryFor(stored);
     const json = JSON.stringify(conversation);
-    if (this.lastPublished.get(stored) === json) return;
+    if (turnOutcome === undefined && this.lastPublished.get(stored) === json) return;
     this.lastPublished.set(stored, json);
-    this.hub.publish({ type: 'conversation_upsert', conversation });
+    this.hub.publish({ type: 'conversation_upsert', conversation, ...(turnOutcome ? { turnOutcome } : {}) });
   }
 
   private scheduleListRefresh(delay = 800): void {
@@ -2364,7 +2365,7 @@ export class HermesAdapter implements HermesSource {
     this.activeByStored.set(stored, 'idle');
     const row = this.rows.get(stored);
     if (row) row.last_active = Date.now() / 1000;
-    this.publishSummary(stored);
+    this.publishSummary(stored, outcome === 'error' || outcome === 'interrupted' ? outcome : 'complete');
     this.scheduleListRefresh(1500);
   }
 

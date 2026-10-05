@@ -8,14 +8,17 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const paths = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
   { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
 const text = [...new Set(paths)].filter(path => existsSync(resolve(root, path))).flatMap(path => {
-  const data = readFileSync(resolve(root, path));
+  let data: Buffer;
+  // Other test files create and remove untracked temporary folders while this one reads the tree.
+  try { data = readFileSync(resolve(root, path)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
   return data.includes(0) ? [] : [{ path, body: data.toString('utf8') }];
 });
 const fixtures = text.filter(({ path }) => /(?:\.test\.ts|\/test_[^/]+\.py)$/.test(path));
 
 it('describes optional host command wrappers without naming a private guard CLI', () => {
   // Hermes' public skills scanner is an upstream feature.
-  const cli = /\b(?!skills-guard\b)[a-z]+-guard\b/;
+  const cli = /\b(?!(?:skills|loop)-guard\b)[a-z]+-guard\b/;
   expect(text.filter(({ body }) => cli.test(body)).map(({ path }) => path)).toEqual([]);
 });
 

@@ -109,6 +109,30 @@ agents started by another agent are nested under the thread that started them.
 Hermes agents running inside Paseo carry a "Hermes · in Paseo" badge, and their
 Hermes-side session is not listed twice.
 
+## Starting something new
+
+"New conversation" — and **New task** on Home — opens one box: say the thing,
+tap **Start chat**, and Hermes takes it the way it takes anything else you say
+to it. No agent to choose, no model to pick, no folder to name; the paperclip,
+the mic and `/` work in that box. Hermes answers in the folder it keeps its own
+chats in, on the model you normally use.
+
+**Advanced** opens the sheet with every choice in it: Hermes or Paseo, which
+Paseo agent and cloud model, which folder (including one that does not exist
+yet), and the model for a Hermes chat. Whichever of the two you last used is
+what this device opens next time — it is a per-device preference kept in the
+browser, so a shared sign-in changes nobody else's screens. What you typed, and
+any files you attached, carry across when you switch.
+
+Two cases go straight to Advanced, because the box has nowhere to hold them: a
+new chat opened *for* a folder (from a project row, or `/new` inside a thread
+that has one), and a Paseo agent asking for a new thread. And when Hermes is not
+answering, or only Paseo is running, there is no plain chat to offer, so the
+sheet shows with what you typed in it.
+
+A thread's heading says who is answering it: *Hermes · …*, or
+*Paseo · Claude Code · ~/repo*.
+
 ## Approvals
 
 Approvals are the most security-sensitive part of the app:

@@ -60,7 +60,7 @@ class DemoDashboard implements Dashboard {
       enabled: true,
       state: 'error',
       deliver: 'local',
-      skills: ['flight-search'],
+      skills: ['trip-planner'],
       enabled_toolsets: ['web', 'todo', 'kiwi', 'mapbox'],
       last_run_at: new Date(Date.now() - 2 * 3600_000).toISOString(),
       last_status: 'error',
@@ -78,7 +78,7 @@ class DemoDashboard implements Dashboard {
       enabled: false,
       state: 'paused',
       deliver: 'local',
-      skills: ['daily-digest'],
+      skills: ['morning-roundup'],
       last_run_at: new Date(Date.now() - 9 * 86400_000).toISOString(),
       last_status: 'ok',
       repeat: { completed: 3 },
@@ -127,10 +127,10 @@ class DemoDashboard implements Dashboard {
     }
     if (path === '/api/skills' && method === 'GET') {
       return ok([
-        { name: 'directions', description: 'Travel times and routes with live traffic', enabled: true },
+        { name: 'route-times', description: 'Travel times between two places', enabled: true },
         { name: 'watchers', description: 'Poll pages and feeds and report changes', enabled: true },
         { name: 'google-workspace', description: 'Gmail, Calendar and Drive', enabled: true },
-        { name: 'flight-search', description: 'Find and compare flights', enabled: true },
+        { name: 'trip-planner', description: 'Plan a trip and compare the options', enabled: true },
       ]);
     }
     if (path === '/api/cron/jobs' && method === 'GET') return ok(this.cron);
@@ -290,7 +290,7 @@ class DemoPaseoSchedules implements PaseoSchedulesApi {
       id: 'sch_nightly_tests',
       name: 'Nightly tests',
       prompt: 'Run the test suite in ~/code/webapp and fix anything that fails. Open a draft PR with the fixes.',
-      cadence: { type: 'cron', expression: '0 2 * * *', timezone: 'America/New_York' },
+      cadence: { type: 'cron', expression: '0 2 * * *', timezone: 'UTC' },
       target: { type: 'new-agent', config: { provider: 'claude', cwd: '/home/demo/code/webapp' } },
       status: 'active',
       createdAt: '2026-09-20T12:00:00Z',
@@ -349,7 +349,7 @@ export const demoAssist: AssistApi = {
         idea: 'Warns you about train delays before work, and stays quiet when trains run normally.',
         skills: [
           { name: 'watchers', why: 'reads the transit alerts feed' },
-          { name: 'directions', why: 'live travel time to work if the trains are down' },
+          { name: 'route-times', why: 'how long the trip takes right now' },
         ],
         tools: 'web',
         toolsWhy: 'it reads the transit alerts page',

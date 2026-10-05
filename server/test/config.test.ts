@@ -148,10 +148,12 @@ describe('config', () => {
     expect(parseConfig(withPatch({ supervisor: { keyFile: '/etc/wayroost/supervisor-key' } })).supervisor).toEqual({
       socket: '/run/wayroost/supervisor.sock',
       keyFile: '/etc/wayroost/supervisor-key',
+      expectedStatusOnly: true,
     });
     expect(parseConfig(withPatch({ supervisor: { socket: '/run/wayroost/supervisor.sock', keyFile: '/etc/wayroost/supervisor-key' } })).supervisor).toEqual({
       socket: '/run/wayroost/supervisor.sock',
       keyFile: '/etc/wayroost/supervisor-key',
+      expectedStatusOnly: true,
     });
     // Exactly at the limit, and a short path with accents in it, both pass.
     expect(parseConfig(withPatch({ supervisor: { socket: `/${'a'.repeat(106)}`, keyFile: '/etc/wayroost/supervisor-key' } })).supervisor?.socket).toBe(`/${'a'.repeat(106)}`);
@@ -164,6 +166,7 @@ describe('config', () => {
     expect(parseConfig(socketOnly, { supervisorKeyCredential: credential }).supervisor).toEqual({
       socket: '/demo/supervisor.sock',
       keyFile: credential,
+      expectedStatusOnly: true,
     });
     // Both there: the credential wins over the development key file.
     const both = withPatch({ supervisor: { keyFile: '/srv/dev/supervisor-key' } });
@@ -173,6 +176,11 @@ describe('config', () => {
     expect(() => parseConfig(socketOnly, { supervisorKeyCredential: 'supervisor-server-key' })).toThrow(/absolute/);
     // The pairing recovery tool never calls the supervisor and doesn't need its key.
     expect(parseConfig(socketOnly, { withoutSupervisor: true }).supervisor).toBeUndefined();
+  });
+
+  it('keeps the deployment action mode for Checks', () => {
+    expect(parseConfig(withPatch({ supervisor: { keyFile: '/demo/supervisor-key', expectedStatusOnly: false } }))
+      .supervisor?.expectedStatusOnly).toBe(false);
   });
 
   it('finds the supervisor credential only where systemd put it', () => {

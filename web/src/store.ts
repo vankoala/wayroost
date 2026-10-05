@@ -61,6 +61,10 @@ export interface AppState {
   feed: Record<string, FeedCard> | null;
   /** Bumped when a skill folder changes, so an open Skills page refetches. */
   skillsVersion: number;
+  /** Bumped when a settings change lands (applied, undone or failed), so open settings pages refetch. */
+  settingsVersion: number;
+  /** Bumped when model usage moves on, so usage pills read their summary again. */
+  usageVersion: number;
   /** The Cloudflare Access identity, when the app is reached through Access. */
   email?: string;
   /** This browser's paired device, from /api/me or the socket greeting. */
@@ -86,6 +90,8 @@ const initialState: AppState = {
   schedulesVersion: 0,
   feed: null,
   skillsVersion: 0,
+  settingsVersion: 0,
+  usageVersion: 0,
   socket: 'connecting',
   statuses: {
     hermes: { source: 'hermes', state: 'connecting' },
@@ -479,6 +485,12 @@ export function applyEvent(event: ServerEvent): void {
     case 'conversation_moved':
       moveConversation(event.source, event.from, event.to);
       return;
+    case 'notification': {
+      // An agent waiting on an answer must reach the open app on every paired device.
+      const { title, body } = event.notification;
+      if (state.device && (state.device.kind === 'desktop' || event.notification.event === 'agent-needs-you')) toast(body ? `${title} · ${body}` : title, 'info');
+      return;
+    }
     case 'items_upsert': {
       flushDeltas(); // keep ordering: pending text lands before replacements
       const key = convKey(event.source, event.conversationId);
@@ -515,6 +527,12 @@ export function applyEvent(event: ServerEvent): void {
       });
       return;
     }
+    case 'settings_changed':
+      setState((s) => ({ ...s, settingsVersion: s.settingsVersion + 1 }));
+      return;
+    case 'usage_changed':
+      setState((s) => ({ ...s, usageVersion: s.usageVersion + 1 }));
+      return;
     case 'voice': // handled by the voice module (events.ts routes it there)
     case 'pong':
       return;

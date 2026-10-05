@@ -1,3 +1,4 @@
+import { FakeSettingsSupervisor } from './fake-settings-supervisor.js';
 import { BackgroundGate } from '../src/background.js';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { EventHub } from '../src/hub.js';
@@ -173,12 +174,14 @@ describe('app: /api/cloud-agents', () => {
     await app.close();
   });
 
-  it('switches one off and answers with the new list', async () => {
-    const { app, paseo } = await makeApp(keys);
+  it('switches one off through the supervisor', async () => {
+    const supervisor = new FakeSettingsSupervisor();
+    const { app, paseo } = await makeApp(keys, { supervisor, configExtra: { settings: { legacyRoutesViaPipeline: true } } });
     const res = await put(app, 'codex', { enabled: false });
     expect(res.statusCode).toBe(200);
-    expect(paseo.calls).toContain('cloud:codex:false');
-    expect(res.json().agents.find((a: { id: string }) => a.id === 'codex')).toMatchObject({ enabled: false, state: 'off' });
+    expect(paseo.calls).not.toContain('cloud:codex:false');
+    expect(res.json()).toMatchObject({ agents: [{ id: 'claude', enabled: true }, { id: 'codex', enabled: false, state: 'off' }] });
+    expect(supervisor.configApply).toHaveBeenCalledWith(expect.objectContaining({ operation: 'paseo.provider-enabled', params: { provider: 'codex', enabled: false } }));
     await app.close();
   });
 

@@ -13,6 +13,7 @@ const FILE = 'hermes-safety-commands.json';
 export class SafetyCommandsSetting {
   private readonly path: string;
   private value: boolean;
+  private settingsSource?: () => boolean;
 
   constructor(stateDir: string) {
     this.path = join(stateDir, FILE);
@@ -28,8 +29,10 @@ export class SafetyCommandsSetting {
   }
 
   enabled(): boolean {
-    return this.value;
+    return this.settingsSource ? this.settingsSource() : this.value;
   }
+
+  useSettingsSource(source: () => boolean): void { this.settingsSource = source; }
 
   setEnabled(enabled: boolean): boolean {
     checkDeviceSignal();

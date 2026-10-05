@@ -182,7 +182,7 @@ it.each(['discovery', 'reload', 'cloud reload'])('acknowledges cancellation duri
   const owner = devices!.signal(TEST_DESKTOP.id);
   const result = stage === 'cloud reload'
     ? withDeviceSignal(owner, () => client.setCloudAgentEnabled('codex', false)).catch(error => error)
-    : app.inject({ method: 'PUT', url: '/api/worker-approvals', headers: postHeaders(token), payload: { enabled: false } });
+    : withDeviceSignal(owner, () => client.setEnabled(false)).catch(error => error);
   try {
     await started;
     const beforeConfig = readFileSync(configPath);
@@ -201,8 +201,7 @@ it.each(['discovery', 'reload', 'cloud reload'])('acknowledges cancellation duri
     expect(owner.aborted).toBe(true);
     expect(JSON.parse(readFileSync(join(config.stateDir, 'devices.json'), 'utf8')).devices).not.toContainEqual(expect.objectContaining({ id: TEST_DESKTOP.id }));
     release();
-    if (stage === 'cloud reload') expect(await result).toMatchObject({ status: 424 });
-    else expect([403, 424]).toContain((await result).statusCode);
+    expect(await result).toMatchObject({ status: 424 });
     // Drain uncancellable daemon replies and the helper's queue after revocation.
     await setting.status();
     expect(readFileSync(configPath)).toEqual(beforeConfig);

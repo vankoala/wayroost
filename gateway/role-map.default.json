@@ -1,0 +1,82 @@
+{
+  "version": 2,
+  "contracts": {
+    "main": {
+      "input": [
+        "text"
+      ],
+      "toolCalling": true,
+      "thinkingLevels": false,
+      "maxOutputTokens": 4096,
+      "advertisedContext": 32768
+    },
+    "coder": {
+      "input": [
+        "text"
+      ],
+      "toolCalling": true,
+      "thinkingLevels": false,
+      "maxOutputTokens": 4096,
+      "advertisedContext": 32768
+    },
+    "fast": {
+      "input": [
+        "text"
+      ],
+      "toolCalling": true,
+      "thinkingLevels": false,
+      "maxOutputTokens": 4096,
+      "advertisedContext": 32768
+    }
+  },
+  "backends": {
+    "example-main": {
+      "baseUrl": "http://127.0.0.1:19041/v1",
+      "servedName": "example-main-model",
+      "contextLength": 32768,
+      "maxOutputTokens": 4096,
+      "input": [
+        "text"
+      ],
+      "toolCalling": true,
+      "thinkingLevels": false,
+      "listenerUid": 1000
+    },
+    "example-coder": {
+      "baseUrl": "http://127.0.0.1:19042/v1",
+      "servedName": "example-coder-model",
+      "contextLength": 32768,
+      "maxOutputTokens": 4096,
+      "input": [
+        "text"
+      ],
+      "toolCalling": true,
+      "thinkingLevels": false,
+      "listenerUid": 1000
+    },
+    "example-fast": {
+      "baseUrl": "http://127.0.0.1:19043/v1",
+      "servedName": "example-fast-model",
+      "contextLength": 32768,
+      "maxOutputTokens": 4096,
+      "input": [
+        "text"
+      ],
+      "toolCalling": true,
+      "thinkingLevels": false,
+      "listenerUid": 1000
+    }
+  },
+  "profiles": {
+    "example/vllm": {
+      "main": "example-main",
+      "coder": "example-coder",
+      "fast": "example-fast"
+    }
+  },
+  "roles": {
+    "main": "example-main",
+    "coder": "example-coder",
+    "fast": "example-fast"
+  }
+}

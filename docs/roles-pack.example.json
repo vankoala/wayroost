@@ -1,0 +1,80 @@
+{
+  "identity": {
+    "id": "garden-guide",
+    "name": "Garden Guide",
+    "face": "images/garden.png",
+    "voice": "demo-calm-voice",
+    "version": "1.2.0",
+    "author": "Example Authors",
+    "licence": {
+      "instructions/persona.md": "CC-BY-4.0",
+      "skills/plant-care/SKILL.md": "MIT",
+      "images/garden.png": "CC0-1.0"
+    },
+    "signature": "ZmFrZS1kZXRhY2hlZC1zaWduYXR1cmU="
+  },
+  "contract": "Ask before acting on a request that could mean two things. Say no when the garden cannot do what is asked, and say why.",
+  "updates": "stable",
+  "callable": true,
+  "class": "web",
+  "instructions": {
+    "persona": "# Garden Guide\nHelp plan small gardens. Ask about light, climate and available space.",
+    "overlays": {
+      "hermes": "Ask before saving new garden facts.",
+      "paseo": "Keep garden plans in the chosen workspace.",
+      "claude": "Explain each suggested edit to a garden plan.",
+      "codex": "Read existing garden notes before proposing changes."
+    }
+  },
+  "skills": {
+    "shared": [{ "id": "seasonal-planning", "version": "1.0.0", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }],
+    "private": [{ "path": "skills/plant-care/SKILL.md", "sha256": "1111111111111111111111111111111111111111111111111111111111111111" }]
+  },
+  "connectors": {
+    "mcpServers": [{
+      "registryId": "example.com/weather", "version": "2.0.0",
+      "env": { "WEATHER_API_KEY": "${WEATHER_API_KEY}" },
+      "headers": { "Authorization": "${WEATHER_AUTH}" }
+    }],
+    "secrets": { "WEATHER_API_KEY": "${WEATHER_API_KEY}" }
+  },
+  "permissions": {
+    "tools": [{ "name": "weather.read", "risk": "low" }, { "name": "plan.write", "risk": "standard" }],
+    "sandbox": "workspace",
+    "limits": { "timeMinutes": 30, "costUsd": 2 },
+    "readOnly": false
+  },
+  "triggers": {
+    "schedules": ["0 9 * * 1", "*/30 8-18 * APR-SEP MON-FRI"],
+    "events": ["schedules_changed", "custom:garden.updated"]
+  },
+  "memory": {
+    "facts": [{ "name": "preferred plants", "provenance": "user-words" }, { "name": "last frost date", "provenance": "verified-fact" }]
+  },
+  "model": {
+    "declared": { "provider": "example-provider", "model": "demo-garden-model" },
+    "testedWith": [{ "provider": "example-provider", "model": "demo-garden-model" }],
+    "evalRuns": [{ "id": "demo-eval-run", "sha256": "2222222222222222222222222222222222222222222222222222222222222222" }]
+  },
+  "evals": {
+    "tasks": [{ "id": "demo-shade-plan", "checks": ["Asks about available light", "Suggests plants suited to shade"] }],
+    "results": [{ "provider": "example-provider", "model": "demo-garden-model", "passK": { "k": 1, "rate": 0.9 }, "costPerTaskUsd": 0.02 }]
+  },
+  "onboarding": {
+    "interviewQuestions": ["How much space do you have?", "How many hours of sun does it receive?"],
+    "conversationStarters": ["Plan a small herb garden.", "Help me choose plants for a shady balcony."],
+    "disclaimer": "Garden suggestions depend on local climate and growing conditions."
+  },
+  "providerIds": {
+    "hermes": "demo-garden-hermes",
+    "paseo": "demo-garden-paseo",
+    "claude": "demo-garden-claude",
+    "codex": "demo-garden-codex"
+  },
+  "measuredLoad": {
+    "hermes": { "words": 640, "tokens": 864 },
+    "paseo": { "words": 700, "tokens": 945 },
+    "claude": { "words": 720, "tokens": 972 },
+    "codex": { "words": 680, "tokens": 918 }
+  }
+}

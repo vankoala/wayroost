@@ -295,6 +295,69 @@ The first public release, to be tagged 0.1.0.
   so a switched-off agent can't be started from anywhere: the New sheet, the
   bridge, other agents or the Paseo app. See
   [docs/paseo.md](docs/paseo.md#cloud-agents).
+- **A chat-first new chat**: "New conversation" and Home's "New task" open one
+  box — say the thing, tap Start chat, and Hermes takes it the way it takes
+  anything else you say to it. No agent to choose, no model to pick, no folder to
+  name. Photos, files and the mic work in that box, and so does `/`. **Advanced**
+  opens the sheet that holds all of those (the source, the agent, the folder, and
+  a folder that doesn't exist yet), and the device remembers which of the two you
+  last used; nothing you typed is lost when you switch. A new chat opened *for* a
+  folder, or asked for from a Paseo agent's thread, goes straight to Advanced —
+  the box has nowhere to put a folder. With only Paseo running, or Hermes not
+  answering, there is no plain chat to offer and the sheet shows instead. A
+  thread's own heading now names whoever is answering it: *Hermes · …* or
+  *Paseo · Claude Code · ~/repo*.
+- **What a folder says about itself** before a Paseo agent starts in it: in
+  Advanced, under the folder, a card names the files in that folder that
+  configure agents and what those files let an agent do — "This folder has hooks
+  Claude Code runs without asking" for `.claude/hooks`. Wayroost reads the
+  configuration as the folder's owner and shows only names and findings;
+  nothing in the folder is running while you read it: the agent starts when you
+  launch it, and the card never stands between
+  you and launching it. A folder it could not fully read says so in the same
+  card. Hermes chats aren't asked, since a Hermes chat reads its folder's files
+  the way it always has. See
+  [docs/paseo.md](docs/paseo.md#what-a-folder-says-about-itself).
+- **Alerts** (Settings → Notifications, see
+  [docs/notifications.md](docs/notifications.md)): the server decides once, for
+  every alert, where it goes — this PC's app, your phone, both or nowhere.
+  - A rule per event (an agent needs you, finished or failed, a For-you or
+    security card, a change applied or failed, a mismatch, this PC's status),
+    for every source or for one of them. What every install starts with: an
+    answer that waits on you reaches the app and the phone, an alert about a run
+    you started reaches the app, and cards stay off the phone unless you say
+    otherwise. An agent waiting on an answer can never be switched off: the app
+    always shows it, and no rule or switch can hide it there.
+  - Presence routing: while the desktop app says someone is at this PC, an alert
+    the app can show stops there; when it reports idle or locked the same alert
+    goes to the phone too; when no desktop has reported for two minutes the phone
+    takes it instead.
+  - Quiet hours (21:00–07:00 to start) hold the phone's push of a card alert and
+    nothing else, read in the owner's own time zone (`notifications.timeZone`),
+    across midnight and daylight saving. The hours and the phone's card switch
+    are the same settings the For-you page writes.
+  - Approval pushes now follow these rules instead of firing on every
+    `approval_upsert`, and one approval is announced once. Desktop toasts follow
+    the same decision: the server sends a `notification` event only for alerts it
+    routed to the app, and the page shows what it receives.
+  - The rules and hours are Wayroost's own settings (`wayroost-settings.json`,
+    mode 600), written through the write-through core: backed up, replaced
+    atomically, audited per change, and undoable. A file that can't be read
+    routes alerts as the defaults would and is never replaced by one of these
+    writes.
+
+### Changed
+
+- **An assist that cannot reach Hermes tries the next address.** When a request
+  fails because the connection failed — refused, reset, closed midway — Wayroost
+  moves to the next address the tunnel publishes and asks once more, then keeps
+  the address that worked. Your own deadline, a revoked device and an answer that
+  says no are not connection failures and are reported exactly as before.
+- **Skill lists and a job's instructions reach the assistant as quoted text.**
+  What a skills catalogue says, and what a scheduled job's instructions and the
+  owner's wish contain, travel between `WAYROOST-QUOTE` markers, with the model
+  told the markers are Wayroost's own — so a line inside that text asking for
+  something is not asking the assistant that is describing it.
 
 ### Fixed
 

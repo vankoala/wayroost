@@ -1,0 +1,27 @@
+[Unit]
+Description=Wayroost model gateway
+Requires=wayroost-gateway.socket
+After=wayroost-gateway.socket
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=wayroost-gateway
+StateDirectoryMode=0700
+RuntimeDirectory=wayroost-gateway
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStartPre=/usr/bin/node /usr/lib/wayroost-gateway/seed.js --local /etc/wayroost-gateway/role-map.local.json /usr/lib/wayroost-gateway/role-map.default.json /var/lib/private/wayroost-gateway/role-map.json
+ExecStart=/usr/bin/node /usr/lib/wayroost-gateway/index.js --config /var/lib/private/wayroost-gateway/role-map.json --socket /run/wayroost-gateway/admin.sock
+Restart=always
+RestartSec=1
+TimeoutStopSec=15
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

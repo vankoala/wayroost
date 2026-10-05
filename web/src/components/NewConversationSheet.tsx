@@ -1,6 +1,6 @@
 import { Check, Folder, LoaderCircle, Zap } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import type { FolderStatus, HermesOptions, PaseoOptions, Source } from '../../../shared/protocol';
+import type { FolderStatus, HermesOptions, PaseoOptions, ProjectConfigReport, Source } from '../../../shared/protocol';
 import { api, ApiError, refreshList } from '../api';
 import { releasePreview, toUpload, type PendingAttachment } from '../attach';
 import { newHermesChatCommands } from '../commands';
@@ -18,12 +18,18 @@ export function NewConversationSheet({
   initialCwd,
   initialSource,
   initialText,
+  initialAttachments,
+  onBasic,
 }: {
   onClose: () => void;
   initialCwd?: string;
   /** Opened from a conversation ("/new"): start on its source. */
   initialSource?: Source;
   initialText?: string;
+  /** What the one-box view already held when Advanced opened. */
+  initialAttachments?: PendingAttachment[];
+  /** Back to the one box, for the device that opened Advanced from there. */
+  onBasic?: (text: string, files: PendingAttachment[]) => void;
 }) {
   const statuses = useStore((s) => s.statuses);
   const conversations = useStore((s) => s.conversations);
@@ -35,9 +41,23 @@ export function NewConversationSheet({
     return statuses.hermes.state === 'connected' || statuses.paseo.state !== 'connected' ? 'hermes' : 'paseo';
   });
   const [text, setText] = useState(initialText ?? '');
-  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [attachments, setAttachments] = useState<PendingAttachment[]>(initialAttachments ?? []);
   const [busy, setBusy] = useState(false);
-  const adder = useFileAdder(attachments, setAttachments);
+  const mounted = useRef(false);
+  const unsent = useRef(attachments);
+  const prepared = useRef(new WeakSet(attachments));
+  const changeAttachments = (next: PendingAttachment[]) => {
+    // Preparation may finish after dismissal; only new previews still need freeing.
+    for (const file of next) {
+      if (!mounted.current && !prepared.current.has(file)) releasePreview(file);
+      prepared.current.add(file);
+    }
+    if (mounted.current) {
+      unsent.current = next;
+      setAttachments(next);
+    }
+  };
+  const adder = useFileAdder(attachments, changeAttachments);
   useFileDrop({
     label: 'Drop to attach to the new chat',
     refusal: dropRefusal(adder, busy ? 'Starting the chat…' : null),
@@ -49,11 +69,23 @@ export function NewConversationSheet({
   const slash = useSlashMenu({ text, setText, inputRef: textRef, load: tab === 'hermes' ? newHermesChatCommands : null });
 
   // Files not sent when the sheet closes: free their thumbnails.
-  const unsent = useRef(attachments);
+  const previewMount = useRef(0);
+  const submitting = useRef(false);
   useEffect(() => {
-    unsent.current = attachments;
-  }, [attachments]);
-  useEffect(() => () => unsent.current.forEach(releasePreview), []);
+    const mount = ++previewMount.current;
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      // Let cleanup and setup replay before freeing thumbnails that may still be in use.
+      queueMicrotask(() => {
+        // A pending start owns its previews until the request succeeds or fails.
+        if (previewMount.current === mount && !submitting.current) {
+          unsent.current.forEach(releasePreview);
+          unsent.current = [];
+        }
+      });
+    };
+  }, []);
 
   // Paseo choices
   const [options, setOptions] = useState<PaseoOptions | null>(null);
@@ -168,8 +200,37 @@ export function NewConversationSheet({
   const folderStatus = folderCheck?.path === typedFolder ? folderCheck.status : undefined;
   const folderUnusable = folderStatus === 'missing-parent' || folderStatus === 'not-a-folder';
 
+  // What the chosen folder's own files would let this agent do, read before it starts (the server runs
+  // as you, so it reads what the agent will read). Advice: nothing here stops the launch.
+  const paseoFolder = tab === 'paseo' && options && !offline ? folderPath(cwd) : '';
+  const [configReport, setConfigReport] = useState<{ path: string; provider: string; report: ProjectConfigReport } | null>(null);
+  const configRequest = useRef<{ path: string; provider: string; promise: Promise<ProjectConfigReport> } | null>(null);
+  const folderConfig = configReport?.path === paseoFolder && configReport.provider === providerId ? configReport.report : null;
+  const checkFolderConfig = (path: string, provider: string) => {
+    if (configRequest.current?.path === path && configRequest.current.provider === provider) return configRequest.current.promise;
+    const promise = api.projectConfig(path, provider).catch((): ProjectConfigReport => ({ notices: [], unreadable: true }));
+    configRequest.current = { path, provider, promise };
+    return promise;
+  };
+  useEffect(() => {
+    setConfigReport(null);
+    if (!paseoFolder.startsWith('/') || !providerId) return;
+    let live = true;
+    const timer = setTimeout(() => {
+      const promise = checkFolderConfig(paseoFolder, providerId);
+      promise.then((report) => {
+        if (live && configRequest.current?.promise === promise) setConfigReport({ path: paseoFolder, provider: providerId, report });
+      });
+    }, 500);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [paseoFolder, providerId]);
+
   const canSubmit =
     !busy &&
+    !adder.busy &&
     !offline &&
     !folderUnusable &&
     (text.trim().length > 0 || attachments.length > 0) &&
@@ -177,8 +238,18 @@ export function NewConversationSheet({
       ? (!hermesCwd.trim() || hermesCwd.trim().startsWith('/')) && (!modelCosts || modelCostOk)
       : Boolean(providerId) && cwd.trim().startsWith('/') && (!actsOnItsOwn || acknowledged));
 
+  const resetSubmission = () => {
+    submitting.current = false;
+    if (mounted.current) setBusy(false);
+    else {
+      unsent.current.forEach(releasePreview);
+      unsent.current = [];
+    }
+  };
+
   const submit = async () => {
-    if (!canSubmit) return;
+    if (!canSubmit || submitting.current) return;
+    submitting.current = true;
     setBusy(true);
     const files = attachments;
     try {
@@ -189,12 +260,18 @@ export function NewConversationSheet({
       }
       if (found === 'missing-parent' || found === 'not-a-folder') {
         setFolderCheck({ path: typedFolder, status: found });
-        setBusy(false);
+        resetSubmission();
         return;
       }
       if (found === 'missing') {
         await api.createFolder(typedFolder);
         setFolderCheck({ path: typedFolder, status: 'exists' });
+        configRequest.current = null;
+      }
+      if (tab === 'paseo') {
+        const path = folderPath(cwd);
+        const report = await checkFolderConfig(path, providerId);
+        setConfigReport({ path, provider: providerId, report });
       }
       const created =
         tab === 'hermes'
@@ -218,8 +295,11 @@ export function NewConversationSheet({
       const key = convKey(created.source, created.id);
       keepPreviews(key, null, files, getState().details[key]?.items.map((i) => i.id) ?? []);
       unsent.current = [];
-      onClose();
-      navigate(conversationPath(created.source, created.id));
+      submitting.current = false;
+      if (mounted.current) {
+        onClose();
+        navigate(conversationPath(created.source, created.id));
+      }
       if (created.command) applyCommandResult(created.source, created.id, created.command);
       if (created.notice) toast(created.notice, 'info');
       refreshList().catch(() => {});
@@ -227,7 +307,7 @@ export function NewConversationSheet({
       // Hermes wants a yes for this model's cost: show the box to tick.
       if (err instanceof ApiError && err.status === 409 && tab === 'hermes' && modelChanged) setModelNeedsOk(true);
       toast((err as Error).message);
-      setBusy(false);
+      resetSubmission();
     }
   };
 
@@ -236,10 +316,25 @@ export function NewConversationSheet({
       title="New conversation"
       onClose={onClose}
       footer={
-        <button type="button" className="btn btn-primary btn-block" disabled={!canSubmit} onClick={submit}>
-          {busy && <LoaderCircle size={18} className="spin" />}
-          {tab === 'hermes' ? 'Start chat' : 'Launch agent'}
-        </button>
+        <div className="new-chat-foot">
+          <button type="button" className="btn btn-primary btn-block" disabled={!canSubmit} onClick={submit}>
+            {busy && <LoaderCircle size={18} className="spin" />}
+            {tab === 'hermes' ? 'Start chat' : 'Launch agent'}
+          </button>
+          {onBasic && (
+            <button
+              type="button"
+              className="link-btn basic-toggle"
+              disabled={busy || adder.busy}
+              onClick={() => {
+                unsent.current = [];
+                onBasic(text, attachments);
+              }}
+            >
+              Ask in one box instead
+            </button>
+          )}
+        </div>
       }
     >
       <div className="segmented" role="tablist" hidden={enabled.length < 2}>
@@ -280,7 +375,9 @@ export function NewConversationSheet({
           </div>
         </div>
         {slash.menu}
-        <AttachmentChips attachments={attachments} onChange={setAttachments} />
+        <fieldset disabled={busy} style={{ display: 'contents' }} aria-label="Attachments">
+          <AttachmentChips attachments={attachments} onChange={changeAttachments} />
+        </fieldset>
       </div>
 
       {tab === 'hermes' && !offline && hermesOptions && hermesOptions.models.length > 0 && (
@@ -412,6 +509,10 @@ export function NewConversationSheet({
 
               <div className="field">
                 <span>Folder</span>
+                {/* Said while the folder is still a choice, not after you have committed to it. */}
+                {folderConfig && (folderConfig.notices.length > 0 || folderConfig.unreadable) && (
+                  <FolderConfigNote report={folderConfig} />
+                )}
                 {options.workspaces.length > 0 && (
                   <div className="options" role="radiogroup" aria-label="Folder">
                     {options.workspaces.map((w) => (
@@ -484,4 +585,25 @@ function FolderNote({ status }: { status: FolderStatus | undefined }) {
   }
   if (status === 'not-a-folder') return <small className="folder-note bad">That's a file, not a folder.</small>;
   return null;
+}
+
+/**
+ * What the agent is about to work under can configure itself: hooks it runs, permissions it
+ * grants itself, code it starts. Said plainly, with the file names, before the launch.
+ * Wayroost reads those files as you; it never shows what is inside them.
+ */
+function FolderConfigNote({ report }: { report: ProjectConfigReport }) {
+  return (
+    <div className="notice-card" role="note">
+      <div className="notice-title">This folder configures its agents</div>
+      {report.notices.map((notice) => (
+        <div className="notice-line" key={notice.text}>
+          <p className="notice-text">{notice.text}</p>
+          <p className="notice-files">{notice.files.join('  ·  ')}</p>
+        </div>
+      ))}
+      {report.unreadable && <p className="notice-text">Some of it could not be read, so this may not be all of it.</p>}
+      <p className="notice-foot">Only file names and findings are shown. The agent starts when you launch it.</p>
+    </div>
+  );
 }

@@ -9,6 +9,26 @@ permissions:
   contents: read
 
 jobs:
+  gateway-systemd:
+    name: Model gateway socket activation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Build standalone deployment entries
+        run: |
+          npx esbuild gateway/src/index.ts --bundle --platform=node --format=esm --outfile=dist/gateway/index.js
+          npx esbuild gateway/src/seed.ts --bundle --platform=node --format=esm --outfile=dist/gateway/seed.js
+      - name: Exercise deployed units as root
+        run: sudo env CI=true "$(command -v node)" gateway/test/systemd-ci.mjs
+
   test:
     name: Typecheck, test, build
     runs-on: ubuntu-latest

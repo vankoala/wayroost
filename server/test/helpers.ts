@@ -31,6 +31,7 @@ import type { SpeechService } from '../src/speech.js';
 import type { Feed } from '../src/feed/service.js';
 import { Devices } from '../src/devices.js';
 import { EventHub } from '../src/hub.js';
+import type { Notifications } from '../src/notifications/service.js';
 import type { PowerOptions } from '../src/power.js';
 import type { SupervisorApi } from '../src/supervisor-client.js';
 import { createAccessVerifier } from '../src/security/access.js';
@@ -303,6 +304,8 @@ export async function makeApp(
     schedules?: AppDeps['schedules'];
     /** Builds For you from this app's hub and fake Hermes. */
     feed?: (deps: { hub: EventHub; hermes: FakeHermes; stateDir: string }) => Feed;
+    /** Alerts: the routing service, built from this app's hub and state folder. */
+    notifications?: (deps: { hub: EventHub; stateDir: string }) => Notifications;
     skills?: AppDeps['skills'];
     /** Status & power: a supervisor to talk to (the fake in power.test.ts). */
     supervisor?: SupervisorApi;
@@ -317,6 +320,8 @@ export async function makeApp(
     tasks?: AppDeps['tasks'];
     bridge?: AppDeps['bridge'];
     workerUpdates?: AppDeps['workerUpdates'];
+    /** What a folder's own files let an agent do there (tests plant their own folders). */
+    configScan?: AppDeps['configScan'];
   } = {},
 ) {
   const config = makeConfig(options.staticDir, options.configExtra);
@@ -327,6 +332,7 @@ export async function makeApp(
   const paseo = new FakePaseo();
   const verifier = createAccessVerifier({ ...config.access!, keySource: keys.keySource });
   const feed = options.feed?.({ hub, hermes, stateDir: config.stateDir });
+  const notifications = options.notifications?.({ hub, stateDir: config.stateDir });
   const app = await buildApp({
     config,
     verifier,
@@ -344,14 +350,16 @@ export async function makeApp(
     ...(options.supervisor ? { supervisor: options.supervisor } : {}),
     ...(options.power ? { power: options.power } : {}),
     ...(feed ? { feed } : {}),
+    ...(notifications ? { notifications } : {}),
     ...(options.skills ? { skills: options.skills } : {}),
     ...(options.workerApprovals ? { workerApprovals: options.workerApprovals } : {}),
     ...(options.safetyCommands ? { safetyCommands: options.safetyCommands } : {}),
     ...(options.tasks ? { tasks: options.tasks } : {}),
     ...(options.bridge ? { bridge: options.bridge } : {}),
     ...(options.workerUpdates ? { workerUpdates: options.workerUpdates } : {}),
+    ...(options.configScan ? { configScan: options.configScan } : {}),
   });
-  return { app, config, hub, hermes, paseo, feed, devices };
+  return { app, config, hub, hermes, paseo, feed, notifications, devices };
 }
 
 /** Headers our own frontend sends on an API call from the public origin, signed in as the test desktop. */

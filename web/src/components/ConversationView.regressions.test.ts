@@ -68,6 +68,23 @@ describe('removing the open thread', () => {
   });
 });
 
+describe('who is answering', () => {
+  it('names the agent at the top of the thread, beside where it works', async () => {
+    await act(async () => setState((s) => ({
+      ...s,
+      conversations: {
+        ...s.conversations,
+        'hermes:demo-thread': { ...s.conversations['hermes:demo-thread']!, subtitle: 'Desktop · ~/code/app' },
+      },
+    })));
+    expect(container.querySelector('.conv-title .sub')!.textContent).toBe('Hermes · Desktop · ~/code/app');
+  });
+
+  it('still says Hermes for a chat with nothing under the title', () => {
+    expect(container.querySelector('.conv-title .sub')!.textContent).toBe('Hermes');
+  });
+});
+
 describe('related-thread filters', () => {
   it('uses a changed filter without remounting the open thread', async () => {
     await act(async () => setState((s) => ({ ...s, conversations: { ...s.conversations,

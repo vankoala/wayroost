@@ -11,6 +11,7 @@ ui-shots/
 e2e-shots/
 test-results/
 .tmp/
+gateway/.test-tmp/
 
 # Local config and secrets. Only the templates in deploy/ belong in git.
 .env

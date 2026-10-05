@@ -8,7 +8,7 @@ import { Inbox } from './components/Inbox';
 import { MediaViewer } from './components/Media';
 import { ForYouSheet } from './components/ForYouSheet';
 import { MoreSheet, PhoneBar, Sidebar, useIsPhone } from './components/Shell';
-import { NewConversationSheet } from './components/NewConversationSheet';
+import { NewChatSheet } from './components/NewChatSheet';
 import { DevicesPage } from './components/DevicesPage';
 import { PairPage } from './components/PairPage';
 import { startEvents } from './events';
@@ -27,6 +27,10 @@ import {
 import { convKey, toast, useStore } from './store';
 import { HomePage } from './pages/Home';
 import { SettingsPage, VoicePage } from './pages/Settings';
+import { AgentsSettingsPage } from './pages/SettingsAgents';
+import { ModelsSettingsPage } from './pages/SettingsModels';
+import { SafetySettingsPage } from './pages/SettingsSafety';
+import { ChecksSettingsPage } from './pages/SettingsChecks.js';
 import { ArchivedPage, ConnectorsPage, SchedulePage, SkillsPage } from './pages/SettingsPages';
 import { StatusPage, type PowerConfirmation } from './pages/StatusPage';
 import { TeamPage } from './pages/TeamPage';
@@ -167,6 +171,10 @@ function Main({ route }: { route: Exclude<Route, { name: 'pair' }> }) {
             <StatusPage onConfirm={(confirmation) => setSheet({ kind: 'power-confirm', ...confirmation })} />
           )}
           {route.name === 'settings' && route.page === 'devices' && <DevicesPage />}
+          {route.name === 'settings' && route.page === 'agents' && <AgentsSettingsPage />}
+          {route.name === 'settings' && route.page === 'models' && <ModelsSettingsPage />}
+          {route.name === 'settings' && route.page === 'safety' && <SafetySettingsPage />}
+          {route.name === 'settings' && route.page === 'checks' && <ChecksSettingsPage />}
           {route.name === 'settings' && route.page === 'voice' && <VoicePage />}
           {route.name === 'settings' && route.page === 'connectors' && <ConnectorsPage />}
           {route.name === 'settings' && route.page === 'skills' && <SkillsPage />}
@@ -201,7 +209,7 @@ function Main({ route }: { route: Exclude<Route, { name: 'pair' }> }) {
         />
       )}
       {sheet?.kind === 'new' && (
-        <NewConversationSheet
+        <NewChatSheet
           onClose={() => setSheet(null)}
           {...(sheet.cwd ? { initialCwd: sheet.cwd } : {})}
           {...(sheet.source ? { initialSource: sheet.source } : {})}

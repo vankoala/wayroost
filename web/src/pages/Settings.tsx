@@ -59,6 +59,8 @@ import { readMessage, setVoiceSettings, setVoiceStatus, SPEEDS, useVoiceSettings
 import { navigate, settingsPath } from '../router';
 import { ConfirmDialog, Page, SOURCE_NAMES, SourceAvatar, statusLabel, statusTone, useEnabledSources } from '../components/common';
 import { ForYouSettings } from '../components/ForYouSettings';
+import { NotificationRules } from '../components/NotificationRules';
+import { RecentChanges } from '../components/RecentChanges';
 import { currentTheme, setTheme, type Theme } from '../theme';
 import { SettingsTiming } from '../components/SettingsTiming';
 
@@ -1190,7 +1192,7 @@ function VoiceSettings({ loadCloud = false }: { loadCloud?: boolean }) {
 
 const SETTINGS_GROUPS = {
   'Overview': [
-    'connection', 'hermes', 'paseo', 'offline', 'status', 'Hermes sign-in', 'Signed in to the Hermes dashboard', 'Sign out',
+    'connection', 'hermes', 'paseo', 'offline', 'status', 'recent', 'changes', 'undo', 'Hermes sign-in', 'Signed in to the Hermes dashboard', 'Sign out',
     'Hermes dashboard username', 'Password', 'Connect Hermes',
   ],
   'You': [
@@ -1201,7 +1203,7 @@ const SETTINGS_GROUPS = {
     'Read replies aloud', 'Send what you say right away', 'Speed', 'Play this voice', 'Try it', 'Theme', 'Light', 'Dark', 'Text size and language',
     'Set a PIN', 'New PIN', 'Choose a PIN', 'Set PIN', 'Change PIN', 'Change', 'Show PIN', 'Hide PIN',
   ],
-  'Your AI': ['agents', 'models', 'cloud', 'connectors', 'gmail', 'skills', 'memory', 'persona', 'Cloud agents', 'Memory & persona'],
+  'Your AI': ['agents', 'models', 'cloud', 'connectors', 'gmail', 'skills', 'memory', 'persona', 'Cloud agents', 'Memory & persona', 'safety'],
   'Work': [
     'scheduled', 'jobs', 'automation', 'chats', 'projects', 'archive', 'bridge', 'Scheduled jobs', 'Tidy up',
     'Archived threads', 'Archive threads idle for more than', 'View', 'Project bridge', 'Last hour', 'Pause', 'Resume', 'New jobs and triggers',
@@ -1413,12 +1415,14 @@ export function SettingsPage() {
             </div>
           </div>
         )}
+        <RecentChanges />
       </Group>
 
       <Group label="You" query={query} indexed={indexed} onIndex={indexGroup}>
         <WhatsAppSettings />
         <PhoneSettings />
         {enabled.includes('hermes') && <ForYouSettings />}
+        <NotificationRules />
         <VoiceSettings />
         <div className="group">
           <PageRow icon={<AudioLines size={18} />} title="Voice settings" help="Choose the app read-aloud provider, voice and model" to={settingsPath('voice')} />
@@ -1431,6 +1435,20 @@ export function SettingsPage() {
       </Group>
 
       <Group label="Your AI" query={query} indexed={indexed} onIndex={indexGroup}>
+        <div className="group">
+          <PageRow
+            icon={<Waypoints size={18} />}
+            title="Agents"
+            help="How Hermes behaves, which Paseo agents may start, profiles and delegation limits"
+            to={settingsPath('agents')}
+          />
+          <PageRow
+            icon={<Gauge size={18} />}
+            title="Models & accounts"
+            help="What serves each role, keys, subscriptions and usage"
+            to={settingsPath('models')}
+          />
+        </div>
         {enabled.includes('paseo') && <CloudAgentsSettings />}
         <div className="group-title">Connectors and skills</div>
         <div className="group">
@@ -1471,6 +1489,20 @@ export function SettingsPage() {
 
       <Group label="Safety & access" query={query} indexed={indexed} onIndex={indexGroup}>
         <div className="group-title">Safety</div>
+        <div className="group">
+          <PageRow
+            icon={<ShieldCheck size={18} />}
+            title="Safety"
+            help="Approval mode, the always-allowed list, staging and the workers’ switch"
+            to={settingsPath('safety')}
+          />
+          <PageRow
+            icon={<ShieldCheck size={18} />}
+            title="Checks"
+            help="Comparisons reported by this PC and fixes for mismatches"
+            to={settingsPath('checks')}
+          />
+        </div>
         <div className="group">
           {/* Signed in through Cloudflare Access: only then is there an Access session to end. */}
           {email && (

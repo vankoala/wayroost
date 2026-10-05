@@ -9,7 +9,7 @@ export const desktopOnly = ['desktop/test/fuses.test.ts', 'desktop/test/main.tes
 const base = { environment: 'node', testTimeout: 15_000 } as const;
 /** The app's tests, the desktop's that the root install can run included (scripts/root-suite.test.ts checks). */
 export const appTests = {
-  include: ['server/test/**/*.test.ts', 'web/src/**/*.test.ts', 'scripts/**/*.test.ts', 'desktop/test/**/*.test.ts'],
+  include: ['server/test/**/*.test.ts', 'web/src/**/*.test.ts', 'scripts/**/*.test.ts', 'desktop/test/**/*.test.ts', 'gateway/test/**/*.test.ts'],
   exclude: [...configDefaults.exclude, ...desktopOnly],
 };
 const supervisor = ['supervisor/test/**/*.test.ts'];

@@ -3,17 +3,21 @@ import { BackgroundGate } from '../server/src/background.js';
 // demo sources, drives headless Chrome at phone and desktop sizes, saves
 // screenshots, and fails on any page error or CSP violation.
 //   npm run build:web && npx tsx scripts/ui-check.ts <output-dir>
-import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { chromium, type Locator, type Page, type Response as PageResponse } from 'playwright-core';
 import type { ScheduleRun } from '../shared/protocol.js';
 import { buildApp } from '../server/src/app.js';
+import { localSettingsListener } from '../server/src/settings/listener.js';
 import { WorkerUpdatesSetting } from '../server/src/tasks/setting.js';
+import { Notifications } from '../server/src/notifications/service.js';
+import { NotificationSettingsStore } from '../server/src/notifications/settings.js';
 import { demoTasks } from './demo-tasks.js';
+import { demoProjectConfig } from './demo-project-config.js';
 import { parseConfig } from '../server/src/config.js';
 import { EventHub } from '../server/src/hub.js';
 import { createAccessVerifier } from '../server/src/security/access.js';
+import { privateStateDir } from './lib/private-state-dir.js';
 import { DEVICE_COOKIE, Devices } from '../server/src/devices.js';
 import { PAIR_PATH } from '../shared/protocol.js';
 import { demoAssist, demoConnectors, demoDashboard, demoHelper, demoPaseoSchedules } from './demo-connectors.js';
@@ -31,18 +35,26 @@ import { createLocalAccess, startEdge } from './lib/local-access.js';
 const OUT = resolve(process.argv[2] ?? 'ui-shots');
 // The browser talks to a stand-in for Cloudflare's edge on PORT, which stamps
 // the Access JWT on every request and WebSocket handshake, like the real one.
-const PORT = Number(process.env.PORT ?? 8890);
+const PORT = Number(process.env.PORT ?? 8892);
 const APP_PORT = PORT + 1;
+const LOCAL_PORT = PORT; // Separate loopback hosts keep the local listener and its cookies apart.
 const ORIGIN = `http://127.0.0.1:${PORT}`;
+// This PC's own settings listener, where pc-only rows read whole values.
+const LOCAL_ORIGIN = `http://127.0.0.2:${LOCAL_PORT}`;
+
 
 mkdirSync(OUT, { recursive: true });
 const access = await createLocalAccess({ issuer: 'http://127.0.0.1:1' });
 const config = parseConfig(
   {
     listen: { host: '127.0.0.1', port: APP_PORT },
+    // This PC's own listener, writes confirmed: the desktop settings shots open there,
+    // which is the only place pc-only rows read whole values instead of digests.
+    localListener: { host: '127.0.0.2', port: LOCAL_PORT, pcOnlyWrites: true },
+    origins: [LOCAL_ORIGIN],
     publicOrigin: ORIGIN,
     access: { teamDomain: access.issuer, aud: access.aud, allowedEmails: [access.email] },
-    stateDir: mkdtempSync(join(tmpdir(), 'sb-ui-')),
+    stateDir: privateStateDir('sb-ui-'),
     staticDir: resolve('dist/web'),
   },
   { allowLocalDev: true },
@@ -59,19 +71,36 @@ const sources = { hermes: new DemoHermes(hub), paseo: new DemoPaseo(hub) };
 const bridge = await startDemoBridge(sources, hub);
 const speech = new DemoSpeech();
 const cloudSpeech = new DemoCloudSpeech();
-const feed = demoFeed(hub, sources.hermes, mkdtempSync(join(tmpdir(), 'sb-ui-feed-')));
+const feed = demoFeed(hub, sources.hermes, privateStateDir('sb-ui-feed-'));
 feed.start();
+// Settings → Notifications: where each alert goes. No push here (the demo origin is http),
+// so the page says what it can show and how many devices a push could reach.
+const notifications = new Notifications({
+  settings: new NotificationSettingsStore(config.stateDir),
+  hub,
+  feed,
+  background: new BackgroundGate('primary'),
+  log: { info() {}, warn() {} },
+});
+feed.useRouting(notifications);
 // A pretend supervisor behind the real power routes: the status block and Status &
 // power run off it in every shot below, with the server's own confirm taps.
 const power = new DemoSupervisor();
+power.documents['paseo-config']!.daemon = { agentProfiles: [{ id: 'paseo-coder', name: 'Coder', provider: 'pi', model: 'pi/example-coder-model' }], appendSystemPrompt: 'Route coding to the coder profile.' };
 const app = await buildApp({
   config,
   verifier: createAccessVerifier({ ...config.access!, keySource: access.keySource }),
   devices,
   supervisor: power,
+  settings: {
+    modelStatus: async () => [{ role: 'main', health: 'up', inFlight: 2 }, { role: 'coder', health: 'up', inFlight: 1 }, { role: 'fast', health: 'down', inFlight: 0 }],
+    roleLoads: async () => [{ role: 'example-role', harness: 'hermes', words: 120, tokens: 180, targetWords: 100, budgetWords: 150, parts: { shared: 20, dispatch: 10, role: 50, skills: 40 } }],
+    agentAvailability: async () => [{ id: 'claude', installed: true, authenticated: true }, { id: 'codex', installed: true, authenticated: false }, { id: 'copilot', installed: false, authenticated: null }],
+  },
   hub,
   sources,
   feed,
+  notifications,
   bridge,
   connectors: demoConnectors(ORIGIN),
   schedules: new Schedules({ background: new BackgroundGate('primary'),
@@ -91,12 +120,18 @@ const app = await buildApp({
   // Settings → Project bridge → Worker updates; the check drives this row (see shot 30b).
   workerUpdates: new WorkerUpdatesSetting(config.stateDir),
   tasks: demoTasks,
+  // Demo folders are names, not directories: this is what each one's own files would say.
+  configScan: demoProjectConfig,
   speech,
   cloudSpeech,
   logger: false,
 });
 app.addHook('onClose', async () => power.stop());
+// The desktop's own port, same app: the settings shots open here, so pc-only
+// rows read whole values instead of digests. Built before listen: it adds a close hook.
+const localListener = localSettingsListener(app, config);
 await app.listen({ host: '127.0.0.1', port: APP_PORT });
+await new Promise<void>((res, rej) => { localListener.once('error', rej); localListener.listen(LOCAL_PORT, '127.0.0.2', () => res()); });
 const edge = await startEdge({ port: PORT, appPort: APP_PORT, token: access.token });
 
 // Voice mode: Chrome's fake microphone (a beeping tone) stands in for a real one.
@@ -157,6 +192,8 @@ async function shoot(
     expectErrors?: RegExp;
     /** Which paired device the page signs in as; null for a browser that isn't paired. Default the desktop. */
     device?: string | null;
+    /** 'local' reaches the app on this PC's own listener port, where pc-only values read whole. (The socket cannot carry the app marker from a browser, so those pages are HTTP-only; fine for settings, which read by fetch.) */
+    origin?: 'edge' | 'local';
   },
 ) {
   // SHOTS=77,79 runs only the shots whose name starts with those, for debugging one.
@@ -169,18 +206,25 @@ async function shoot(
     isMobile: phone,
     hasTouch: phone,
     permissions: ['microphone', 'notifications'],
+    // Local-listener shots sign in the way the desktop app does: every request carries its marker.
+    ...(opts.origin === 'local' ? { extraHTTPHeaders: { 'x-wayroost-app': 'desktop' } } : {}),
   });
   const device = opts.device === undefined ? demoDesktop.cookie : opts.device;
-  if (device) await context.addCookies([{ name: DEVICE_COOKIE, value: device, url: ORIGIN, httpOnly: true, sameSite: 'Strict' }]);
+  if (device) {
+    await context.addCookies([{ name: DEVICE_COOKIE, value: device, url: ORIGIN, httpOnly: true, sameSite: 'Strict' }]);
+    // A local-listener shot carries the same cookie on the local origin, as the desktop app's own store would.
+    if (opts.origin === 'local') await context.addCookies([{ name: DEVICE_COOKIE, value: device, url: LOCAL_ORIGIN, httpOnly: true, sameSite: 'Strict' }]);
+  }
   // The saved theme is in place before the first page load.
   if (opts.theme) {
     await context.addInitScript((theme) => localStorage.setItem('wayroost.theme', theme), opts.theme);
   }
   const page = await context.newPage();
   const seen: Seen = { responses: [], frames: [], console: [], posts: [], urls: [] };
+  const localWsNoise = /WebSocket connection .* failed/;
   page.on('console', (m) => {
     seen.console.push(m.text());
-    if (m.type() === 'error' && !opts.expectErrors?.test(m.text())) problems.push(`${name}: console: ${m.text()}`);
+    if (m.type() === 'error' && !(opts.origin === 'local' && localWsNoise.test(m.text())) && !opts.expectErrors?.test(m.text())) problems.push(`${name}: console: ${m.text()}`);
   });
   page.on('pageerror', (e) => problems.push(`${name}: pageerror: ${e.message}`));
   page.on('response', (res) => seen.responses.push(readBody(res)));
@@ -189,10 +233,16 @@ async function shoot(
     if (req.method() === 'POST') seen.posts.push(req.postData() ?? '');
   });
   page.on('websocket', (ws) => ws.on('framereceived', (f) => seen.frames.push(String(f.payload))));
-  await page.goto(ORIGIN + opts.path);
-  await page.waitForSelector(opts.ready, { timeout: 10_000 });
-  await opts.act?.(page, seen);
-  await page.waitForTimeout(400);
+  await page.goto((opts.origin === 'local' ? LOCAL_ORIGIN : ORIGIN) + opts.path);
+  const mounted = await page.waitForSelector(opts.ready, { timeout: 10_000 }).then(() => true).catch(async () => {
+    problems.push(`${name}: ready never appeared: ${(await page.locator('body').innerText().catch(() => '(no body)')).slice(0, 200)}`);
+    await page.screenshot({ path: join(OUT, `${name}-FAILED.png`) }).catch(() => undefined);
+    return false;
+  });
+  if (mounted) {
+    await opts.act?.(page, seen);
+    await page.waitForTimeout(400);
+  }
   await page.screenshot({ path: join(OUT, `${name}.png`) });
   console.log('shot', name);
   await opts.after?.(page, seen);
@@ -407,9 +457,18 @@ async function checkTintedSurfaces(page: Page, name: string, phone: boolean): Pr
   needs('for-you strip', await checkTextContrast(name, 'for-you strip', page.locator('.foryou-strip')), ['muted']);
   // The chosen folder in New conversation (a Paseo agent lists its folders): its name, then its path.
   await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.click('.sheet .advanced-toggle');
   await page.click('.sheet .segmented button:nth-child(2)');
   const folder = page.locator(".sheet .option[aria-checked='true']");
   needs('chosen folder', await checkTextContrast(name, 'chosen folder', folder), ['label div', 'label div']);
+  // What the chosen folder says about the agents it configures for itself.
+  await page.waitForSelector('.notice-card');
+  needs('folder notice', await checkTextContrast(name, 'folder notice', page.locator('.notice-card')), [
+    'notice-title',
+    'notice-text',
+    'notice-files',
+    'notice-foot',
+  ]);
   // The current choice in a settings picker (the model, with its price as the description).
   await page.goto(ORIGIN + '/c/hermes/20260927_080000_abcdef');
   await page.locator('.control-chip[aria-label^="Model:"]').click();
@@ -615,6 +674,7 @@ try {
     ready: '.row',
     act: async (page) => {
       await page.click('.fab');
+      await page.click('.sheet .advanced-toggle');
       await page.click('.segmented button:nth-child(2)');
       await page.waitForSelector('.option');
     },
@@ -700,6 +760,7 @@ try {
     ready: '.row',
     act: async (page) => {
       await page.click('.fab');
+      await page.click('.sheet .advanced-toggle');
       await page.click('.segmented button:nth-child(2)');
       await page.waitForSelector('.chip[role="radio"]');
       await page.click('.chip[role="radio"]:has-text("Pi")');
@@ -2264,6 +2325,7 @@ try {
     ready: '.row',
     act: async (page) => {
       await page.click('.fab');
+      await page.click('.sheet .advanced-toggle');
       const folder = page.locator('.sheet input[aria-label="Folder for this Hermes chat"]');
       await folder.fill('/home/me/code/nope/deeper');
       await page.waitForSelector('.sheet .folder-note.bad:has-text("doesn\'t exist")');
@@ -2284,6 +2346,110 @@ try {
       if ((await sources.paseo.folderStatus('/home/me/code/newproj')) !== 'exists') problems.push('new folder was not made');
     },
   });
+
+  // ---- the chat-first new chat ----
+  // One message box starts the kind of chat Wayroost is for. The choices are under Advanced.
+  for (const [sizeName, size] of [
+    ['phone', phone],
+    ['desktop', { width: 1280, height: 820 }],
+  ] as const) {
+    for (const dark of [true, false]) {
+      const theme = dark ? 'dark' : 'light';
+
+      await shoot(`89-${sizeName}-new-chat-box-${theme}`, {
+        ...size,
+        dark,
+        path: '/chats',
+        ready: '.row',
+        act: async (page) => {
+          await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+          await page.locator('.sheet textarea').fill('Which trains are late tonight?');
+          await page.waitForSelector('.sheet .voice-btn');
+          for (const [what, selector] of [
+            ['a source to choose', '.sheet .segmented'],
+            ['a model to choose', '.sheet select'],
+            ['a folder to choose', '.sheet input[aria-label="Folder for this Hermes chat"]'],
+          ] as const) {
+            if (await page.locator(selector).count()) problems.push(`the new chat asks for ${what}`);
+          }
+          if (!(await page.locator('.sheet .attach-btn').isVisible())) problems.push('the new chat cannot attach');
+          if (await page.locator('.sheet-foot .btn-primary').isDisabled()) problems.push('the new chat cannot start');
+        },
+        after: async (page) => {
+          // Started with nothing chosen, it is a Hermes chat - and the thread says who is answering.
+          await page.click('.sheet-foot .btn-primary');
+          await page.waitForSelector('.conv-title .sub');
+          const who = await page.locator('.conv-title .sub').innerText();
+          if (!who.startsWith('Hermes')) problems.push(`the thread does not say who is answering: "${who}"`);
+        },
+      });
+
+      await shoot(`90-${sizeName}-new-chat-advanced-${theme}`, {
+        ...size,
+        dark,
+        path: '/chats',
+        ready: '.row',
+        act: async (page) => {
+          await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+          await page.locator('.sheet textarea').fill('Rename the branch to match the ticket');
+          await page.click('.sheet .advanced-toggle');
+          await page.locator('.sheet .basic-toggle').waitFor();
+          if ((await page.locator('.sheet textarea').inputValue()) !== 'Rename the branch to match the ticket') {
+            problems.push('Advanced lost what was typed');
+          }
+          // The sheet fetches its choices first: the model picker appears with them.
+          for (const [what, selector] of [
+            ['source choice', '.sheet .segmented'],
+            ['model picker', '.sheet select[aria-label="Model for this Hermes chat"]'],
+            ['folder field', '.sheet input[aria-label="Folder for this Hermes chat"]'],
+          ] as const) {
+            await page.waitForSelector(selector, { timeout: 4000 }).catch(() => problems.push(`Advanced has no ${what}`));
+          }
+        },
+        after: async (page) => {
+          // This device asked for Advanced, so the next new chat opens there.
+          await page.keyboard.press('Escape');
+          await page.waitForSelector('.sheet', { state: 'detached' });
+          await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+          await page.locator('.sheet .basic-toggle').waitFor();
+          // And the way back is remembered just as well.
+          await page.click('.sheet .basic-toggle');
+          await page.locator('.sheet .advanced-toggle').waitFor();
+          await page.keyboard.press('Escape');
+          await page.waitForSelector('.sheet', { state: 'detached' });
+          await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+          if (await page.locator('.sheet .basic-toggle').count()) problems.push('the new chat forgot the way back to the box');
+        },
+      });
+
+      await shoot(`91-${sizeName}-new-chat-folder-config-${theme}`, {
+        ...size,
+        dark,
+        path: '/chats',
+        ready: '.row',
+        act: async (page) => {
+          await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+          await page.click('.sheet .advanced-toggle');
+          await page.click('.sheet .segmented button:nth-child(2)');
+          await page.locator('.sheet textarea').fill('Move the settings page under a new route');
+          await page.waitForSelector('.notice-card');
+          // A phone has to scroll to reach the folder at all: bring the card into the frame.
+          await page.locator('.notice-card').scrollIntoViewIfNeeded();
+          const card = await page.locator('.notice-card').innerText();
+          for (const line of [
+            'This folder configures its agents',
+            'Files here can give Claude Code permission to act without asking.',
+            '.claude/settings.json',
+            'This folder has code Paseo runs on its own.',
+            'Only file names and findings are shown.',
+          ]) {
+            if (!card.includes(line)) problems.push(`the folder notice is missing "${line}"`);
+          }
+          if (await page.locator('.sheet-foot .btn-primary').isDisabled()) problems.push('the folder notice stopped the launch');
+        },
+      });
+    }
+  }
 
   // ---- Connectors: the page, signing in, and a mail trigger ----
   const openConnectors = async (page: Page) => {
@@ -2566,15 +2732,15 @@ try {
       const list = page.locator('.skills-list');
       // A copy changed in one app opens the "Needs a look" filter first.
       if (!(await page.locator('.skills-filters .skills-chip[aria-pressed="true"]', { hasText: 'Needs a look' }).count())) problems.push('skills: attention filter not first');
-      await list.locator('.skill-head', { hasText: 'research-to-doc' }).click();
-      const row = list.locator('.skill-row', { hasText: 'research-to-doc' });
+      await list.locator('.skill-head', { hasText: 'notes-to-report' }).click();
+      const row = list.locator('.skill-row', { hasText: 'notes-to-report' });
       if (!(await row.innerText()).includes('Changed in Claude Code')) problems.push('skills: edited copy not explained');
       if (!(await row.locator('button', { hasText: 'Use everywhere' }).count())) problems.push('skills: no "use everywhere"');
     },
     after: async (page) => {
-      const row = page.locator('.skill-row', { hasText: 'research-to-doc' });
+      const row = page.locator('.skill-row', { hasText: 'notes-to-report' });
       await row.locator('button', { hasText: 'Put shared back' }).click();
-      await page.waitForSelector('.toast:has-text("Put the shared research-to-doc back")');
+      await page.waitForSelector('.toast:has-text("Put the shared notes-to-report back")');
       // All skills: the Hermes-made one shares only after a second look at its scan.
       await page.locator('.skills-filters .skills-chip', { hasText: 'All' }).click();
       const planner = page.locator('.skill-row', { hasText: 'meal-planner' });
@@ -2584,17 +2750,17 @@ try {
       if (!(await planner.innerText()).includes('Fetches a URL with curl')) problems.push('skills: scan findings not shown');
       await planner.locator('button', { hasText: 'Share anyway' }).click();
       await page.waitForSelector('.toast:has-text("meal-planner is now shared")');
-      // Windows Claude Code is switched off for paseo; the switch says so, and turns back on.
-      const paseoRow = page.locator('.skill-row', { hasText: 'Paseo reference' });
+      // Windows Claude Code is switched off for project-helper; the switch says so, and turns back on.
+      const paseoRow = page.locator('.skill-row', { hasText: 'Reference for organising projects' });
       await paseoRow.locator('.skill-head').click();
-      const sw = paseoRow.locator('button[role="switch"][aria-label="paseo in Windows Claude Code"]');
+      const sw = paseoRow.locator('button[role="switch"][aria-label="project-helper in Windows Claude Code"]');
       if ((await sw.getAttribute('aria-checked')) !== 'false') problems.push('skills: excluded copy shown on');
       await sw.click();
-      await paseoRow.locator('button[role="switch"][aria-label="paseo in Windows Claude Code"][aria-checked="true"]').waitFor();
+      await paseoRow.locator('button[role="switch"][aria-label="project-helper in Windows Claude Code"][aria-checked="true"]').waitFor();
       // A linux-only skill can't be switched on for Windows.
-      const flight = page.locator('.skill-row', { hasText: 'flight-search' });
+      const flight = page.locator('.skill-row', { hasText: 'trip-planner' });
       await flight.locator('.skill-head').click();
-      if (!(await flight.locator('button[role="switch"][aria-label="flight-search in Windows Claude Code"]').isDisabled())) {
+      if (!(await flight.locator('button[role="switch"][aria-label="trip-planner in Windows Claude Code"]').isDisabled())) {
         problems.push('skills: other-OS switch is enabled');
       }
     },
@@ -2833,6 +2999,7 @@ try {
     width: 1280,
     height: 900,
     dark: false,
+    origin: 'local',
     path: '/settings',
     ready: '.page-settings',
     act: async (page) => {
@@ -3084,6 +3251,254 @@ try {
       if (!(await cloud.innerText()).includes('Change this on a paired desktop.')) problems.push('cloud agents: missing phone instructions');
     },
   });
+
+  // Settings → Notifications: which alerts reach this PC's app, which reach a phone, and
+  // which wait. The rules are Wayroost's own settings, so a saved one comes back from the file.
+  await shoot('83-desktop-settings-notifications-light', {
+    width: 1280,
+    height: 900,
+    dark: false,
+    path: '/settings',
+    ready: '.notification-rules',
+    act: async (page) => {
+      const box = page.locator('.notification-rules');
+      await box.scrollIntoViewIfNeeded();
+      const text = await box.innerText();
+      if (!text.includes('No report from this PC for two minutes')) problems.push(`notifications: where the next alert would go isn't said: ${text.slice(0, 160)}`);
+      if (!text.includes('needs an https address')) problems.push('notifications: a server that can reach no phone doesn’t say so');
+      if (!text.includes('Never switched off')) problems.push('notifications: an agent waiting on an answer isn’t explained');
+      const answer = box.locator('select[aria-label="Alert 1 delivery"]');
+      if ((await answer.locator('option').count()) !== 2) problems.push('notifications: an agent waiting on an answer can be switched off');
+      if ((await answer.inputValue()) !== 'both') problems.push('notifications: an answer should reach the app and the phone to start with');
+      if ((await box.locator('select[aria-label="Alert 2"]').inputValue()) !== 'agent-finished') problems.push('notifications: the rules aren’t in the order a fresh install writes them');
+      if ((await box.locator('select[aria-label="Alert 2 delivery"]').inputValue()) !== 'toast') problems.push('notifications: a finished agent should reach the app alone to start with');
+    },
+    after: async (page) => {
+      const box = page.locator('.notification-rules');
+      await box.locator('select[aria-label="Alert 2 delivery"]').selectOption('push');
+      await box.getByRole('button', { name: 'Save notification rules' }).click();
+      await until('the rules saved', async () => (await page.getByText('Saved.', { exact: true }).count()) > 0, 5_000);
+      await page.reload();
+      await page.waitForSelector('.notification-rules');
+      const again = page.locator('.notification-rules select[aria-label="Alert 2 delivery"]');
+      if ((await again.inputValue()) !== 'push') problems.push('notifications: the saved rule did not come back from the settings file');
+      // Back the way a fresh install has it, so a later shot reads the defaults.
+      await again.selectOption('toast');
+      await page.locator('.notification-rules').getByRole('button', { name: 'Save notification rules' }).click();
+      await until('the rule back where it started', async () => (await page.getByText('Saved.', { exact: true }).count()) > 0, 5_000);
+    },
+  });
+
+  // The three settings pages and the Overview's Recent changes.
+  await shoot('94-desktop-settings-agents-light', {
+    width: 1280,
+    height: 1000,
+    dark: false,
+    origin: 'local',
+    path: '/settings/agents',
+    ready: '.page-agents-settings',
+    act: async (page) => {
+      await page.waitForSelector('.agents-profiles');
+      await page.waitForSelector('.agents-role-loads');
+      const text = (await page.locator('.page-agents-settings').textContent()) ?? '';
+      for (const want of ['Reasoning effort', 'Personality', 'Delegation limits', 'Routing note', 'What each role loads', 'Any device', 'Confirm', 'PC only']) {
+        if (!text.includes(want)) problems.push(`agents (desktop): missing “${want}”`);
+      }
+      if (text.includes('in flight')) problems.push('agents: health numbers do not belong here');
+      // The desktop is the PC: the note and the limits are editable here.
+      if (!(await page.locator('textarea[aria-label="Routing note"]').count())) problems.push('agents: the routing note is not editable on the PC');
+      if (!(await page.locator('input[aria-label="Delegated chats at once"]').count())) problems.push('agents: delegation limits are not editable on the PC');
+      // The profile model editor shows the saved profile.
+      if (!text.includes('paseo-coder')) problems.push('agents: the saved profile is not shown');
+      await page.locator('.page-agents-settings .group').first().scrollIntoViewIfNeeded();
+    },
+  });
+
+  await shoot('95-phone-settings-agents-dark', {
+    ...phone,
+    dark: true,
+    path: '/settings/agents',
+    ready: '.page-agents-settings',
+    device: demoPhone.cookie,
+    act: async (page) => {
+      await page.waitForSelector('.agents-profiles');
+      await page.waitForSelector('.agents-role-loads');
+      const text = (await page.locator('.page-agents-settings').textContent()) ?? '';
+      if (!text.includes('PC only')) problems.push('agents (phone): the PC-only level is not shown');
+      // The routing note is PC-only: a phone cannot type it, and its value reads as a digest.
+      if (await page.locator('textarea[aria-label="Routing note"]').count()) problems.push('agents (phone): the routing note is editable');
+      if (!text.includes('The exact value is shown on the PC.')) problems.push('agents (phone): the note’s value is not marked PC-only');
+      // Delegation limits are confirm-level: still editable from a phone (with a code).
+      if (!(await page.locator('input[aria-label="Delegated chats at once"]').count())) problems.push('agents (phone): confirm-level limits are not editable');
+    },
+  });
+
+  await shoot('96-desktop-settings-models-dark', {
+    width: 1280,
+    height: 1100,
+    dark: true,
+    origin: 'local',
+    path: '/settings/models',
+    ready: '.page-models-settings',
+    act: async (page) => {
+      await page.waitForSelector('.models-keys');
+      await page.waitForSelector('.models-usage');
+      const text = (await page.locator('.page-models-settings').textContent()) ?? '';
+      for (const want of ['Model roles', 'anthropic-main', 'example-main-model', 'example-tiny-model', 'example-coder-model', 'Contract:', 'Default model', 'API keys', 'Subscriptions', 'Usage', 'Estimated cost', 'until the next model switch']) {
+        if (!text.includes(want)) problems.push(`models (desktop): missing “${want}”`);
+      }
+      if (!text.includes('Health: up') || !text.includes('2 in flight')) problems.push('models: live health or in-flight counts are missing');
+      // Keys are password fields that never echo a stored value.
+      const key = page.locator('input[aria-label="Key for anthropic"]');
+      if ((await key.count()) !== 1 || (await key.inputValue()) !== '') problems.push('models: the key field echoes a value');
+      // Usage pills show today and the week with the demo counts.
+      if (!text.includes('42 req')) problems.push(`models: usage counts missing`);
+      await page.locator('.models-usage').scrollIntoViewIfNeeded();
+    },
+  });
+
+  await shoot('97-phone-settings-models-light', {
+    ...phone,
+    dark: false,
+    path: '/settings/models',
+    ready: '.page-models-settings',
+    device: demoPhone.cookie,
+    act: async (page) => {
+      await page.waitForSelector('.models-keys');
+      await page.waitForSelector('.models-usage');
+      const text = (await page.locator('.page-models-settings').textContent()) ?? '';
+      // Keys are pc-only; the role map reads digested here, so keys and serving backends point at the PC.
+      if (!text.includes('shown on the PC')) problems.push('models (phone): nothing is marked PC-only on the page');
+      if (await page.locator('input[type="password"]').count()) problems.push('models (phone): a key field is editable');
+      // The role rows are there, with their level chips.
+      if (!(await page.locator('.models-roles').count())) problems.push('models (phone): the role rows are missing');
+      if (!text.includes('Confirm')) problems.push('models (phone): the confirm level is not shown');
+      if (!text.includes('42 req')) problems.push('models (phone): usage is not shown');
+    },
+  });
+
+  await shoot('98-desktop-settings-safety-light', {
+    width: 1280,
+    height: 1100,
+    dark: false,
+    origin: 'local',
+    path: '/settings/safety',
+    ready: '.page-safety-settings',
+    act: async (page) => {
+      await page.waitForSelector('.safety-staging');
+      const text = (await page.locator('.page-safety-settings').textContent()) ?? '';
+      for (const want of ['Approval mode', 'Always ask', 'guardian', 'Never ask', 'git status', 'sed -n 1,40p *', 'Revoke', 'wait for your OK', 'Scheduled jobs answer with: deny', 'on-request', 'Workers', 'PC only']) {
+        if (!text.includes(want)) problems.push(`safety (desktop): missing “${want}”`);
+      }
+      if ((await page.locator('input[name="approval-mode"]').count()) !== 3) problems.push('safety: the three modes are not offered');
+      // cron mode is shown, not managed: there is no control for it.
+      if (await page.locator('[aria-label="Cron mode"]').count()) problems.push('safety: cron mode is editable');
+      await page.locator('.safety-always').scrollIntoViewIfNeeded();
+    },
+  });
+
+  await shoot('99-phone-settings-safety-dark', {
+    ...phone,
+    dark: true,
+    path: '/settings/safety',
+    ready: '.page-safety-settings',
+    device: demoPhone.cookie,
+    act: async (page) => {
+      await page.waitForSelector('.safety-staging');
+      const text = (await page.locator('.page-safety-settings').textContent()) ?? '';
+      // Only “manual” is selectable from a phone; loosening is PC-only.
+      if (!(await page.locator('input[name="approval-mode"][value="off"]').isDisabled())) problems.push('safety (phone): off is selectable');
+      if (await page.locator('input[name="approval-mode"][value="manual"]').isDisabled()) problems.push('safety (phone): tightening to manual is blocked');
+      // The exact commands are PC-only; the phone reads where to look.
+      if (!text.includes('exact text are shown on the PC')) problems.push('safety (phone): the allowlist is not hidden');
+      if (text.includes('git status')) problems.push('safety (phone): an allowlist entry leaked');
+      // Switching staging ON is the anywhere direction.
+      if (!(await page.getByRole('switch', { name: 'Skill changes wait for your OK' }).count())) problems.push('safety (phone): staging cannot be switched on');
+    },
+  });
+
+  await shoot('100-desktop-settings-recent-light', {
+    width: 1280,
+    height: 1000,
+    dark: false,
+    origin: 'local',
+    path: '/settings',
+    ready: '.recent-changes',
+    act: async (page) => {
+      const list = page.locator('.recent-changes');
+      await list.scrollIntoViewIfNeeded();
+      // Earlier shots may already have applied changes, so accept either an honest empty
+      // line or a list whose rows carry level labels — never raw values.
+      const first = (await list.textContent()) ?? '';
+      if (!first.includes('Nothing has been changed') && !/(Any device|Confirm|PC only)/.test(first)) {
+        problems.push(`recent changes: the card says nothing useful (${first.slice(0, 120)})`);
+      }
+      if (first.includes('undefined') || first.includes('[object')) problems.push('recent changes: raw values leak into the list');
+      // Apply something through the real pipeline, then find it here with Undo.
+      await page.goto(ORIGIN + '/settings/agents');
+      await page.waitForSelector('.page-agents-settings');
+      await page.selectOption('select[aria-label="Reasoning effort"]', 'high');
+      await until('the effort saved', async () => (await page.locator('.toast').count()) > 0, 6_000);
+      await page.goto(ORIGIN + '/settings');
+      await page.waitForSelector('.recent-changes');
+      const now = await page.locator('.recent-changes').innerText();
+      if (!now.includes('Reasoning effort')) problems.push(`recent changes: the change is not listed (${now.slice(0, 160)})`);
+      if (!now.includes('Applied.')) problems.push('recent changes: the result is not said');
+      if (!(await page.locator('.recent-changes button', { hasText: 'Undo' }).count())) problems.push('recent changes: no Undo for it');
+      await page.locator('.recent-changes').scrollIntoViewIfNeeded();
+    },
+    after: async (page) => {
+      // Undo it, and the undo itself lands in the list: the same pipeline, audited.
+      await page.locator('.recent-changes button', { hasText: 'Undo' }).first().click();
+      await until('the undo listed', async () => (await page.locator('.recent-changes').innerText()).includes('Undo of Reasoning effort'), 6_000);
+      await page.reload();
+      await page.waitForSelector('.recent-changes');
+      const now = await page.locator('.recent-changes').innerText();
+      if (!now.includes('Undo of Reasoning effort')) problems.push(`recent changes: the undo is not audited (${now.slice(0, 160)})`);
+    },
+  });
+
+  const remainingSettingsShots = [
+    { page: 'agents', width: 'desktop', dark: true }, { page: 'agents', width: 'phone', dark: false },
+    { page: 'models', width: 'desktop', dark: false }, { page: 'models', width: 'phone', dark: true },
+    { page: 'safety', width: 'desktop', dark: true }, { page: 'safety', width: 'phone', dark: false },
+    { page: 'recent', width: 'desktop', dark: true }, { page: 'recent', width: 'phone', dark: false }, { page: 'recent', width: 'phone', dark: true },
+  ] as const;
+  for (const [index, shot] of remainingSettingsShots.entries()) {
+    await shoot(`${101 + index}-${shot.width}-settings-${shot.page}-${shot.dark ? 'dark' : 'light'}`, {
+      ...(shot.width === 'phone' ? { ...phone, device: demoPhone.cookie } : { width: 1280, height: 1100, origin: 'local' as const }),
+      dark: shot.dark,
+      path: shot.page === 'recent' ? '/settings' : `/settings/${shot.page}`,
+      ready: shot.page === 'recent' ? '.recent-changes' : `.page-${shot.page}-settings`,
+      act: async page => {
+        await page.waitForSelector(shot.page === 'recent' ? '.recent-changes button' : shot.page === 'agents' ? '.agents-role-loads' : shot.page === 'models' ? '.models-usage' : '.safety-staging');
+        if (shot.page === 'recent') {
+          const list = page.locator('.recent-changes');
+          await list.scrollIntoViewIfNeeded();
+          if (!(await list.innerText()).includes('Undo of Reasoning effort')) problems.push('recent changes: the restored change is missing');
+        }
+      },
+    });
+  }
+  for (const dark of [false, true]) {
+    await shoot(`110-phone-model-confirm-${dark ? 'dark' : 'light'}`, {
+      ...phone, dark, device: demoPhone.cookie, path: '/settings/models', ready: '.models-roles',
+      act: async page => {
+        const selector = page.getByLabel('Backend for the coder role');
+        await selector.waitFor();
+        const current = await selector.inputValue();
+        const other = await selector.locator('option').evaluateAll((options, current) => options.map(option => (option as { value: string }).value).find(value => value !== current), current);
+        if (!other) throw new Error('The demo needs two backend choices.');
+        await selector.selectOption(other);
+        await page.getByRole('button', { name: 'Point coder', exact: true }).click();
+        const dialog = page.getByRole('alertdialog', { name: 'Confirm this change' });
+        await dialog.waitFor();
+        const background = await dialog.evaluate('element => getComputedStyle(element).backgroundColor') as string;
+        if (background === 'transparent' || /rgba\([^)]*,\s*0\)/.test(background)) problems.push('settings confirmation: the card is transparent');
+      },
+      after: async page => { await page.getByRole('button', { name: 'Cancel', exact: true }).click(); },
+    });
+  }
 
   await shoot('62-phone-shadow-trigger-light', {
     ...phone,

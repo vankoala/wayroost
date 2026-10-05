@@ -6,7 +6,7 @@ import { SettingsPage } from './Settings';
 import { getState, setState } from '../store';
 import { pendingWorkerApprovals, type WorkerApprovalsStatus } from '../../../shared/safety';
 
-const fixture = vi.hoisted(() => ({ bridge: false, whatsapp: true, pinSet: false, cloudAgents: vi.fn(), setCloudAgent: vi.fn(), setSafetyCommands: vi.fn(), workerApprovals: vi.fn(), setWorkerApprovals: vi.fn(), setBridgePaused: vi.fn(), setWorkerUpdates: vi.fn() }));
+const fixture = vi.hoisted(() => ({ bridge: false, whatsapp: true, pinSet: false, cloudAgents: vi.fn(), setCloudAgent: vi.fn(), setSafetyCommands: vi.fn(), workerApprovals: vi.fn(), setWorkerApprovals: vi.fn(), setBridgePaused: vi.fn(), setWorkerUpdates: vi.fn(), setNotificationSettings: vi.fn() }));
 vi.mock('../voice', () => ({
   useVoiceStatus: () => ({ enabled: true, available: true, defaultVoice: 'af_heart', voices: ['af_heart'] }),
   useVoiceSettings: () => ({ readReplies: true, autoSend: false, speed: 1 }),
@@ -27,6 +27,17 @@ vi.mock('../api', () => ({ api: {
   phone: () => Promise.resolve({ running: true, ok: true, pinSet: fixture.pinSet }),
   whatsappRouting: () => Promise.resolve({ installed: true, active: fixture.whatsapp, replyRouting: true, returnMinutes: 30, freshAfterHours: 24 }),
   cleanupPreview: () => Promise.resolve({ count: 0 }),
+  settingsSection: () => Promise.resolve({ section: 'overview', changes: [] }),
+  settingsChanges: () => Promise.resolve({ changes: [] }),
+  settingsApply: () => Promise.reject(new Error('not used here')),
+  settingsUndo: () => Promise.reject(new Error('not used here')),
+  notificationSettings: () => Promise.resolve({
+    rules: [{ event: 'agent-needs-you', source: '*', delivery: 'both' }],
+    quietHours: { start: '21:00', end: '07:00' },
+    push: { approvals: true, cards: false },
+    pushAvailable: true, pushDevices: 1, presence: 'active', timeZoneConfigured: false,
+  }),
+  setNotificationSettings: fixture.setNotificationSettings,
   feed: () => Promise.resolve({ settings: {
     level: 'normal', pulseFound: true, quietHours: { start: '21:00', end: '07:00' },
     pushAvailable: true, pushDevices: 1, push: { approvals: true, cards: false },

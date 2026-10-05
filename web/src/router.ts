@@ -17,7 +17,9 @@ export type Route =
   | { name: 'pair' };
 
 /** Settings pages that exist today. The rest of the groups arrive with M2. */
-export type SettingsPage = 'overview' | 'status' | 'devices' | 'voice' | 'connectors' | 'schedule' | 'skills' | 'archived';
+export type SettingsPage =
+  | 'overview' | 'agents' | 'models' | 'safety' | 'checks'
+  | 'status' | 'devices' | 'voice' | 'connectors' | 'schedule' | 'skills' | 'archived';
 
 /** Settings → Devices & access. */
 export const DEVICES_PATH = '/settings/devices';
@@ -30,6 +32,10 @@ const NAV_EVENT = 'signalbox:navigate';
 const SETTINGS_PAGES: Record<string, SettingsPage> = {
   '': 'overview',
   overview: 'overview',
+  agents: 'agents',
+  models: 'models',
+  safety: 'safety',
+  checks: 'checks',
   status: 'status',
   devices: 'devices',
   voice: 'voice',

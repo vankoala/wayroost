@@ -28,6 +28,8 @@
     "scripts/**/*.ts",
     "supervisor/src",
     "supervisor/test",
+    "gateway/src",
+    "gateway/test",
     "tests/development-ports.ts"
   ]
 }

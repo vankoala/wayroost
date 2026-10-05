@@ -24,9 +24,8 @@ import { SafetyHelperClient } from './paseo/safety-rpc.js';
 import { SecretStore, readOrCreateClientId } from './secrets.js';
 import { SpeechClient } from './speech.js';
 import { CloudSpeechClient } from './cloud-speech.js';
-import { Feed } from './feed/service.js';
-import { FeedStore } from './feed/store.js';
 import { PushSender } from './feed/push.js';
+import { createNotificationServices } from './notifications/service.js';
 import { SafetyCommandsSetting } from './hermes/safety.js';
 import { SupervisorClient } from './supervisor-client.js';
 import { BusyReporter, countBusy, phoneSource } from './busy.js';
@@ -36,6 +35,8 @@ import { startPairingSocket } from './pairing-socket.js';
 import { WorkerUpdatesSetting } from './tasks/setting.js';
 import type { TaskRelay } from './tasks/relay.js';
 import { createTaskRelay } from './tasks/wire.js';
+import { localSettingsListener } from './settings/listener.js';
+import { buildChecks } from './checks/sources.js';
 
 // Structured logs to stdout (journald). Never log tokens, cookies or message text.
 // LOG_LEVEL uses the request logger's names: trace, debug, info, warn, error, fatal, silent.
@@ -135,19 +136,22 @@ const schedules =
     : undefined;
 
 // For you: cards from Hermes' pulse and phone notifications (https only).
-const feed = config.feed.enabled
-  ? new Feed({
-      background,
-      store: new FeedStore(config.stateDir),
-      hub,
-      hermes,
-      ...(schedules ? { schedules } : {}),
-      ...(config.publicOrigin.startsWith('https://')
-        ? { push: new PushSender(config.stateDir, config.publicOrigin, log, undefined, background) }
-        : {}),
-      log,
-    })
+const push = config.publicOrigin.startsWith('https://')
+  ? new PushSender(config.stateDir, config.publicOrigin, log, undefined, background)
   : undefined;
+// Settings → Notifications: where each alert goes. The rules, the quiet hours and the
+// phone's switches are Wayroost's own settings, written through the write-through core.
+const { notifications, feed } = await createNotificationServices({
+  background,
+  stateDir: config.stateDir,
+  feedEnabled: config.feed.enabled,
+  hermes,
+  hub,
+  ...(schedules ? { schedules } : {}),
+  ...(push ? { push } : {}),
+  log,
+  ...(config.notifications.timeZone ? { timeZone: config.notifications.timeZone } : {}),
+});
 
 // The project bridge, when turned on: its own listener on 127.0.0.1 only, with a
 // bearer token. If it can't start, Signalbox runs without it.
@@ -229,6 +233,9 @@ const busy = supervisor
   ? new BusyReporter(supervisor, () => countBusy({ hermes, paseo, ...(phoneLine ? { phone: phoneLine } : {}) }), log)
   : undefined;
 
+// Settings → Checks: one snapshot of the configured sources.
+const checks = buildChecks(config, supervisor);
+
 const accessKeys = config.access
   ? remoteAccessKeys(config.access.jwksUrl, (err) =>
       log.warn({ err: String(err) }, 'could not refresh Cloudflare Access signing keys'),
@@ -249,6 +256,7 @@ const app = await buildApp({
   ...(speech ? { speech } : {}),
   ...(speech ? { cloudSpeech: new CloudSpeechClient(config.speech.cloudSocket) } : {}),
   ...(feed ? { feed } : {}),
+  notifications,
   // Settings → WhatsApp: the whatsapp-routing Hermes plugin's settings, through the helper.
   ...(connectors && helper ? { whatsappRouting: helper } : {}),
   // Settings → Phone: Hermes Phone's status and PIN, through the helper.
@@ -257,11 +265,20 @@ const app = await buildApp({
   ...(skills ? { skills } : {}),
   // Status & power, through the supervisor.
   ...(supervisor ? { supervisor } : {}),
+  // Settings → Checks: the engine, with the sources this PC has.
+  settings: { ...(checks ? { checks } : {}) },
   // Settings → Project bridge → Worker updates.
   ...(taskRelay && workerUpdates ? { workerUpdates, tasks: taskRelay } : {}),
 });
 
+const localListener = config.localListener ? localSettingsListener(app, config) : undefined;
 await app.listen({ host: config.listen.host, port: config.listen.port });
+if (localListener && config.localListener) {
+  await new Promise<void>((resolve, reject) => {
+    localListener.once('error', reject);
+    localListener.listen(config.localListener!.port, config.localListener!.host, () => { localListener.removeListener('error', reject); resolve(); });
+  });
+}
 // Only root and the service user can reach it (see pairing-socket.ts). Without it
 // the app still runs; recovery waits for the next start.
 const pairingSocket = devices

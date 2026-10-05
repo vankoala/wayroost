@@ -114,7 +114,18 @@ const origin = 'http://127.0.0.1:8896';
 const home = '/home/me/demo';
 const demoPath = (...parts: string[]) => join(home, ...parts);
 const approval: Approval = { id: 'demo-approval', source: 'hermes', conversationId: 'demo:chat', kind: 'permission', title: 'Run the demo check.', detail: 'npm test', options: [{ id: 'once', label: 'Allow once', kind: 'allow' }], createdAt: 0 };
-const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+// The server routes each pending approval's toast to the device it picked (presence routing);
+// a snapshot here routes every approval to this desktop unless a test says otherwise.
+const routedApproval = (item: { id: string; source: string; conversationId: string; createdAt: number }) => ({
+  event: 'agent-needs-you', source: item.source, title: 'An agent needs you', url: `/c/${item.source}/${encodeURIComponent(item.conversationId)}`, at: 1,
+  approval: { id: item.id, source: item.source, conversationId: item.conversationId, createdAt: item.createdAt },
+});
+const json = (body: unknown, status = 200) => {
+  if (body && typeof body === 'object' && 'approvals' in body && Array.isArray(body.approvals) && !('approvalNotifications' in body)) {
+    body = { ...body, approvalNotifications: body.approvals.filter((item): item is Parameters<typeof routedApproval>[0] => !!item && typeof item === 'object').map(routedApproval) };
+  }
+  return new Response(JSON.stringify(body), { status });
+};
 const flush = async () => { await vi.advanceTimersByTimeAsync(0); };
 const toastActivation = (action: string) => {
   const url = mocks.notifications[0]!.options.toastXml!.match(new RegExp(`wayroost(?:-dev)?://approval/demo-approval/${action}/[A-Za-z0-9_-]{22}`))?.[0];

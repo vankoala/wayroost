@@ -1,4 +1,4 @@
-import type { Approval, ConversationDetail, ConversationSummary, ListResponse, ServerEvent } from './protocol.js';
+import type { AppNotification, Approval, ConversationDetail, ConversationSummary, ListResponse, ServerEvent } from './protocol.js';
 
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string';
@@ -32,9 +32,20 @@ function isConversation(value: unknown): value is ConversationSummary {
 export function isApprovalSnapshot(value: unknown): value is ListResponse {
   return record(value) && optional(value.role, (role) => oneOf(role, ['primary', 'shadow'])) && optional(value.notifications, boolean) &&
     Array.isArray(value.approvals) && value.approvals.every(isApproval) &&
+    optional(value.approvalNotifications, (notifications) => Array.isArray(notifications) && notifications.every(isAppNotification)) &&
     Array.isArray(value.conversations) && value.conversations.every(isConversation) &&
     Array.isArray(value.statuses) && value.statuses.every((status: unknown) => record(status) && source(status.source) &&
       oneOf(status.state, ['connecting', 'connected', 'disconnected', 'needs_credentials', 'error', 'disabled']) && optional(status.message, text));
+}
+
+/** A native toast accepts only a routed alert and a local navigation target. */
+export function isAppNotification(value: unknown): value is AppNotification {
+  return record(value) && oneOf(value.event, ['agent-needs-you', 'agent-finished', 'agent-error', 'feed-card', 'stack-status',
+    'settings-applied', 'settings-failed', 'mismatch-warning', 'security-card']) &&
+    oneOf(value.source, ['hermes', 'paseo', 'brief', 'scout', 'agent', 'supervisor']) &&
+    text(value.title) && optional(value.body, text) && text(value.url) && value.url.startsWith('/') &&
+    !value.url.startsWith('//') && !/[\\\u0000-\u0020\u007f]/.test(value.url) && finite(value.at) &&
+    optional(value.approval, (approval) => reference(approval) && text(approval.conversationId) && finite(approval.createdAt));
 }
 
 export function isApprovalDetail(value: unknown): value is ConversationDetail {

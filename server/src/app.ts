@@ -1,3 +1,4 @@
+import { SETTINGS_RESOLUTION_MESSAGE } from '../../shared/settings.js';
 import { checkDeviceSignal, withDeviceSignal, actionSignal } from './security/device-signal.js';
 import { listenerTls } from '../../lib/loopback-tls.js';
 import { wayroostEnv } from './environment.js';
@@ -8,14 +9,12 @@ import fastifyWebsocket from '@fastify/websocket';
 import Fastify, { LogController, type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import {
-  CLOUD_AGENT_IDS,
   CONNECTOR_ACCESS,
   SOURCES,
   SCHEDULE_TOOL_LEVELS,
   TRIGGER_INTERVALS,
   VOICE_SPEAK_MAX_CHARS,
   FEED_ACTIONS,
-  PROACTIVITY_LEVELS,
   DEVICE_KINDS,
   WS_CLOSE_DEVICE_REVOKED,
   WS_CLOSE_REAUTH,
@@ -28,7 +27,9 @@ import {
   type ArchivedList,
   type BridgeStatus,
   type CleanupPreview,
+  CLOUD_AGENT_IDS,
   type CloudAgentsStatus,
+  type ProjectConfigReport,
   type SafetyCommandsStatus,
   WORKER_TIME_BOXES,
   type WorkerUpdatesStatus,
@@ -54,7 +55,6 @@ import {
   type VoiceStatus,
   type FeedActionResult,
   type FeedList,
-  type FeedSettings,
   WHATSAPP_FRESH_HOURS,
   WHATSAPP_RETURN_MINUTES,
   type WhatsAppRouting,
@@ -66,6 +66,7 @@ import {
   type ScheduleRun,
 } from '../../shared/protocol.js';
 import { SAFETY_COMMANDS } from './hermes/commands.js';
+import { checkProjectConfigNotices, type ProjectConfigScanner } from './hub/project-config-notice.js';
 import type { SafetyCommandsSetting } from './hermes/safety.js';
 import type { WorkerUpdatesSetting } from './tasks/setting.js';
 import type { TaskRelay } from './tasks/relay.js';
@@ -110,15 +111,19 @@ import { CLOUD_ID, type SpeechFrame } from '../../shared/voice.js';
 import { Readable } from 'node:stream';
 import { VOICE_NAME, VoiceSetting } from './voice-setting.js';
 import type { Feed } from './feed/service.js';
-import { HHMM } from './feed/store.js';
 import { PushSubscriptionInput } from './feed/push.js';
+import type { Notifications } from './notifications/service.js';
 import { UserFacingError, type Sources } from './sources.js';
 import type { SupervisorApi } from './supervisor-client.js';
 import { Power, type PowerOptions } from './power.js';
 import { PRESENCE_STATES, type PowerActionResponse, type PowerStatus } from '../../shared/protocol.js';
 import { SUPERVISOR_VERBS } from '../../shared/supervisor.js';
 import type { ActionRequest, SupervisorVerb } from '../../shared/supervisor.js';
-import { WorkerApprovalsWrite, pendingWorkerApprovals, type WorkerApprovalsApi, type WorkerApprovalsStatus } from '../../shared/safety.js';
+import { WorkerApprovalsWrite, WorkerApprovalsStatus, type WorkerApprovalsApi } from '../../shared/safety.js';
+import { registerSettingsRoutes, type SettingsOptions } from './settings/routes.js';
+import { buildChecks } from './checks/sources.js';
+import { productionSettingsReaders } from './settings/readers.js';
+import { isSettingsPolicyRoute } from '../../shared/settings-levels.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -155,6 +160,8 @@ export interface AppDeps {
   cloudSpeech?: CloudSpeechService;
   /** For you (Hermes' pulse feed) and phone notifications, when turned on. */
   feed?: Feed;
+  /** Settings → Notifications: which alerts reach the app, which reach the phone, and when they wait. */
+  notifications?: Notifications;
   /** Settings → WhatsApp, through the helper, when Hermes is on and the helper is set up. */
   whatsappRouting?: Pick<HelperApi, 'whatsappRouting' | 'setWhatsappRouting'>;
   /** Settings → Scheduled jobs (Hermes cron), when Hermes is on. */
@@ -173,10 +180,16 @@ export interface AppDeps {
   supervisor?: SupervisorApi;
   /** Tests: a short confirm life, a clock they control. */
   power?: PowerOptions;
+  settings?: SettingsOptions;
   /** Settings → Project bridge → Worker updates, when the task log runs (bridge, Hermes and Paseo all on). */
   workerUpdates?: Pick<WorkerUpdatesSetting, 'status' | 'update'>;
   /** The authenticated, read-only task ledger, when worker updates are available. */
   tasks?: Pick<TaskRelay, 'status'>;
+  /**
+   * What a folder's own files let an agent do there, read as the owner before an agent starts in it.
+   * Defaults to the real scan; tests and the visual check plant their own folders instead.
+   */
+  configScan?: ProjectConfigScanner;
 }
 
 // Files a browser may fetch while installing the app to the home screen. They
@@ -261,6 +274,13 @@ const PaseoCreateBody = z
   })
   .strict()
   .refine((b) => b.text.length > 0 || (b.attachments?.length ?? 0) > 0, 'empty message');
+// A folder an agent is about to work in, and which agent that will be.
+const ProjectConfigBody = z
+  .object({
+    path: z.string().min(1).max(4096).startsWith('/'),
+    provider: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
+  })
+  .strict();
 const MediaQuery = z.object({ p: z.string().min(1).max(6000), s: z.string().min(1).max(100) }).strict();
 const ControlChangeBody = z
   .object({
@@ -277,8 +297,8 @@ const HermesCredentialsBody = z
   .strict();
 const BridgeBody = z.object({ paused: z.boolean() }).strict();
 const CloudAgentParams = z.object({ id: z.enum(CLOUD_AGENT_IDS) });
-const CloudAgentBody = z.object({ enabled: z.boolean() }).strict();
-const SafetyCommandsBody = z.object({ enabled: z.boolean() }).strict();
+const EnabledBody = z.object({ enabled: z.boolean() }).strict();
+
 const WorkerUpdatesBody = z
   .object({
     enabled: z.boolean().optional(),
@@ -338,14 +358,6 @@ const DAY_MS = 86_400_000;
 const BACKEND_NAMES: Record<Source, string> = { hermes: 'Hermes', paseo: 'Paseo' };
 const FeedParams = z.object({ id: z.string().regex(/^[a-f0-9]{16}$/) });
 const FeedActionBody = z.object({ action: z.enum(FEED_ACTIONS) }).strict();
-const FeedSettingsBody = z
-  .object({
-    level: z.enum(PROACTIVITY_LEVELS).optional(),
-    quietHours: z.object({ start: HHMM, end: HHMM }).strict().nullable().optional(),
-    push: z.object({ approvals: z.boolean().optional(), cards: z.boolean().optional() }).strict().optional(),
-    removeLessLike: z.string().trim().min(1).max(40).optional(),
-  })
-  .strict();
 const PushEndpointBody = z.object({ endpoint: z.string().min(1).max(2000) }).strict();
 const VoiceRun = z.number().int().min(1).max(255);
 const ClientMessage = z.discriminatedUnion('type', [
@@ -417,7 +429,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const { config, verifier, hub, sources } = deps;
   if (config.access && !verifier) throw new Error('Cloudflare Access is configured but no token verifier was given');
   const devices = config.devices.enabled ? (deps.devices ?? new Devices(config.stateDir)) : undefined;
-  deps.feed?.bindDevices(devices);
+  if (deps.notifications) deps.notifications.bindDevices(devices);
+  else deps.feed?.bindDevices(devices);
   const app = Fastify({
     ...(config.tls ? { https: listenerTls(config.tls, process.env, wayroostEnv('DEV_ALLOW_LOOPBACK') === '1') } : {}),
     logger: deps.logger ?? { level: 'info' },
@@ -427,9 +440,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     logController: new LogController({ disableRequestLogging: true }),
     return503OnClosing: true,
   });
-  const stopPushRevokeWatch = devices?.onRevoke((id) => withDeviceSignal(undefined, () => deps.feed?.revokeDevice(id)));
+  const stopPushRevokeWatch = devices?.onRevoke((id) => withDeviceSignal(undefined, () => {
+    if (deps.notifications) deps.notifications.revokeDevice(id);
+    else deps.feed?.revokeDevice(id);
+  }));
   app.addHook('onClose', async () => stopPushRevokeWatch?.());
   const changes: string[] = [];
+  const handledRequests = new WeakSet<FastifyRequest>();
   CHANGE_ROUTES.set(app, changes);
   const checkLiveChange = (req: FastifyRequest): void => {
     if (!devices || !CHANGE_METHODS.has(req.method)) return;
@@ -443,10 +460,36 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (route.url === '/ws') return;
     // Hooks can await after the body check. Enter every mutating handler with a live device.
     const handler = route.handler;
-    route.handler = function (req, reply) {
+    route.handler = async function (req, reply) {
       checkLiveChange(req);
+      handledRequests.add(req);
       return withDeviceSignal(req.deviceSignal, () => handler.call(this, req, reply));
     };
+  });
+  app.addHook('onSend', async (req, reply, payload) => {
+    const route = req.routeOptions.url ?? '';
+    const settingsRoute = /^\/api\/(?:settings(?:\/|$)|feed\/settings$|worker-approvals$|safety-commands$|cloud-agents\/|whatsapp-routing$|voice$|bridge$|worker-updates$|skills\/excluded$|phone\/pin$|conversations\/:source\/:id\/controls$)/.test(route);
+    const settingsChange = settingsRoute && CHANGE_METHODS.has(req.method) && route !== '/api/settings/credentials/:provider/test';
+    if (!deps.notifications || !handledRequests.has(req) || req.deviceSignal?.aborted
+      || !settingsChange && route !== '/api/worker-approvals') return payload;
+    let result: unknown;
+    try { result = typeof payload === 'string' ? JSON.parse(payload) : undefined; }
+    catch { return payload; }
+    const params = req.params as { source?: unknown } | undefined;
+    const source = settingsRoutes.notificationSource(req) ?? (params?.source === 'hermes' || params?.source === 'paseo' ? params.source
+      : route.includes('hermes') || route.includes('safety-commands') ? 'hermes'
+      : route.includes('worker-approvals') || route.includes('cloud-agents') ? 'paseo' : 'supervisor');
+    const status = route === '/api/worker-approvals' ? WorkerApprovalsStatus.safeParse(result) : undefined;
+    const outcome = settingsRoutes.notificationOutcome(req) ?? (result && typeof result === 'object' && 'status' in result ? result.status : undefined);
+    const uncertain = outcome === 'outcome_unknown' || result && typeof result === 'object' && 'code' in result && result.code === 'outcome_unknown';
+    const failed = reply.statusCode >= 400 || outcome === 'refused' || outcome === 'outcome_unknown' || outcome === 'failed';
+    // Earlier routes return saved values directly; explicit outcomes must confirm application.
+    const applied = outcome === 'applied' || outcome === undefined && result !== null && typeof result === 'object' && !failed;
+    if (settingsChange && (failed || applied)) deps.notifications.alert({ event: failed ? 'settings-failed' : 'settings-applied', source,
+      title: uncertain ? 'The change outcome is unknown' : failed ? 'A change failed' : 'A change applied',
+      ...(uncertain ? { body: SETTINGS_RESOLUTION_MESSAGE } : {}), url: uncertain ? '/#settings/checks' : '/#settings', tag: `settings-${source}` });
+    if (status?.success) deps.notifications.mismatch(source, failed);
+    return payload;
   });
 
   // Each origin gets its own CSP (its WebSocket address) and, on https, HSTS.
@@ -563,6 +606,16 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // Never echo or log a request body here: an approval answer can carry a
   // password (Hermes secret prompts). Validation errors name the fields only.
   app.setErrorHandler((err, req, reply) => {
+    if (req.routeOptions.url === '/api/worker-approvals' && err instanceof UserFacingError && err.status === 424 && !req.deviceSignal?.aborted) {
+      return reply.code(424).send({ error: err.message });
+    }
+    const legacyWriter = !settingsRoutes.legacyRoutesViaPipeline && ['/api/cloud-agents/:id', '/api/safety-commands', '/api/worker-approvals'].includes(req.routeOptions.url ?? '');
+    const deviceRefusal = req.deviceSignal?.aborted || err instanceof UserFacingError && err.status === 403;
+    if ((!legacyWriter || deviceRefusal) && isSettingsPolicyRoute(req.routeOptions.url ?? req.url.split('?')[0]!) && req.routeOptions.url !== '/api/settings/hermes' && req.routeOptions.url !== '/api/feed/settings') {
+      const code = req.deviceSignal?.aborted || err instanceof UserFacingError && err.status === 403 ? 'not_permitted'
+        : err instanceof z.ZodError || (err as { statusCode?: number }).statusCode === 400 ? 'invalid_parameters' : 'failed';
+      return reply.code(code === 'not_permitted' ? 403 : code === 'invalid_parameters' ? 400 : 500).send({ status: 'refused', code });
+    }
     if (req.deviceSignal?.aborted) return reply.code(403).send({ error: 'Pair this device before controlling the PC.' });
     if (err instanceof UserFacingError) {
       // Cloudflare swaps an origin's 502 and 504 for its own error page, which
@@ -579,6 +632,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     req.log.error({ err }, 'unhandled error');
     return reply.code(500).send({ error: 'Something went wrong' });
   });
+
+  const settingsRoutes = await registerSettingsRoutes(app, config, deps.supervisor, hub, { checks: buildChecks(config, deps.supervisor), ...productionSettingsReaders(config, deps.supervisor), ...deps.settings, consumers: {
+    safetyCommands: deps.safetyCommands, workerApprovals: deps.workerApprovals,
+    cloudAgents: sources.paseo.cloudAgents?.bind(sources.paseo),
+    notifications: deps.notifications, feed: deps.feed,
+  } });
 
   // ---- JSON API -----------------------------------------------------------
 
@@ -624,6 +683,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     }
     reply.header('set-cookie', deviceCookie(paired.cookie, secureCookie(req)));
     req.log.info({ device: paired.device.id, kind: paired.device.kind }, 'device paired');
+    deps.notifications?.alert({ event: 'security-card', source: 'supervisor', title: 'A device was paired', url: '/#settings', tag: 'device-paired' });
     return { device: paired.device };
   });
 
@@ -673,6 +733,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     } finally { release?.(); }
     if (req.device?.id === id) reply.header('set-cookie', clearedDeviceCookie(secureCookie(req)));
     req.log.warn({ device: id, by: req.device?.id }, 'device revoked');
+    deps.notifications?.alert({ event: 'security-card', source: 'supervisor', title: 'A device was revoked', url: '/#settings', tag: 'device-revoked' });
     return { ok: true };
   });
 
@@ -825,11 +886,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       return [];
     });
     conversations.sort((a, b) => b.updatedAt - a.updatedAt);
+    const approvals = [...sources.hermes.listApprovals(), ...sources.paseo.listApprovals()];
     return {
       conversations,
       role: config.role,
       notifications: config.role === 'primary',
-      approvals: [...sources.hermes.listApprovals(), ...sources.paseo.listApprovals()],
+      approvals,
+      approvalNotifications: config.role === 'primary' ? deps.notifications?.approvalNotifications(approvals) ?? [] : [],
       statuses: statuses(),
     };
   });
@@ -930,6 +993,22 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return { path: await sources.paseo.createFolder(path) };
   });
 
+  // What a folder's own configuration would let an agent do there, in plain words, before it starts.
+  app.post('/api/project-config', async (req): Promise<ProjectConfigReport> => {
+    const { path, provider } = ProjectConfigBody.parse(req.body);
+    const roots = deps.configScan ? [] : await sources.paseo.options()
+      .then((options) => options.workspaces.map((workspace) => workspace.path), () => []);
+    checkDeviceSignal(req.deviceSignal);
+    if (deps.configScan) return checkProjectConfigNotices(path, provider, deps.configScan);
+    try {
+      const result = await deps.supervisor?.projectScan?.({ folder: path, workspaceRoots: roots });
+      return checkProjectConfigNotices(path, provider, () => {
+        if (!result?.ok) throw new Error('unavailable');
+        return result.scan;
+      });
+    } catch { return { notices: [], unreadable: true }; }
+  });
+
   app.get('/api/hermes/options', async () => sources.hermes.newChatOptions());
 
   app.get('/api/hermes/commands', async (): Promise<CommandCatalog> => ({
@@ -1000,15 +1079,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return sources.paseo.cloudAgents();
   });
 
-  app.put('/api/cloud-agents/:id', async (req): Promise<CloudAgentsStatus> => {
+  app.put('/api/cloud-agents/:id', async (req, reply) => settingsRoutes.legacyWrite(req, reply, 'paseo.provider-enabled', async (): Promise<CloudAgentsStatus> => {
     const { id } = CloudAgentParams.parse(req.params);
-    const { enabled } = CloudAgentBody.parse(req.body);
-    if (!sources.paseo.setCloudAgentEnabled) {
-      throw new UserFacingError("Cloud agents can't be switched from here.", 404);
-    }
+    const { enabled } = EnabledBody.parse(req.body);
+    if (!sources.paseo.setCloudAgentEnabled) throw new UserFacingError("Cloud agents can't be switched from here.", 404);
     requireDesktopChange(req);
     return sources.paseo.setCloudAgentEnabled(id, enabled);
-  });
+  }));
 
   // Whether /yolo, /approve, /debug and the other safeguard commands may run from here.
   const safetyCommands = () => {
@@ -1019,24 +1096,26 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get('/api/safety-commands', async (): Promise<SafetyCommandsStatus> => safetyStatus(safetyCommands().enabled()));
 
-  app.get('/api/worker-approvals', async (): Promise<WorkerApprovalsStatus> =>
-    deps.workerApprovals ? deps.workerApprovals.status() : pendingWorkerApprovals());
-
-  app.put('/api/worker-approvals', async (req): Promise<WorkerApprovalsStatus> => {
-    const { enabled } = WorkerApprovalsWrite.parse(req.body);
-    if (!deps.workerApprovals) throw new UserFacingError('The Safety helper is not configured.', 424);
-    requireDesktopChange(req);
-    return deps.workerApprovals.setEnabled(enabled);
-  });
-
-  app.put('/api/safety-commands', async (req): Promise<SafetyCommandsStatus> => {
-    const { enabled } = SafetyCommandsBody.parse(req.body);
+  app.put('/api/safety-commands', async (req, reply) => settingsRoutes.legacyWrite(req, reply, 'wayroost.safety-commands', (): SafetyCommandsStatus => {
+    const { enabled } = EnabledBody.parse(req.body);
     const setting = safetyCommands();
     requireDesktopChange(req);
     const result = safetyStatus(setting.setEnabled(enabled));
     req.log.warn({ enabled }, 'hermes safety commands switched');
     return result;
+  }));
+
+  app.get('/api/worker-approvals', async (req, reply) => {
+    const result = await settingsRoutes.workerApprovals(req);
+    return reply.code('code' in result ? 503 : 200).send(result);
   });
+
+  app.put('/api/worker-approvals', async (req, reply) => settingsRoutes.legacyWrite(req, reply, 'paseo.worker-approvals', async (): Promise<WorkerApprovalsStatus> => {
+    const { enabled } = WorkerApprovalsWrite.parse(req.body);
+    if (!deps.workerApprovals) throw new UserFacingError('The Safety helper is not configured.', 424);
+    requireDesktopChange(req);
+    return deps.workerApprovals.setEnabled(enabled);
+  }));
 
   // ---- WhatsApp routing --------------------------------------------------------
   // The whatsapp-routing Hermes plugin reads its settings file on every message,
@@ -1143,19 +1222,16 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return feed().act(id, FeedActionBody.parse(req.body).action);
   });
 
-  app.put('/api/feed/settings', async (req): Promise<FeedSettings> =>
-    feed().updateSettings(FeedSettingsBody.parse(req.body)),
-  );
+  const phonePush = () => deps.notifications ?? feed();
+  app.get('/api/push/key', async () => ({ publicKey: phonePush().pushKey() }));
 
-  app.get('/api/push/key', async () => ({ publicKey: feed().pushKey() }));
-
-  app.post('/api/push/devices', async (req) => ({ devices: feed().addDevice(PushSubscriptionInput.parse(req.body), changeDevice(req).id) }));
+  app.post('/api/push/devices', async (req) => ({ devices: phonePush().addDevice(PushSubscriptionInput.parse(req.body), changeDevice(req).id) }));
 
   app.post('/api/push/devices/remove', async (req) => ({
-    devices: feed().removeDevice(PushEndpointBody.parse(req.body).endpoint, changeDevice(req).id),
+    devices: phonePush().removeDevice(PushEndpointBody.parse(req.body).endpoint, changeDevice(req).id),
   }));
 
-  app.post('/api/push/test', async () => feed().testPush());
+  app.post('/api/push/test', async () => phonePush().testPush());
 
   // ---- Skills -----------------------------------------------------------------
   // Every agent's skill folders through the helper (which keeps them the same as the
@@ -1430,6 +1506,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // sign-in alone. Reads and changes both check it against the live store at the action.
   const power = new Power(deps.supervisor, hub, app.log, deps.power ?? {});
   power.start();
+  // Alerts are routed by whoever is at this PC, and the desktop app is the one that says so.
+  deps.notifications?.bindPresence(() => power.view().presence);
   // A revoked device's confirm taps and presence go with it.
   const stopPowerRevokeWatch = devices?.onRevoke((id) => power.forget(id));
   app.addHook('onClose', async () => {

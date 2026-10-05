@@ -138,7 +138,9 @@ export function ConversationView({
             <div className="name">
               {readableBridgeText(conversation?.title) ?? (detail?.status === 'loading' ? 'Loading…' : 'Conversation')}
             </div>
-            <div className="sub">{conversation?.subtitle ?? SOURCE_NAMES[source]}</div>
+            {/* Who is answering, named first: a chat started from the one box chose nothing, and the
+                person should still be able to see which agent it went to. */}
+            <div className="sub">{[SOURCE_NAMES[source], conversation?.subtitle].filter(Boolean).join(' · ')}</div>
           </div>
         </div>
         {conversation && !subagent && (

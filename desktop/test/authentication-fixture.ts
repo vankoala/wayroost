@@ -1,6 +1,6 @@
 import { vi } from 'vitest';
 import type { Session } from 'electron';
-import type { Approval } from '../../shared/protocol.js';
+import type { AppNotification, Approval } from '../../shared/protocol.js';
 import { ServerClient, type LiveSocket } from '../src/server-client.js';
 import { ToastTickets } from '../src/approvals.js';
 import { monitorPairing } from '../src/pairing.js';
@@ -10,7 +10,16 @@ export const approval: Approval = { id: 'demo-approval', source: 'hermes', conve
   title: 'Run the demo check.', detail: 'npm test', options: [{ id: 'once', label: 'Allow once', kind: 'allow' }], createdAt: 0 };
 export const snapshot = { role: 'primary', notifications: true, conversations: [], approvals: [approval], statuses: [] };
 export const identity = { device: { id: 'demo-device', kind: 'desktop' }, statuses: [] };
-export const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
+export const routedApproval = (item: Approval): AppNotification => ({
+  event: 'agent-needs-you', source: item.source, title: 'An agent needs you', url: `/c/${item.source}/${encodeURIComponent(item.conversationId)}`, at: 1,
+  approval: { id: item.id, source: item.source, conversationId: item.conversationId, createdAt: item.createdAt },
+});
+export const json = (data: unknown, status = 200) => {
+  if (data && typeof data === 'object' && 'approvals' in data && Array.isArray(data.approvals) && !('approvalNotifications' in data)) {
+    data = { ...data, approvalNotifications: data.approvals.filter((item) => item && typeof item === 'object').map(routedApproval) };
+  }
+  return new Response(JSON.stringify(data), { status });
+};
 /** A socket that never opened and lost its connection, as Electron words it: a network failure, not a refusal. */
 export const connectionLost = { code: 1006, reason: 'Connection closed before receiving a handshake response (net::ERR_EMPTY_RESPONSE)' };
 export function deferred<T>() {

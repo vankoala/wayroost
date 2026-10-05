@@ -1,3 +1,4 @@
+import { isSettingsPolicyRoute } from '../../shared/settings-levels.js';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { changeRoutes, LIVE_DEVICE_EXEMPT } from '../src/app.js';
@@ -11,6 +12,8 @@ import { DESKTOP_COOKIE, PHONE_COOKIE, TEST_DESKTOP, TEST_PHONE, makeApp, makeKe
 // body has arrived: a device revoked while its request was still uploading changes nothing.
 
 const REFUSED = { error: 'Pair this device before controlling the PC.' };
+const refusalFor = (url: string) => isSettingsPolicyRoute(url) && url !== '/api/settings/hermes' && url !== '/api/feed/settings'
+  ? { status: 'refused', code: 'not_permitted' } : REFUSED;
 const apps: Array<Awaited<ReturnType<typeof makeApp>>['app']> = [];
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -108,7 +111,7 @@ describe('pairing at the mutation', () => {
     const cloud = vi.spyOn(ctx.paseo, 'setCloudAgentEnabled');
     ctx.app.addHook('preHandler', async () => { await Promise.resolve(); ctx.devices!.revoke(TEST_DESKTOP.id); });
     const res = await ctx.app.inject({ method: 'PUT', url, headers: postHeaders(ctx.token), payload: body });
-    expect(res.statusCode).toBe(403); expect(res.json()).toEqual(REFUSED);
+    expect(res.statusCode).toBe(403); expect(res.json()).toEqual(refusalFor(url));
     expect(cloud).not.toHaveBeenCalled(); expect(ctx.workerUpdates.update).not.toHaveBeenCalled();
   });
 
@@ -200,7 +203,7 @@ describe('the live device check covers every change', () => {
       const [method, path] = route.split(' ') as [string, string];
       const url = path.replace(/:source/g, 'hermes').replace(/:[A-Za-z]+/g, 'demo-id').replace(/\*$/, 'demo');
       const res = await ctx.app.inject({ method: method as 'POST', url, headers: postHeaders(ctx.token), payload: '{}' });
-      expect({ route, status: res.statusCode, body: res.json() }).toEqual({ route, status: 403, body: REFUSED });
+      expect({ route, status: res.statusCode, body: res.json() }).toEqual({ route, status: 403, body: refusalFor(url) });
     }
   });
 
@@ -213,7 +216,7 @@ describe('the live device check covers every change', () => {
       const [method, path] = route.split(' ') as [string, string];
       const url = path.replace(/:source/g, 'hermes').replace(/:[A-Za-z]+/g, 'demo-id').replace(/\*$/, 'demo');
       const res = await ctx.app.inject({ method: method as 'POST', url, headers: postHeaders(ctx.token), payload: '{}' });
-      expect({ route, status: res.statusCode, body: res.json() }).toEqual({ route, status: 403, body: REFUSED });
+      expect({ route, status: res.statusCode, body: res.json() }).toEqual({ route, status: 403, body: refusalFor(url) });
       vi.restoreAllMocks();
     }
   });

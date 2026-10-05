@@ -85,6 +85,157 @@ A `server` key works on the Unix socket only and may call every verb; a
 
 ## Configuration
 
+The settings verbs use a separate root-owned `settings-targets.json`. Its
+`configWrites` flag defaults to false and does not add fields to `supervisor.json`
+or the component registry. Status advertises the three implemented verbs and a
+directory check for each target, backup, audit and lock path. Launcher keys keep
+the `server` scope for rollback compatibility; their access is restricted to
+status, config reads and their catalogue applies.
+
+Hermes observations call its installed environment and configuration loaders,
+model resolver and approval resolvers with a fixed packaged Python program.
+The supervisor runs it as the config owner in a transient unit with
+`PrivateNetwork=yes`, a five-second unit limit, a three-second subprocess limit
+and a 1 MiB JSON output limit. The interpreter refuses writes, process launches
+and network operations; the unit exposes the filesystem read-only. The disposable
+probe suppresses only Hermes' home-initialization and config-backup hooks before
+calling its environment loader, config loader and value resolvers. Config
+normalization and variable expansion remain in Hermes' installed runtime.
+Configure the `hermes-config` target's `resolver` with its interpreter and import
+root, for example `{ "python": "/opt/example/hermes/.venv/bin/python", "modulePath":
+"/opt/example/hermes" }`. The resolver and module must pass the root-only trust
+walk. Without this setting effective observations are unavailable.
+Optional `resolver.home` supplies the owner's startup `HOME`; otherwise the owner
+process's home is used. `HERMES_HOME` remains the config file's containing directory,
+including for nested profiles.
+Optional `resolver.environment` supplies approved non-secret startup variables;
+Hermes' own environment loader handles dotenv decoding, interpolation and
+precedence. `HERMES_MANAGED_DIR` can
+be supplied there; a configured `hermes-managed` target selects its containing
+directory. Every loader failure, exception, timeout or malformed output reports
+`unavailable`, including failed reads for which Hermes supplies fallback values.
+Reader and parser exceptions remain failures even when a later loader catches them.
+Snapshot failures and unit failures use the same code.
+Missing runtimes, unsupported housekeeping hooks and attempted writes also leave
+effective observations unavailable. Dependent Checks rows remain unknown; persisted
+YAML is never substituted for effective values. File hashes still refer to
+persisted bytes for write preconditions. The separate `hermes.allowlist` view
+supplies persisted command text for revocation; comparisons use the effective
+`hermes.safety` output.
+
+Agent availability uses the optional top-level `agentStatus` in this site file:
+`{ "home": "/home/me", "runAs": { "user": "me", "uid": 1001 }, "binaries": {
+"claude": "/home/me/.local/bin/claude", "codex": "/home/me/.local/bin/codex",
+"copilot": "/home/me/.local/bin/copilot" } }`. The `wayroost.agents` view runs
+fixed status-only probes as that owner with a read-only home and no public
+network. The server's home isolation stays enabled. Only three installation and
+authentication flags are returned; command output and account identities are
+never returned.
+
+Config requests use the schemas in `shared/supervisor-config.ts`. The supervisor
+passes the validated request and site configuration over stdin to the packaged
+`config-entry.js`, through `systemd-run --wait --pipe`, as the target's uid. No
+parameter reaches command arguments or a shell. The writer has a private network,
+strict filesystem protection, no new privileges and a 30-second runtime limit.
+Only the target folder and its backup and audit folders are writable. Install the
+compiled supervisor and its dependencies beneath root-owned directories; the
+Node binary, entry point and optional consumer loader pass the executable trust
+walk at each launch.
+
+Provision each backup and audit directory as its target's owner with mode 0700
+before enabling writes. Backup data lives beneath `backupDir/files`; this also
+keeps the core's shared audit lock within the configured backup folder. The executor
+retains ten backups per target; completed backups older than thirty days expire
+under the target lock. The core's unfinished commit records pin its backups. The `file` lock path must be the target plus
+`.wayroost-settings.lock`, pi's lock the target plus `.lock`, and Paseo's lock the
+target plus `.wayroost.lock`. pi reads also take its mkdir lock, with a heartbeat;
+this writer refuses an existing lock and does not reap pi's locks. Paseo shares
+the existing flock implementation. Untrusted directories and mismatched owners
+or modes return fixed codes before launching a write.
+
+For Paseo, set the site's `loader` to the root-owned installed module exporting
+`readPersistedConfig` from `@getpaseo/server`. Validation creates a private home
+with `config.json` beneath the target's audit folder and calls
+`readPersistedConfig(home)`. That loader strips removed fields before its strict
+persisted schema; the protocol's mutable schema is not used for validation.
+The private copy is removed after validation, and loader output is suppressed.
+[Paseo's persisted loader](https://github.com/getpaseo/paseo/blob/v0.9.2/packages/server/src/server/persisted-config.ts)
+defines that runtime interface.
+
+Set `WAYROOST_PASEO_URL` to the daemon's loopback WebSocket address in the root
+supervisor unit. If authentication is enabled, supply `paseo-password` through
+systemd's `LoadCredential`; the supervisor reads it from `CREDENTIALS_DIRECTORY`.
+Reload happens through the supported client after the isolated writer finishes.
+The supervisor reads checked file snapshots before and after reload,
+checks both content hashes against the committed write, and compares the view's
+values with `getDaemonConfig` from the supported client. Restart-required or
+override-controlled paths, differing effective values, outside saves, connection
+failures and failed reloads return `outcome_unknown` with the target and backup
+id. Provider entries removed by undo are checked against their effective
+enabled defaults even when they no longer appear in the persisted view. If no
+reload connection is configured, Paseo writes return `not_configured` before
+launch. Tests inject the unit runner, consumer validator and reload adapter.
+
+Each apply or undo launches exactly one transient writer unit. There are no
+recovery units or owner receipts. A failure after the launch attempt, including
+a launch error, timeout, lost or malformed result, core audit failure, failed
+reload or supervisor audit failure, returns the fixed result
+`{ ok:false, code:"outcome_unknown", target, backupId }`. The supervisor reserves
+the backup id and saves it in the launch record before starting the unit. The
+writer saves that rollback snapshot under the target lock before running the
+core; it uses the reserved id for both success and failure results. The core's
+temporary backup is removed after successful coordination. Lost output and
+launch errors retain the reserved id, although the backup may not exist if the
+unit never reached backup creation. That result makes no claim
+about whether the write committed, and never exposes upstream text or values.
+Preflight refusals before launch retain their specific fixed codes.
+
+The target file's content hash is the source of truth. Before applying, retain
+config.read's hash and the intended values. After `outcome_unknown`, call
+config.read again: compare its values against the intended values and its hash
+against the pre-apply hash. Intended values with a different hash show the
+requested state is present; the pre-apply hash shows the original bytes are
+present. Any other state needs reconciliation before another write. For undo,
+compare against the token's backup and written hashes. An absent or unreadable
+target, or intended values unchanged from the original state, cannot establish
+that a particular unit completed. A read may precede a still-running unit's
+completion, so keep checking until the state is settled. Retrying the same
+request id returns its recorded result and never repeats the write or launches
+a recovery unit; use a new id only after reconciling the file.
+
+The supervisor records one strict, value-free row per unit launch attempt in
+`config-audit.jsonl`, including `outcome_unknown`: caller, operation, target,
+key names, any known backup id and hashes, and the fixed result. Private request
+records bind request ids to caller and request digests before launch and persist
+the result afterward. Reads also save launch metadata, without storing their
+returned values. Success stays provisional until the audit append finishes;
+pending metadata overrides a provisional log row after a failed append or save.
+If a crash loses final success publication, the durable pending record still
+prevents replay and identifies the reserved backup for hash reconciliation.
+An interrupted request remains `outcome_unknown` without inspecting owner
+storage. Request-record saves and log appends are attempted independently.
+Once storage is available, reconciliation repairs missing rows
+and replaces changed rows atomically, preserving one row per launch. No audit
+or request record contains parameters or values. Undo must match the backup id
+and hashes in the root-held audit, then the core checks the live file's hash and
+the backup's actual bytes under the target lock. An outside edit is left intact.
+Undo returns a reverse backup token on success. Failed executor output is
+discarded; only one schema-checked JSON line is accepted.
+Delayed applies are refused with `invalid_parameters`. Operations needing a role
+catalogue or a required state record (move, restore or intended values) return
+`not_configured` before launching until that executor is installed.
+
+The Codex read-only view parses TOML and projects only the root approval policy
+and sandbox mode. Forbidden control characters and bare carriage returns are
+rejected throughout the document, including comments and multiline strings.
+Read-only managed Hermes files may be owned by root with no
+group or world write bits. Explicit drvfs reads also accept the documented
+root:root 0777 shape; descriptor, symlink, hard-link, UTF-8 and size checks remain
+in force. These policies never enable writes or change the reader's uid.
+Failed transient units remain loaded until their systemd `Result` is captured;
+`timeout` is captured before `reset-failed` collects the unit. Reads retain
+the fixed timeout code; launched writes return `outcome_unknown`.
+
 Production configuration is strict JSON, selected by `WAYROOST_SUPERVISOR_CONFIG`
 (default `/etc/wayroost/supervisor.json`): `socket`, `rescueHost`, `rescuePort`,
 `keysFile`, `stateDir`, `registryOverrides`, `idleLimitMs`, `pollMs`,

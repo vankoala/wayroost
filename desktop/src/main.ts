@@ -260,6 +260,15 @@ async function start() {
     notification.on('click', () => { if (currentWindow(generation)) void openApproval(client.approvals.get(key)); });
     toasts.set(key, notification);
     notification.show();
+  }, notification: (alert) => {
+    const notification = new Notification({ title: alert.title, body: alert.body ?? '' });
+    const generation = client.pairingGeneration;
+    notification.on('click', () => {
+      if (!currentWindow(generation) || client.authenticationBlocked) return;
+      showOnLoad = true;
+      void loadAppPage(new URL(alert.url, origin).href, generation).then(() => presentSurface(generation)).catch(() => {});
+    });
+    notification.show();
   }, link: (open, code) => {
     if (open) { appLink.socketOpened(); void pollStatus(); return; }
     // The server recycles every socket every 30 minutes; that reconnect isn't news.

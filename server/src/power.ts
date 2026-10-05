@@ -282,6 +282,7 @@ export class Power {
   }
 
   private onEvent(event: SupervisorEvent): void {
+    if (event.type === 'usage_changed') { this.hub.publish({ type: 'usage_changed' }); return; }
     this.streamChanges += 1;
     if (event.type === 'status') this.cache(event.status);
     else if (event.type === 'action') {

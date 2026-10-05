@@ -187,6 +187,31 @@ wrapper ahead of the real CLI on the agents' `PATH` that refuses to run while
 Paseo has that provider switched off. Agents run as your user, so this guards
 against accidents, not against a determined agent.
 
+## What a folder says about itself
+
+Folders often configure the agents that work in them, and those files were not
+written by Wayroost. When you choose a folder for a Paseo agent, the sheet looks
+at the folder's configuration and says, in plain words, what it would let an
+agent do:
+
+- `Files here can give Claude Code permission to act without asking.`
+- `This folder has hooks Claude Code runs without asking.`
+- `This folder has code Paseo runs on its own.` — a plugin or a command Paseo
+  loads whatever agent you chose to work there.
+- `This folder has VS Code configuration Wayroost could not read.`
+
+Every warning group is shown, with at most four file names in each and a count
+of any others. Wayroost reads configuration contents as the folder's owner to
+classify them, but returns and displays only file names and findings. Nested
+folders include configuration inherited within their workspace. Nothing runs
+while you read the card, and the card is advice rather than a gate — Launch stays
+available, and a folder Wayroost could not fully read says so on the same card.
+Launch waits for the current folder and agent's check, even if you start before
+the card loads; findings and failed checks still allow the agent to start.
+Instruction files (`AGENTS.md` and friends) go unmentioned: they are text an
+agent reads, not something that runs. A Hermes chat isn't asked, since a Hermes
+chat reads its folder's files the way it always has.
+
 ## Archiving and deleting
 
 A thread's ⋯ menu archives or deletes it, and so do **Archive folder** in the

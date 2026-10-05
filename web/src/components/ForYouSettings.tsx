@@ -1,7 +1,7 @@
 import { BellRing, Gauge, Info, LoaderCircle, Moon, ShieldAlert, Smartphone, Sparkles, ThumbsDown, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import type { FeedSettings, ProactivityLevel } from '../../../shared/protocol';
-import { api } from '../api';
+import { api, serializeNotificationSettingsSave } from '../api.js';
 import { disablePush, enablePush, pushState, type PushState } from '../push';
 import { toast } from '../store';
 import { SettingsTiming } from './SettingsTiming';
@@ -59,10 +59,19 @@ export function ForYouSettings() {
 
   if (!settings) return null;
 
-  const save = async (key: string, patch: Parameters<typeof api.feedSettings>[0]) => {
+  const save = async (key: string, patch: Omit<Parameters<typeof api.feedSettings>[0], 'quietHours'> & {
+    quietHours?: Partial<NonNullable<FeedSettings['quietHours']>> | null;
+  }) => {
     setBusy(key);
     try {
-      setSettings(await api.feedSettings(patch));
+      const next = await serializeNotificationSettingsSave(async () => {
+        const { quietHours, ...rest } = patch;
+        const body = quietHours
+          ? { ...rest, quietHours: { ...((await api.feed()).settings.quietHours ?? DEFAULT_QUIET), ...quietHours } }
+          : { ...rest, ...(quietHours === null ? { quietHours: null } : {}) };
+        return api.feedSettings(body);
+      });
+      setSettings(next);
     } catch (err) {
       toast((err as Error).message);
     } finally {
@@ -162,7 +171,7 @@ export function ForYouSettings() {
             <span className="muted">From</span>
             <select
               value={quiet.start}
-              onChange={(e) => save('quiet', { quietHours: { ...quiet, start: e.target.value } })}
+              onChange={(e) => save('quiet', { quietHours: { start: e.target.value } })}
               disabled={busy !== null}
               aria-label="Quiet hours start"
             >
@@ -175,7 +184,7 @@ export function ForYouSettings() {
             <span className="muted">to</span>
             <select
               value={quiet.end}
-              onChange={(e) => save('quiet', { quietHours: { ...quiet, end: e.target.value } })}
+              onChange={(e) => save('quiet', { quietHours: { end: e.target.value } })}
               disabled={busy !== null}
               aria-label="Quiet hours end"
             >

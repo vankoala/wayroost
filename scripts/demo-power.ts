@@ -16,6 +16,14 @@ import type {
   SupervisorStatus,
 } from '../shared/supervisor.js';
 import type { BusyCounts, SupervisorApi, SupervisorStreamHandlers } from '../server/src/supervisor-client.js';
+import { createHash } from 'node:crypto';
+import { z } from 'zod';
+import { READ_VIEWS, operationKeys, operationTarget, parseOperation, readViewKeys } from '../shared/settings-ops.js';
+import { formatKeyPath, type KeyPath, type SettingValue } from '../shared/settings.js';
+import type {
+  ConfigApplyRequest, ConfigReadRequest, ConfigReadResult, ConfigUndoRequest, ConfigWriteResult, CredentialTestRequest, CredentialWriteRequest,
+  credentialTestResultSchema, credentialWriteResultSchema, UsageSummaryRequest, usageSummaryResultSchema,
+} from '../shared/supervisor-config.js';
 
 /** One lifecycle action at a time, like the supervisor. */
 const RUN_MS = 9_000;
@@ -244,6 +252,124 @@ export class DemoSupervisor implements SupervisorApi {
     return true;
   }
 
+  // ---- Settings: the config verbs the settings pipeline calls -----------------
+  // Demo documents stand in for the files on a real PC, so the settings pages,
+  // apply, undo, keys and usage all run the production routes in the UI check.
+
+  readonly documents: Record<string, Record<string, unknown>> = {
+    'hermes-config': {
+      model: { provider: 'anthropic', default: 'example-main-model', base_url: '' },
+      fallback_providers: [],
+      agent: { reasoning_effort: 'medium' },
+      display: { personality: '' },
+      delegation: { model: 'example-main-model', provider: 'anthropic', max_concurrent_children: 2, max_iterations: 30, fallback_providers: [] },
+      auxiliary: { compression: { provider: 'anthropic', model: 'example-tiny-model' } },
+      approvals: { mode: 'smart', cron_mode: 'deny' },
+      command_allowlist: ['git status', 'sed -n 1,40p *'],
+      skills: { write_approval: false },
+      memory: { write_approval: true },
+    },
+    'paseo-config': {
+      agents: { providers: {
+        claude: { enabled: true }, codex: { enabled: false }, hermes: { enabled: true, paseoTools: { enabled: true } },
+      } },
+      daemon: { agentProfiles: { 'paseo-coder': { id: 'paseo-coder', name: 'Coder', provider: 'pi', model: 'pi/example-coder-model' } } },
+    },
+    'gateway-role-map': {
+      roles: { main: 'anthropic-main', coder: 'pi-coder', fast: 'anthropic-fast' },
+      backends: {
+        'anthropic-main': { provider: 'anthropic', servedName: 'example-main-model', contextLength: 1000000, maxOutputTokens: 64000, input: ['text', 'image'], toolCalling: true, thinkingLevels: true },
+        'anthropic-fast': { provider: 'anthropic', servedName: 'example-tiny-model', contextLength: 200000, maxOutputTokens: 8000, input: ['text'], toolCalling: true, thinkingLevels: false },
+        'pi-coder': { provider: 'openrouter', servedName: 'example-coder-model', contextLength: 131072, maxOutputTokens: 16000, input: ['text'], toolCalling: true, thinkingLevels: true },
+      },
+      contracts: {
+        main: { input: ['text', 'image'], toolCalling: true, thinkingLevels: true, maxOutputTokens: 64000, advertisedContext: 1000000 },
+        coder: { input: ['text'], toolCalling: true, thinkingLevels: true, maxOutputTokens: 16000, advertisedContext: 131072 },
+        fast: { input: ['text'], toolCalling: true, thinkingLevels: false, maxOutputTokens: 8000, advertisedContext: 200000 },
+      },
+    },
+    'gateway-state': { state: { version: 1, profile: 'demo', engine: 'demo', broughtUpAt: 0 }, migration: { version: 1 } },
+    'gateway-credentials': { anthropic: 'stored-key' },
+    'codex-config': { approval_policy: 'on-request', sandbox_mode: 'workspace-write' },
+    'claude-settings': { permissions: { defaultMode: 'acceptEdits' } },
+    'opencode-config': { permission: {} },
+    'wayroost-settings': { safetyCommandsEnabled: false, push: { approvals: true, cards: false }, quietHours: null, rules: [] },
+  };
+  /** Set when a section read reports the managed-keys file; the demo PC has none. */
+  private readonly backups = new Map<string, { target: string; document: Record<string, unknown> }>();
+
+  async configRead(request: ConfigReadRequest): Promise<ConfigReadResult> {
+    const spec = READ_VIEWS[request.view];
+    const document = this.documents[spec.target];
+    if (document === undefined) return { ok: true, view: request.view, present: false, values: [] };
+    const values = readViewKeys(spec, document).map((path) => {
+      const found = valueFromDocument(document, path);
+      return found === undefined ? { path: [...path], exists: false as const } : { path: [...path], exists: true as const, value: found as never };
+    });
+    return { ok: true, view: request.view, present: true, sha256: shaOf(document), values };
+  }
+
+  async configApply(request: ConfigApplyRequest): Promise<ConfigWriteResult> {
+    const parsed = parseOperation(request.operation, request.params, 'server');
+    if (!parsed.ok) return { ok: false, code: parsed.code };
+    const target = operationTarget(parsed.spec, parsed.params as Readonly<Record<string, unknown>>);
+    const document = this.documents[target] ?? {};
+    const before = structuredClone(document);
+    if (request.preconditions && 'file' in request.preconditions && request.preconditions.file.sha256 !== shaOf(document)) return { ok: false, code: 'precondition_changed' };
+    const params = parsed.params as Record<string, unknown>;
+    const paths = operationKeys(parsed.spec, params as never, document);
+    if (paths === 'recorded') return { ok: false, code: 'not_configured' };
+    const values = appliedValues(request.operation, params);
+    if (request.operation === 'hermes.revoke-always') {
+      const allowlist = (document.command_allowlist ?? []) as unknown[];
+      document.command_allowlist = allowlist.filter((entry) => shaOf(entry) !== (params.entrySha256 as string) && shaText(String(entry)) !== (params.entrySha256 as string));
+    } else {
+      paths.forEach((path, index) => setInDocument(document, path, (values[index] ?? params.enabled) as SettingValue | undefined));
+    }
+    this.documents[target] = document;
+    const backupId = `demo-backup-${this.backups.size + 1}`;
+    this.backups.set(backupId, { target, document: before });
+    const token = { operation: request.operation, target, backupId, backupSha256: shaOf(before), writtenSha256: shaOf(document) };
+    return { ok: true, keys: paths.map(formatKeyPath), ...token, undo: token };
+  }
+
+  async configUndo(request: ConfigUndoRequest): Promise<ConfigWriteResult> {
+    const backup = this.backups.get(request.token.backupId);
+    if (!backup || shaOf(backup.document) !== request.token.backupSha256) return { ok: false, code: 'backup_mismatch' };
+    const current = this.documents[request.token.target] ?? {};
+    if (shaOf(current) !== request.token.writtenSha256) return { ok: false, code: 'undo_changed' };
+    const before = structuredClone(current);
+    this.documents[request.token.target] = structuredClone(backup.document);
+    const backupId = `demo-backup-${this.backups.size + 1}`;
+    this.backups.set(backupId, { target: request.token.target, document: before });
+    const token = { operation: request.token.operation, target: request.token.target, backupId, backupSha256: shaOf(before), writtenSha256: shaOf(backup.document) };
+    return { ok: true, keys: [], ...token, undo: token };
+  }
+
+  async credentialWrite(request: CredentialWriteRequest): Promise<z.infer<typeof credentialWriteResultSchema>> {
+    const keys = this.documents['gateway-credentials'] ?? {};
+    if (request.action === 'remove') delete keys[request.provider];
+    else keys[request.provider] = 'stored-key';
+    this.documents['gateway-credentials'] = keys;
+    return { ok: true, provider: request.provider, timing: 'restart-when-idle:gateway' };
+  }
+
+  async credentialTest(request: CredentialTestRequest): Promise<z.infer<typeof credentialTestResultSchema>> {
+    const stored = this.documents['gateway-credentials']?.[request.provider] !== undefined;
+    return stored
+      ? { ok: true, provider: request.provider, backend: request.backend }
+      : { ok: false, code: 'credential_missing' };
+  }
+
+  async usageSummary(request: UsageSummaryRequest): Promise<z.infer<typeof usageSummaryResultSchema>> {
+    const rows = (scale: number) => [
+      { role: 'main' as const, backend: 'anthropic-main', backendModel: 'example-main-model', requests: 42 * scale, errors: 1, inputTokens: 12_400 * scale, cacheReadTokens: 41_000 * scale, cacheWriteTokens: 2_100 * scale, outputTokens: 5_300 * scale, estimatedCostUsd: 0.42 * scale },
+      { role: 'coder' as const, backend: 'pi-coder', backendModel: 'example-coder-model', requests: 18 * scale, errors: 0, inputTokens: 8_200 * scale, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 3_900 * scale, estimatedCostUsd: 0.04 * scale },
+      { role: 'fast' as const, backend: 'anthropic-fast', backendModel: 'example-tiny-model', requests: 96 * scale, errors: 2, inputTokens: 6_100 * scale, cacheReadTokens: 12_000 * scale, cacheWriteTokens: 900 * scale, outputTokens: 2_400 * scale, estimatedCostUsd: 0.09 * scale },
+    ];
+    return { ok: true, generatedAt: Date.now(), windows: request.windows.map((window) => ({ id: window.id, since: window.since, rows: rows(window.id === 'week' ? 6 : 1) })) };
+  }
+
   /** Back to the demo's starting state, with nothing running and no timers left. */
   reset(): void {
     this.stop();
@@ -361,3 +487,65 @@ export class DemoSupervisor implements SupervisorApi {
 /** Used by the report and by anyone reading the demo: the fake states it shows. */
 export const DEMO_STATES: ComponentState[] = ['up', 'starting', 'down', 'held', 'failing'];
 export const demoSeconds = seconds;
+
+// ---- Demo config verbs: helpers --------------------------------------------
+
+function shaText(text: string): string { return createHash('sha256').update(text, 'utf8').digest('hex'); }
+function shaOf(value: unknown): string {
+  return shaText(JSON.stringify(value, (_key, inner) => (inner instanceof Map || inner instanceof Set ? undefined : inner)) ?? 'undefined');
+}
+function valueFromDocument(document: unknown, path: KeyPath): unknown {
+  let current = document;
+  for (const segment of path) {
+    if (!current || typeof current !== 'object') return undefined;
+    if (typeof segment === 'number') {
+      if (!Array.isArray(current)) return undefined;
+      current = (current as unknown[])[segment];
+    } else if (typeof segment === 'object') {
+      current = Array.isArray(current) ? (current as { id?: string }[]).find((entry) => entry && entry.id === segment.id) : undefined;
+    } else {
+      if (!Object.hasOwn(current, segment)) return undefined;
+      current = (current as Record<string, unknown>)[segment];
+    }
+  }
+  return current;
+}
+function setInDocument(document: Record<string, unknown>, path: KeyPath, value: SettingValue | undefined): void {
+  let current: Record<string | number, unknown> = document;
+  for (const [index, segment] of path.entries()) {
+    const last = index === path.length - 1;
+    if (typeof segment === 'number' || typeof segment === 'object') return;
+    if (last) {
+      if (value === undefined) delete current[segment];
+      else current[segment] = value;
+      return;
+    }
+    const next = current[segment];
+    if (next && typeof next === 'object') { current = next as Record<string | number, unknown>; continue; }
+    const created: Record<string | number, unknown> = {};
+    current[segment] = created;
+    current = created;
+  }
+}
+
+/** The values each operation writes, in key order. Mirrors what the real supervisor derives from params. */
+function appliedValues(operation: string, params: Record<string, unknown>): unknown[] {
+  const table: Record<string, unknown[]> = {
+    'hermes.reasoning-effort': [params.effort],
+    'hermes.personality': [params.personality],
+    'hermes.delegation-limits': [params.maxConcurrentChildren, params.maxIterations],
+    'hermes.approval-mode': [params.mode],
+    'hermes.skill-staging': [params.enabled],
+    'paseo.provider-enabled': [params.enabled],
+    'paseo.routing-note': [params.text],
+    'paseo.profile-model': [params.model],
+    'hermes.default-model': [params.provider, params.model, params.baseUrl],
+    'hermes.delegation-model': [params.provider, params.model],
+    'hermes.main-fallbacks': [params.chain],
+    'hermes.delegation-fallbacks': [params.chain],
+    'hermes.helper-model': [params.provider, params.model],
+    'gateway.point': [params.backend],
+    'wayroost.safety-commands': [params.enabled],
+  };
+  return table[operation] ?? [];
+}

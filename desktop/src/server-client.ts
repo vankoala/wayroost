@@ -1,10 +1,10 @@
 import type { Session } from 'electron';
-import type { Approval, ConversationSummary, ListResponse, ServerEvent } from '../../shared/protocol.js';
+import type { AppNotification, Approval, ConversationSummary, ListResponse, ServerEvent } from '../../shared/protocol.js';
 import { AUTHENTICATION_TIMEOUT_MS, authenticationEndpoint, authenticationError, authenticationHttpFailure, readAuthenticationBody, socketAuthenticationLoss, type AuthenticationLoss } from '../../shared/authentication.js';
 import type { Presence } from './presence.js';
 import { approvalKey, onceOption, toastCanAllow } from './approvals.js';
 import { APP_HEADER, APP_HEADER_VALUE } from './hardening.js';
-import { isApprovalEvent, isApprovalSnapshot } from '../../shared/approval-validation.js';
+import { isAppNotification, isApprovalEvent, isApprovalSnapshot } from '../../shared/approval-validation.js';
 
 const UNPAIRED_IDENTITY = Symbol('unpaired identity');
 /** Socket reconnects back off from one to thirty seconds; a socket that opens resets them. */
@@ -63,6 +63,7 @@ class ServerNetworkError extends Error {}
 export interface DeviceRoutes { pair(code: string, name: string): Promise<unknown>; presence(state: Presence): Promise<unknown> }
 export interface ApprovalHandlers {
   notify(approval: Approval): void;
+  notification?(notification: AppNotification): void;
   removed(key: string): void;
   changed(): void;
   authentication?(state: AuthenticationState, generation: number): void;
@@ -107,6 +108,8 @@ export class ServerClient implements DeviceRoutes {
   private readonly toasted = new Set<string>();
   /** Toasts currently shown, closed when the server stops allowing them. */
   private readonly activeToasts = new Set<string>();
+  private readonly pendingToasts = new Map<string, AppNotification>();
+  private readonly alertKeys = new Set<string>();
   private socket: LiveSocket | undefined;
   private opener: ((url: string) => LiveSocket) | undefined;
   private stopped = false;
@@ -142,7 +145,7 @@ export class ServerClient implements DeviceRoutes {
     this.socket = undefined; this.opened = false;
     socket?.close();
     for (const key of [...this.approvals.keys(), ...this.toasted]) this.forget(key);
-    this.toasted.clear(); this.activeToasts.clear(); this.conversations.clear();
+    this.toasted.clear(); this.activeToasts.clear(); this.conversations.clear(); this.pendingToasts.clear(); this.alertKeys.clear();
     this.notifications = false; this.role = undefined;
   }
   /** Connection changes retire snapshot work without changing identity or existing approvals. */
@@ -347,6 +350,14 @@ export class ServerClient implements DeviceRoutes {
       const current = new Set(list.approvals.map(approvalKey));
       for (const key of [...this.approvals.keys()]) if (!current.has(key)) this.forget(key);
       for (const approval of list.approvals) this.upsert(approval);
+      const routed = list.approvalNotifications ?? [];
+      const permitted = new Set(routed.flatMap((notification) => notification.approval ? [approvalKey(notification.approval)] : []));
+      for (const key of this.activeToasts) if (!permitted.has(key)) {
+        this.handlers.removed(key); this.activeToasts.delete(key);
+      }
+      for (const notification of routed) this.showNotification(notification);
+      for (const notification of [...this.pendingToasts.values()]) this.showNotification(notification);
+      this.pendingToasts.clear();
       this.handlers.changed(); this.handlers.answered?.();
     } catch (error) {
       if (!validated && !signal.aborted && !(error instanceof ServerHttpError) && !(error instanceof ServerNetworkError)) this.suspend(generation);
@@ -355,6 +366,15 @@ export class ServerClient implements DeviceRoutes {
   }
   receive(event: ServerEvent) {
     if (this.authenticationBlocked || this.stopped) return;
+    if (event.type === 'notification') {
+      if (!isAppNotification(event.notification)) { this.suspend(this.generation); return; }
+      const notification = event.notification;
+      if (notification.event === 'agent-needs-you' && notification.approval) {
+        this.pendingToasts.set(approvalKey(notification.approval), notification);
+        this.hint();
+      } else this.showNotification(notification);
+      return;
+    }
     if (event.type !== 'approval_upsert' && event.type !== 'approval_removed') return;
     if (!isApprovalEvent(event)) { this.suspend(this.generation); return; }
     if (event.type === 'approval_upsert') this.upsert(event.approval);
@@ -366,14 +386,30 @@ export class ServerClient implements DeviceRoutes {
     const previous = this.approvals.get(key);
     if (previous && previous.createdAt !== approval.createdAt) this.forget(key);
     this.approvals.set(key, approval);
-    if (this.notifications && !this.toasted.has(key)) {
+  }
+
+  private showNotification(notification: AppNotification) {
+    if (!this.notifications) return;
+    if (notification.event === 'agent-needs-you') {
+      const reference = notification.approval;
+      if (!reference || reference.source !== notification.source) return;
+      const key = approvalKey(reference);
+      const approval = this.approvals.get(key);
+      if (!approval || approval.createdAt !== reference.createdAt || this.toasted.has(key)) return;
       this.toasted.add(key); this.activeToasts.add(key); this.handlers.notify(approval);
+      return;
     }
+    const key = JSON.stringify([notification.event, notification.source, notification.url, notification.at, notification.title, notification.body]);
+    if (this.alertKeys.has(key)) return;
+    this.alertKeys.add(key);
+    if (this.alertKeys.size > 200) this.alertKeys.delete(this.alertKeys.values().next().value!);
+    this.handlers.notification?.(notification);
   }
   private forget(key: string) {
     const known = this.approvals.delete(key) || this.toasted.has(key);
     this.toasted.delete(key);
     this.activeToasts.delete(key);
+    this.pendingToasts.delete(key);
     if (known) this.handlers.removed(key);
   }
   hint() {
@@ -429,6 +465,9 @@ export class ServerClient implements DeviceRoutes {
         if (data.type === 'approval_upsert' || data.type === 'approval_removed') {
           if (!isApprovalEvent(data)) { invalid(); return; }
           this.hint();
+        } else if (data.type === 'notification') {
+          if (!('notification' in data) || !isAppNotification(data.notification)) { invalid(); return; }
+          this.receive({ type: 'notification', notification: data.notification });
         }
       } catch { invalid(); }
     };

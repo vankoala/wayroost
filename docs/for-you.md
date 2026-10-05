@@ -55,13 +55,20 @@ ones are forgotten after 14, and at most 300 are kept.
   about cards, and **Not now** won't bring a card back during them.
   Notifications that an agent needs you still come through, since that's
   work you started; your phone's own Do Not Disturb can hold those.
+  These are the same hours Settings → Notifications routes alerts by, and
+  writing them on either page writes the other; they're read in the time
+  zone the site file names (`notifications.timeZone`), not this PC's. See
+  [Alerts](notifications.md).
 - **Notifications on this device**, turned on per phone or computer. Then
   choose what they're for:
   - *When an agent needs you*: an approval or question in Hermes or Paseo,
     quiet hours or not. The notification says which agent and gives the
     request's short title, never the command. Tapping it opens the chat.
   - *New For-you cards*: off to start with, since the brief already comes on
-    WhatsApp.
+    WhatsApp. With it on, a new card reaches the phone unless the quiet hours
+    hold it; a rule in Settings → Notifications can also put the card on this
+    PC's screen, and a rule written there for cards takes the phone's half from
+    this switch.
 
   **Send a test** checks the path end to end. On an iPhone or iPad, add
   Wayroost to the Home Screen first (Share, then Add to Home Screen; iOS 16.4
@@ -134,6 +141,7 @@ so it never caches pages or sees requests.
 | File | In | Contents |
 | --- | --- | --- |
 | `feed.json` | the state folder (`/var/lib/signalbox`), mode 600 | The cards, your settings and turned-down topics, and which approvals have been notified. |
+| `wayroost-settings.json` | the state folder, mode 600 | Wayroost's own settings: notification rules, quiet hours, and the phone's switches. Written through the write-through core, which keeps `settings-backups/` and `settings-audit/settings.jsonl` beside it. See [Alerts](notifications.md). |
 | `push.json` | the state folder, mode 600 | The VAPID key pair and each device's push subscription. An unusable one is set aside as `push.json.bad` and a new key made (phones then turn notifications on again). |
 | `pulse-relay-state.json` | `~/.hermes`, mode 600 | The relay's side: which runs it has handled, and cards Wayroost couldn't take yet (for up to 12 hours). |
 

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { expect, it } from 'vitest';
 
-it('coordinates cutover and rollback with the installed server state permissions and separate Safety role', () => {
+it('coordinates cutover and rollback with server state permissions, supervisor config writes and catalogue writes', () => {
   const unit = readFileSync('deploy/wayroost-server.service', 'utf8');
   expect(unit).toContain('StateDirectory=wayroost-shadow');
   expect(unit).toContain('DynamicUser=yes');
@@ -10,9 +10,19 @@ it('coordinates cutover and rollback with the installed server state permissions
   expect(cutover).toContain('StateDirectory=wayroost\n');
   expect(cutover).toContain('StateDirectory=wayroost-shadow');
   expect(cutover).toContain('StateDirectory=\n');
-  expect(cutover).toContain('wayroost-paseo-safety.service');
+  expect(cutover).toContain("supervisor's config verbs");
   expect(cutover).toContain('systemctl daemon-reload');
-  expect(cutover).toContain('Safety companion');
+  expect(cutover).toContain('do not install or start the owner-side Safety');
+  expect(cutover).toContain("Disable the supervisor's `configWrites` switch");
+  expect(cutover).toContain('is never installed');
+  expect(cutover).toContain('`SAFETY_OWNER` unset');
+  expect(cutover).toContain('`paseo.worker-approvals`');
+  expect(cutover).toContain('`paseo.provider-enabled`');
+  expect(cutover).toContain('config verbs before cutover');
+  expect(cutover).toContain('`configWrites` off before restoring');
+  expect(cutover).toContain('settings.legacyRoutesViaPipeline');
+  expect(cutover).not.toContain('restart the\n   Safety helper');
+  expect(cutover).not.toContain('wayroost-paseo-safety.service');
 });
 
 it('pins every documented Signalbox recovery command to its explicit config and distinguishes rescue keys', () => {

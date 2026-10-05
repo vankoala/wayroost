@@ -8,6 +8,24 @@ line per process. If both are set, the Wayroost variable wins. It is validated s
 level, unsafe values and missing fields stop the service with a clear message
 instead of starting in a weaker state.
 
+The settings pages read gateway telemetry through the supervisor's bounded
+`gateway.status` view. Role prompt measurements come from the compiler's JSON
+build output: save it as `roles-pack-build.json` in the server's state directory,
+or set `settings.packBuildFile` to its absolute path. Only the load counts,
+section counts and budgets are returned to the pages.
+
+Set `agentStatus` in the supervisor's root-owned `settings-targets.json` to
+`{ "home": "/home/me", "runAs": { "user": "me", "uid": 1001 }, "binaries": {
+"claude": "/home/me/.local/bin/claude", "codex": "/home/me/.local/bin/codex",
+"copilot": "/home/me/.local/bin/copilot" } }` to enable installation and sign-in
+status probes. The supervisor runs a bounded, private-network unit as that owner,
+with a read-only home, and returns the `wayroost.agents` observation. The server
+keeps its dynamic account and home isolation. The probes invoke status commands
+and Copilot's stdio auth status RPC with bounded output and timeouts; only
+installed and authenticated flags are returned. Omitted or unreadable sources
+remain unknown. Move any earlier `settings.agentStatus` server entry to this
+supervisor setting; the server entry no longer controls probes.
+
 A minimal config for the new paths:
 
 The local ports below are invented defaults. Set the Hermes, Paseo and model
@@ -60,9 +78,10 @@ are gone, the installer doesn't start the service.
 | `speech.enabled` | `false` | | Turns on [voice mode](voice.md). `deploy/setup-speech.sh` sets it after installing the speech service. |
 | `speech.socket` | `/run/signalbox-speech.sock` | absolute path | The speech service's Unix socket. |
 | `feed.enabled` | `false` | | Turns on [For you](for-you.md): cards from Hermes' brief and daytime checks (posted through the bridge, so turn that on too), the proactivity and quiet-hours settings, and phone notifications (these need an `https://` `publicOrigin`). |
+| `notifications.timeZone` | this PC's own zone | an IANA name this PC's time-zone database knows (`Europe/Berlin`, `UTC`) | Whose clock the quiet hours in Settings → Notifications are read on, so an owner away from home keeps their own 21:00. Unset means the zone this PC is set to. See [Alerts](notifications.md). |
 | `supervisor.socket` | `/run/wayroost/supervisor.sock` | absolute path, at most 107 bytes | Status & power: the supervisor's Unix socket. Without a `supervisor` block the power API says the supervisor isn't running. |
 | `supervisor.keyFile` | none | absolute path | Development only, when `CREDENTIALS_DIRECTORY` is unset: a file holding the supervisor's server key. When the `supervisor` block is configured, a configured credentials directory must supply a readable, valid `supervisor-server-key`; otherwise startup is refused, even with a `keyFile`. Without a `supervisor` block, no supervisor credential is required. The credential wins when both are there; a `supervisor` block with neither is refused. |
-| `stateDir` | `/var/lib/wayroost` for primary; `/var/lib/wayroost-shadow` for shadow | absolute path, isolated by role | Private state: the saved Hermes sign-in, the Paseo client id, the bridge token, and For you's cards and phone subscriptions. Primary deployments carried over from Signalbox can keep `/var/lib/signalbox` (mode 700). |
+| `stateDir` | `/var/lib/wayroost` for primary; `/var/lib/wayroost-shadow` for shadow | absolute path, isolated by role | Private state: the saved Hermes sign-in, the Paseo client id, the bridge token, For you's cards and phone subscriptions, and Wayroost's own settings (notification rules and quiet hours, with their backups and audit log). Primary deployments carried over from Signalbox can keep `/var/lib/signalbox` (mode 700). |
 | `staticDir` | next to the server bundle | absolute path | Built web assets. You won't normally set this. |
 
 The example leaves the bridge out, so it stays off. To turn it on, add:
@@ -372,3 +391,15 @@ explicit config paths continue to work.
 
 Never route Hermes or Paseo ports through a tunnel. Only Wayroost should be
 public, and only behind Access.
+
+The default coder MCP registration name is `coder`. Its script paths come from
+`coderMcp.original` and `coderMcp.gatewayCopy` in the settings targets; process
+checks match their configured basenames. For example, a registration can run
+`/home/me/demo/helper-mcp.py` with `python3`.
+
+A phone line, when there is one, is checked through two loopback `/health`
+endpoints. The phone server's reports the integer counters `active_calls`,
+`webhooks` and `outbound_calls`. The bridge's reports `active_calls`,
+`oldest_call_seconds` and `brains.persona`: the loopback `url` and the `model`
+its spoken persona uses. Moving the phone to the gateway writes a systemd
+drop-in on the bridge unit (`Environment=` lines in its `[Service]` section).

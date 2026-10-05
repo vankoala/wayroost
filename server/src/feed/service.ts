@@ -17,6 +17,7 @@ import type { Schedules } from '../schedules.js';
 import { UserFacingError, type HermesSource } from '../sources.js';
 import { oneLine, type CardInput, type FeedStore, type StoredSettings } from './store.js';
 import type { PushMessage, PushSender, PushSubscriptionInput } from './push.js';
+import type { FeedRouting, Notifications } from '../notifications/service.js';
 import { shadowBackground, type BackgroundGate } from '../background.js';
 import type { Devices } from '../devices.js';
 
@@ -53,6 +54,8 @@ export interface FeedDeps {
   schedules?: Pick<Schedules, 'list' | 'update' | 'setPaused'>;
   /** Phone notifications; absent when Signalbox isn't on https. */
   push?: PushSender;
+  /** Where alerts go: the rules, the PC's presence and quiet hours. Absent means push straight to the phone. */
+  notifications?: Notifications;
   log: FeedLog;
   now?: () => number;
   /** For quiet hours and "Do it" dates; defaults to the machine's zone. */
@@ -70,7 +73,7 @@ export interface PulsePreferences {
   done: string[];
 }
 
-export class Feed {
+export class Feed implements FeedRouting {
   private timer: ReturnType<typeof setInterval> | undefined;
   private pulseFound = false;
   private lastLook = 0;
@@ -78,6 +81,11 @@ export class Feed {
 
   constructor(private readonly deps: FeedDeps) {
     this.now = deps.now ?? Date.now;
+  }
+
+  /** Where alerts go. The routing service reads these settings and these settings need it to. */
+  useRouting(routing: Notifications): void {
+    this.deps.notifications = routing;
   }
 
   start(): void {
@@ -105,7 +113,7 @@ export class Feed {
   }
 
   settings(): FeedSettings {
-    const s = this.deps.store.settings();
+    const s = this.currentSettings();
     return {
       level: s.level,
       quietHours: s.quietHours,
@@ -118,7 +126,7 @@ export class Feed {
   }
 
   preferences(): PulsePreferences {
-    const s = this.deps.store.settings();
+    const s = this.currentSettings();
     const since = this.now() - RECENT_MS;
     const recent = this.deps.store.all().filter((c) => c.updatedAt >= since);
     return {
@@ -145,20 +153,41 @@ export class Feed {
     const { created, updated, removed } = this.deps.store.ingest(source, cards);
     for (const card of [...created, ...updated]) this.publish(card);
     for (const id of removed) this.deps.hub.publish({ type: 'feed_removed', id });
-    const s = this.deps.store.settings();
-    if (created.length && s.push.cards && s.level !== 'off') {
+    const s = this.currentSettings();
+    if (created.length && s.level !== 'off') {
       const first = created[0]!;
-      this.notify({
-        title: 'For you',
-        body: created.length === 1 ? first.title : `${created.length} new · ${first.title}`,
-        url: '/#for-you',
-        tag: 'for-you',
-        ttl: 12 * 3600,
-        urgency: 'normal',
-        topic: 'foryou',
-      });
+      const message = this.cardMessage(created, first);
+      const routing = this.deps.notifications;
+      if (routing) {
+        // The feed's own switch, level and quiet hours are the routing service's; the rules
+        // add the app toast. One card says it once.
+        routing.alert({
+          event: 'feed-card',
+          source,
+          title: message.title,
+          body: message.body,
+          url: message.url,
+          tag: message.tag,
+          ttl: message.ttl,
+          topic: message.topic,
+        }, () => this.deps.store.markNotified(`card-alert:${first.id}`));
+      } else if (s.push.cards) {
+        this.notify(message);
+      }
     }
     return { created: created.length, updated: updated.length };
+  }
+
+  private cardMessage(created: FeedCard[], first: FeedCard): PushMessage {
+    return {
+      title: 'For you',
+      body: created.length === 1 ? first.title : `${created.length} new · ${first.title}`,
+      url: '/#for-you',
+      tag: 'for-you',
+      ttl: 12 * 3600,
+      urgency: 'normal',
+      topic: 'foryou',
+    };
   }
 
   /**
@@ -219,12 +248,27 @@ export class Feed {
     removeLessLike?: string;
   }): Promise<FeedSettings> {
     const { store } = this.deps;
-    if (patch.level && patch.level !== store.settings().level) await this.applyLevel(patch.level);
+    const current = this.currentSettings();
+    if (patch.level && patch.level !== current.level) await this.applyLevel(patch.level);
     const next: Partial<StoredSettings> = {};
     if (patch.level) next.level = patch.level;
     if (patch.quietHours !== undefined) next.quietHours = patch.quietHours;
-    if (patch.push) next.push = { ...store.settings().push, ...patch.push };
-    if (Object.keys(next).length) store.updateSettings(next);
+    if (patch.push) next.push = { ...current.push, ...patch.push };
+    let routingSaved = false;
+    if (next.quietHours !== undefined || next.push) {
+      const saved = await this.deps.notifications?.setRouting({
+        ...(next.quietHours !== undefined ? { quietHours: next.quietHours } : {}),
+        ...(next.push ? { push: next.push } : {}),
+      });
+      if (saved) { next.quietHours = saved.quietHours; next.push = saved.push; routingSaved = true; }
+    }
+    if (Object.keys(next).length) {
+      try { store.updateSettings(next); }
+      catch (err) {
+        if (!routingSaved) throw err;
+        this.deps.log.warn({}, 'notification settings saved; the feed copy could not be persisted');
+      }
+    }
     if (patch.removeLessLike) store.removeLessLike(patch.removeLessLike);
     return this.settings();
   }
@@ -285,30 +329,46 @@ export class Feed {
 
   private observe(event: ServerEvent): void {
     (this.deps.background ?? shadowBackground).run(() => {
-      if (event.type === 'approval_upsert') this.notifyApproval(event.approval);
+      if (event.type === 'approval_upsert' && !this.deps.notifications) this.notifyApproval(event.approval);
     });
   }
 
   /**
-   * An agent is waiting on you: say so on the phone, without the command itself.
-   * Quiet hours don't apply: this is work you started (it has its own switch).
+   * An agent is waiting on you: say so, without the command itself. The rules, the PC's
+   * presence and the phone's switch say where; quiet hours never hold this one.
    */
   private notifyApproval(approval: Approval): void {
+    const key = `${approval.source}:${approval.conversationId}:${approval.id}`;
+    const message = this.approvalMessage(approval);
+    if (!this.deps.push || !this.deps.store.settings().push.approvals || !this.deps.push.devices()) return;
+    if (!this.deps.store.markNotified(key)) return;
+    this.notify(message, { evenWhenQuiet: true });
+  }
+
+  private approvalMessage(approval: Approval): PushMessage {
+    return {
+      title: `${SOURCE_NAMES[approval.source]} needs you`,
+      body: oneLine(approval.title, 80) || 'Open Wayroost to answer.',
+      url: `/c/${approval.source}/${encodeURIComponent(approval.conversationId)}`,
+      tag: `approval-${approval.source}-${approval.conversationId}`.slice(0, 64),
+      ttl: 3600,
+      urgency: 'high',
+      topic: 'approvals',
+    };
+  }
+
+  /** Quiet hours and the card switch, written from Settings → Notifications. */
+  applyRouting(routing: { quietHours: StoredSettings['quietHours']; push: StoredSettings['push'] }): void {
     const s = this.deps.store.settings();
-    if (!this.deps.push || !s.push.approvals || !this.deps.push.devices()) return;
-    if (!this.deps.store.markNotified(`${approval.source}:${approval.conversationId}:${approval.id}`)) return;
-    this.notify(
-      {
-        title: `${SOURCE_NAMES[approval.source]} needs you`,
-        body: oneLine(approval.title, 80) || 'Open Wayroost to answer.',
-        url: `/c/${approval.source}/${encodeURIComponent(approval.conversationId)}`,
-        tag: `approval-${approval.source}-${approval.conversationId}`.slice(0, 64),
-        ttl: 3600,
-        urgency: 'high',
-        topic: 'approvals',
-      },
-      { evenWhenQuiet: true },
-    );
+    const same = JSON.stringify(s.quietHours) === JSON.stringify(routing.quietHours)
+      && s.push.approvals === routing.push.approvals && s.push.cards === routing.push.cards;
+    if (!same) this.deps.store.updateSettings({ quietHours: routing.quietHours, push: routing.push });
+  }
+
+  private currentSettings(): StoredSettings {
+    const stored = this.deps.store.settings();
+    const routing = this.deps.notifications?.settings();
+    return routing ? { ...stored, quietHours: routing.quietHours, push: routing.push } : stored;
   }
 
   private notify(message: PushMessage, { evenWhenQuiet = false } = {}): void {
@@ -328,7 +388,7 @@ export class Feed {
   }
 
   quiet(at: number): boolean {
-    const hours = this.deps.store.settings().quietHours;
+    const hours = this.currentSettings().quietHours;
     if (!hours || hours.start === hours.end) return false;
     const t = this.clock(at);
     return hours.start < hours.end ? t >= hours.start && t < hours.end : t >= hours.start || t < hours.end;
