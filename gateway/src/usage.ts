@@ -4,7 +4,7 @@ import { open, rename, unlink } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { usageEvent, type UsageEventInput, type UsageEvent } from '../../shared/usage.js';
+import { usageEvent, requestAdjustmentsSchema, REQUEST_ADJUSTMENTS, type RequestAdjustments, type UsageEventInput, type UsageEvent } from '../../shared/usage.js';
 import { usageRowSchema, usageSummaryRequestSchema, type UsageRow, type UsageSummaryRequest, type UsageSummaryResult } from '../../shared/supervisor-config.js';
 import type { GatewayRole } from '../../shared/gateway.js';
 import { TrustedDirectory, ownedPrivately, CREDENTIAL_EXPOSED } from './directory.js';
@@ -14,6 +14,7 @@ const DAY = 86_400_000;
 const fields = ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens'] as const;
 const count = z.number().int().nonnegative();
 const eventSchema = z.object({ role: z.enum(['main', 'coder', 'fast']), backendModel: z.string().max(256), status: z.enum(['ok', 'error']),
+  adjustments: requestAdjustmentsSchema.optional(),
   inputTokens: count.optional(), cacheReadTokens: count.optional(), cacheWriteTokens: count.optional(), outputTokens: count.optional(),
   latencyMs: z.number().nonnegative().optional(), estimatedCostUsd: z.number().nonnegative().optional(), reportedCostUsd: z.number().nonnegative().optional() }).strict();
 const recordSchema = z.object({ at: count, backend: z.string().nullable(), event: eventSchema }).strict();
@@ -198,6 +199,10 @@ function merge(rows: Map<string, UsageRow>, value: UsageRow): void {
   const key = JSON.stringify([value.role, value.backend, value.backendModel]);
   const target = rows.get(key) ?? row(value.role, value.backend, value.backendModel);
   for (const field of [...fields, 'requests', 'errors', 'estimatedCostUsd'] as const) target[field] += value[field];
+  for (const name of REQUEST_ADJUSTMENTS) {
+    const count = value.adjustments?.[name];
+    if (count) (target.adjustments ??= {})[name] = (target.adjustments[name] ?? 0) + count;
+  }
   rows.set(key, target);
 }
 function eventRow(record: Record): UsageRow {
@@ -205,6 +210,7 @@ function eventRow(record: Record): UsageRow {
   value.requests = 1; value.errors = record.event.status === 'error' ? 1 : 0;
   for (const field of fields) value[field] = record.event[field] ?? 0;
   value.estimatedCostUsd = record.event.reportedCostUsd ?? record.event.estimatedCostUsd ?? 0;
+  if (record.event.adjustments) value.adjustments = { ...record.event.adjustments };
   return value;
 }
 
@@ -287,7 +293,8 @@ export class UsageStore {
     const now = this.now(); const day = Math.floor(now / DAY) * DAY;
     if (day === this.lastDay) return;
     const recent: Record[] = [];
-    const daily = new Map([...this.daily].map(([day, rows]) => [day, new Map([...rows].map(([key, value]) => [key, { ...value }]))]));
+    const daily = new Map([...this.daily].map(([day, rows]) => [day, new Map([...rows].map(([key, value]) => [key,
+      { ...value, ...(value.adjustments ? { adjustments: { ...value.adjustments } } : {}) }]))]));
     const through = new Map(this.dailyThrough);
     for (const record of this.records) {
       if (record.at >= now - 35 * DAY) recent.push(record);
@@ -341,6 +348,16 @@ export class UsageStore {
       for (const record of this.records) if (record.at >= window.since) merge(rows, eventRow(record));
       return { ...window, rows: [...rows.values()].slice(0, 512) };
     }) };
+  }
+  async adjustments(role: GatewayRole): Promise<RequestAdjustments> {
+    await this.queue;
+    const result: RequestAdjustments = { reasoning_effort_dropped: 0 };
+    const add = (value: { role: string; adjustments?: RequestAdjustments }) => {
+      if (value.role === role) for (const name of REQUEST_ADJUSTMENTS) result[name] = (result[name] ?? 0) + (value.adjustments?.[name] ?? 0);
+    };
+    for (const record of this.records) add(record.event);
+    for (const rows of this.daily.values()) for (const value of rows.values()) add(value);
+    return result;
   }
   async close(): Promise<void> { this.stopped = true; clearInterval(this.maintenance); await this.queue; }
 }

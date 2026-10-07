@@ -102,22 +102,18 @@ A card is `{ key, kind, title, detail?, action?, topic? }`:
 
 ### The pulse
 
-In the setup Wayroost was built for, Hermes cron jobs feed it:
+Hermes cron jobs with these names feed it:
 
-- **pulse-morning-brief** (7:00) and **pulse-scout** (the daytime checks).
-  Their scripts read today's calendar, unread mail that Gmail marks important
-  or primary (sign-in codes and password resets left out), the open-loops
-  list, and `/pulse/v1/preferences`. Every item in that data ends with its key.
-  The jobs run with no tools that act (`todo` and `no_mcp` only). The scout's
-  monitor wakes the model only when something actually changed. Each run
-  replies with a WhatsApp message (or `[SILENT]`), a line `---CARDS---`, and
-  the cards as JSON, and delivers it locally.
-- **pulse-relay**, a script-only job every 2 minutes, picks up those replies,
-  posts the cards to `/pulse/v1/cards`, and hands the message to Hermes to send
-  on WhatsApp. Nothing new means nothing is sent. It also ticks off the
-  open loops you marked **Done**. Its own state (`~/.hermes/pulse-relay-state.json`,
-  mode 600) holds which runs it has handled, and cards Wayroost couldn't take
-  yet, for up to 12 hours; its log has counts only.
+- **pulse-morning-brief** (once each morning) and **pulse-scout** (the daytime
+  checks) read the sources you choose and `/pulse/v1/preferences`. Every item in
+  the data they read ends with its key. Run them with no tools that act (`todo`
+  and `no_mcp` only), and have the scout wake the model only when something
+  changed. Each run replies with a message (or `[SILENT]`), a line
+  `---CARDS---`, and the cards as JSON, and delivers it locally.
+- **pulse-relay**, a script-only job every few minutes, picks up those replies,
+  posts the cards to `/pulse/v1/cards`, and hands any message to Hermes to
+  deliver. Nothing new means nothing is sent. Keep its own state private
+  (mode 600) and its log to counts only.
 
 The proactivity level finds the first two jobs by these names.
 

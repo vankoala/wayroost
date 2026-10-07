@@ -25,7 +25,7 @@ class FakeHelper implements SkillsHelperApi {
   calls: string[] = [];
   version = 1;
   shareVerdict: SkillScan['verdict'] = 'safe';
-  list: SkillInfo[] = [skill('review-agent', { shared: { state: 'source', updatedAt: 1 }, claude: { state: 'same', updatedAt: 1 } })];
+  list: SkillInfo[] = [skill('demo-review-skill', { shared: { state: 'source', updatedAt: 1 }, claude: { state: 'same', updatedAt: 1 } })];
   async skills(): Promise<Omit<SkillList, 'installs'>> {
     return { version: this.version, checkedAt: 1, skills: this.list, places: [], apps: [], events: [] };
   }
@@ -145,7 +145,7 @@ describe('Skills', () => {
     const { skills, hub, helper } = make();
     hub.verdict = 'dangerous';
     await expect(skills.install('skills-sh/acme/pdf-tools', true)).rejects.toThrow(/blocked/);
-    await expect(skills.install('official/x/review-agent', true)).rejects.toThrow(/already have a shared skill/);
+    await expect(skills.install('official/x/demo-review-skill', true)).rejects.toThrow(/already have a shared skill/);
     hub.verdict = 'safe';
     hub.policy = 'block';
     await expect(skills.install('skills-sh/acme/pdf-tools', true)).rejects.toThrow(/blocked/);
@@ -185,20 +185,20 @@ describe('app: /api/skills', () => {
 
     const list = await app.inject({ url: '/api/skills', headers: apiHeaders(token) });
     expect(list.statusCode).toBe(200);
-    expect(list.json().skills[0].name).toBe('review-agent');
+    expect(list.json().skills[0].name).toBe('demo-review-skill');
 
-    expect((await post('/api/skills/share', { place: 'hermes', name: 'review-agent' })).json().shared).toBe(true);
-    expect((await post('/api/skills/excluded', { name: 'review-agent', place: 'win-claude', excluded: true }, 'PUT')).statusCode).toBe(200);
-    expect((await post('/api/skills/take-shared', { place: 'claude', name: 'review-agent' })).statusCode).toBe(200);
-    expect((await post('/api/skills/remove', { name: 'review-agent' })).statusCode).toBe(200);
+    expect((await post('/api/skills/share', { place: 'hermes', name: 'demo-review-skill' })).json().shared).toBe(true);
+    expect((await post('/api/skills/excluded', { name: 'demo-review-skill', place: 'win-claude', excluded: true }, 'PUT')).statusCode).toBe(200);
+    expect((await post('/api/skills/take-shared', { place: 'claude', name: 'demo-review-skill' })).statusCode).toBe(200);
+    expect((await post('/api/skills/remove', { name: 'demo-review-skill' })).statusCode).toBe(200);
     expect(helper.calls).toEqual([
-      'share hermes review-agent false',
-      'excluded review-agent win-claude true',
-      'take claude review-agent',
-      'remove review-agent',
+      'share hermes demo-review-skill false',
+      'excluded demo-review-skill win-claude true',
+      'take claude demo-review-skill',
+      'remove demo-review-skill',
     ]);
 
-    const content = await app.inject({ url: '/api/skills/content?place=shared&name=review-agent', headers: apiHeaders(token) });
+    const content = await app.inject({ url: '/api/skills/content?place=shared&name=demo-review-skill', headers: apiHeaders(token) });
     expect(content.json().text).toContain('name: x');
     const search = await app.inject({ url: '/api/skills/market?q=pdf', headers: apiHeaders(token) });
     expect(search.json().results).toHaveLength(1);

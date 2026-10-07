@@ -1,11 +1,34 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigError, parseConfig, ROLE_PORTS } from '../src/config.js';
 import { demoMap } from './map-fixture.js';
+import { roleAcceptsReasoningEffort } from '../../shared/gateway.js';
 
  describe('gateway role maps', () => {
   it('uses stable ports without binding and parses profile rows', () => {
     expect(ROLE_PORTS).toEqual({ main: 18010, coder: 18011, fast: 18012 });
     expect(parseConfig(demoMap())).toEqual(demoMap());
+  });
+  it('defaults omitted reasoning-effort acceptance to false and rejects non-booleans', () => {
+    const map = demoMap();
+    const { acceptsReasoningEffort, ...legacy } = map.backends['demo-a']!;
+    expect(parseConfig({ ...map, backends: { ...map.backends, 'demo-a': legacy } }).backends['demo-a']!.acceptsReasoningEffort).toBe(false);
+    for (const value of [null, 1, 'true']) {
+      expect(() => parseConfig({ ...map, backends: { ...map.backends, 'demo-a': { ...legacy, acceptsReasoningEffort: value } } })).toThrow(ConfigError);
+    }
+  });
+  it('intersects profile and current reasoning-effort acceptance independently for each role', () => {
+    const map = demoMap(); map.backends['demo-a']!.acceptsReasoningEffort = true;
+    expect(roleAcceptsReasoningEffort(map, 'main')).toBe(false);
+    expect(roleAcceptsReasoningEffort(map, 'coder')).toBe(true);
+    map.backends['demo-b']!.acceptsReasoningEffort = true;
+    expect(roleAcceptsReasoningEffort(map, 'main')).toBe(true);
+    expect(map.contracts.main.thinkingLevels).toBe(false);
+    map.backends['demo-override'] = { ...map.backends['demo-a']!, acceptsReasoningEffort: false };
+    map.roles.main = 'demo-override';
+    expect(roleAcceptsReasoningEffort(map, 'main')).toBe(false);
+    map.roles.fast = null;
+    for (const mapping of Object.values(map.profiles)) mapping.fast = null;
+    expect(roleAcceptsReasoningEffort(map, 'fast')).toBe(false);
   });
   it('requires only named credentials and canonicalizes backend URLs', () => {
     const map = demoMap();

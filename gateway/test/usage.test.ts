@@ -90,6 +90,16 @@ describe('bounded usage capture', () => {
     expect(usageEvent({ role: 'main', backendModel: 'demo', status: 'ok', inputTokens: 100 }, { inputPerMillionUsd: 2 }).estimatedCostUsd).toBe(0.0002);
     expect(usageEvent({ role: 'main', backendModel: 'demo', status: 'error' }, { inputPerMillionUsd: 2 })).not.toHaveProperty('inputTokens');
   });
+  it('copies only named positive adjustment counts, on successes and failures', () => {
+    for (const status of ['ok', 'error'] as const) {
+      const event = usageEvent({ role: 'main', backendModel: 'demo', status,
+        adjustments: { reasoning_effort_dropped: 1, content: 'Example text.' } as { reasoning_effort_dropped: number } });
+      expect(event.adjustments).toEqual({ reasoning_effort_dropped: 1 });
+    }
+    for (const count of [0, -1, 0.5, NaN, Infinity]) {
+      expect(usageEvent({ role: 'main', backendModel: 'demo', status: 'ok', adjustments: { reasoning_effort_dropped: count } }).adjustments).toBeUndefined();
+    }
+  });
 });
 
 describe('usage retention and summaries', () => {
@@ -110,6 +120,21 @@ describe('usage retention and summaries', () => {
     expect(summary).toMatchObject({ ok: true, windows: [{ rows: [{ requests: 2, errors: 1, inputTokens: 100, outputTokens: 50, estimatedCostUsd: 0.0004 }] }] });
     const raw = (await readFile(join(path, 'usage.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
     expect(raw[1].event).not.toHaveProperty('inputTokens');
+  });
+  it('retains named adjustment totals through compaction, summaries and restart without duplicating them', async () => {
+    const day = 86400000; let now = 100 * day;
+    store = await UsageStore.open(directory, () => now);
+    for (const status of ['ok', 'error'] as const) {
+      await store.record('demo-a', usageEvent({ role: 'main', backendModel: 'demo', status, adjustments: { reasoning_effort_dropped: 1 } }));
+    }
+    now += 40 * day;
+    await store.record('demo-a', usageEvent({ role: 'main', backendModel: 'demo', status: 'ok', adjustments: { reasoning_effort_dropped: 1 } }));
+    await store.close(); store = await UsageStore.open(directory, () => now);
+    for (let index = 0; index < 2; index++) {
+      expect(await store.adjustments('main')).toEqual({ reasoning_effort_dropped: 3 });
+      expect(await store.adjustments('coder')).toEqual({ reasoning_effort_dropped: 0 });
+      expect(await store.summary({ windows: [{ id: 'week', since: 0 }] })).toMatchObject({ windows: [{ rows: [{ requests: 3, errors: 1, adjustments: { reasoning_effort_dropped: 3 } }] }] });
+    }
   });
   it.each(['{"at":', '{"at":123,"event":{"backendModel":"🦆'])('recovers a torn final usage append and continues recording %#', async tail => {
     const first = { at: Date.now(), backend: 'demo-a', event: { role: 'main', backendModel: 'demo', status: 'ok', inputTokens: 3 } };

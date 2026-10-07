@@ -2743,13 +2743,13 @@ try {
       await page.waitForSelector('.toast:has-text("Put the shared notes-to-report back")');
       // All skills: the Hermes-made one shares only after a second look at its scan.
       await page.locator('.skills-filters .skills-chip', { hasText: 'All' }).click();
-      const planner = page.locator('.skill-row', { hasText: 'meal-planner' });
+      const planner = page.locator('.skill-row', { hasText: 'demo-meal-skill' });
       await planner.locator('.skill-head').click();
       await planner.locator('button', { hasText: 'Share with every app' }).click();
       await planner.locator('.skill-scan').waitFor();
       if (!(await planner.innerText()).includes('Fetches a URL with curl')) problems.push('skills: scan findings not shown');
       await planner.locator('button', { hasText: 'Share anyway' }).click();
-      await page.waitForSelector('.toast:has-text("meal-planner is now shared")');
+      await page.waitForSelector('.toast:has-text("demo-meal-skill is now shared")');
       // Windows Claude Code is switched off for project-helper; the switch says so, and turns back on.
       const paseoRow = page.locator('.skill-row', { hasText: 'Reference for organising projects' });
       await paseoRow.locator('.skill-head').click();
@@ -2777,7 +2777,7 @@ try {
       const news = page.locator('.skills-news');
       await news.waitFor();
       const text = await news.innerText();
-      if (!text.includes('meal-planner') || !text.includes('Windows .agents')) problems.push('skills: events missing');
+      if (!text.includes('demo-meal-skill') || !text.includes('Windows .agents')) problems.push('skills: events missing');
     },
   });
 

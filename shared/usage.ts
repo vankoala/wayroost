@@ -1,6 +1,11 @@
 // Metadata-only usage events for model requests. The prompt and completion of
 // a request are never part of a usage event, so events can be stored and
 // forwarded without any message content.
+import { z } from 'zod';
+
+export const REQUEST_ADJUSTMENTS = ['reasoning_effort_dropped'] as const;
+export const requestAdjustmentsSchema = z.object({ reasoning_effort_dropped: z.number().int().nonnegative().optional() }).strict();
+export type RequestAdjustments = z.infer<typeof requestAdjustmentsSchema>;
 
 /** Per-million-token prices, in USD. */
 export type ModelPrice = {
@@ -25,6 +30,8 @@ export type UsageEventInput = {
   outputTokens?: number;
   latencyMs?: number;
   status: 'ok' | 'error';
+  /** Named request changes made before forwarding, counted independently of success. */
+  adjustments?: RequestAdjustments;
   /** Cost in USD as the provider reported it; it wins over any estimate. */
   reportedCostUsd?: number;
 };
@@ -38,6 +45,7 @@ export type UsageEvent = {
   outputTokens?: number;
   latencyMs?: number;
   status: 'ok' | 'error';
+  adjustments?: RequestAdjustments;
   estimatedCostUsd?: number;
   reportedCostUsd?: number;
 };
@@ -59,6 +67,10 @@ export function usageEvent(input: UsageEventInput, price?: ModelPrice): UsageEve
   const event: UsageEvent = { role: input.role, backendModel: input.backendModel, status: input.status };
   for (const field of COUNT_FIELDS) {
     if (finiteNumber(input[field])) event[field] = input[field];
+  }
+  for (const name of REQUEST_ADJUSTMENTS) {
+    const count = input.adjustments?.[name];
+    if (typeof count === 'number' && Number.isSafeInteger(count) && count > 0) (event.adjustments ??= {})[name] = count;
   }
   if (input.status === 'ok' && finiteNumber(input.reportedCostUsd)) event.reportedCostUsd = input.reportedCostUsd;
   if (input.status === 'ok' && price && event.reportedCostUsd === undefined) {

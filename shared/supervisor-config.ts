@@ -14,6 +14,7 @@ import {
 } from './settings.js';
 import { DEVICE_KINDS } from './protocol.js';
 import { GATEWAY_ROLES, backendIdSchema, credentialNameSchema, gatewayCredentialTestResultSchema } from './gateway.js';
+import { requestAdjustmentsSchema } from './usage.js';
 
 export const CONFIG_VERBS = ['config.read', 'config.request-status', 'config.apply', 'config.undo', 'credential.write', 'credential.test', 'service.drain-restart', 'service.drain-status', 'project.scan', 'checks.observe', 'usage.summary'] as const;
 /** Credential probes are authenticated reads and never reserve a writable target. */
@@ -445,6 +446,7 @@ export const usageRowSchema = z.object({
   backendModel: z.string().max(256),
   requests: count,
   errors: count,
+  adjustments: requestAdjustmentsSchema.optional(),
   inputTokens: count,
   cacheReadTokens: count,
   cacheWriteTokens: count,

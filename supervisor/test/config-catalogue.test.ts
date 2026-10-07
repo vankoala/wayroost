@@ -54,7 +54,7 @@ function mapFixture(): RoleMap {
     advertisedContext: 65536 * (index + 1), maxOutputTokens: 4096 * (index + 1),
   }]));
   const backend = { baseUrl: 'http://127.0.0.1:19041/v1', servedName: 'demo-model', listenerUid: uid,
-    contextLength: 262144, maxOutputTokens: 16384, input: ['text', 'image'], toolCalling: true, thinkingLevels: true };
+    contextLength: 200000, maxOutputTokens: 16384, input: ['text', 'image'], toolCalling: true, thinkingLevels: true };
   return roleMapSchema.parse({ version: 2, contracts, backends: { 'demo-a': backend, 'demo-b': { ...backend, servedName: 'next-model' } },
     profiles: { 'demo/engine': { main: 'demo-a', coder: 'demo-a', fast: 'demo-a' } }, roles: { main: 'demo-a', coder: 'demo-a', fast: 'demo-a' } });
 }

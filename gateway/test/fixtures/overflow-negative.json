@@ -4,8 +4,8 @@
   {"error":{"code":400,"message":"Invalid input","input":"context_length_exceeded"}},
   {"error":{"type":"BadRequestError","message":"Invalid messages: The input (70000 tokens) is longer than the model's context length (65536 tokens)."}},
   {"error":{"type":"invalid_request_error","message":"prompt exceeds the image sequence length"}},
-  {"error":{"type":"BadRequestError","message":"Invalid messages: Requested token count exceeds the model's maximum context length of 524288 tokens."}},
-  {"error":{"type":"BadRequestError","message":"Invalid input","input":"Requested token count exceeds the model's maximum context length of 524288 tokens."}},
+  {"error":{"type":"BadRequestError","message":"Invalid messages: Requested token count exceeds the model's maximum context length of 65536 tokens."}},
+  {"error":{"type":"BadRequestError","message":"Invalid input","input":"Requested token count exceeds the model's maximum context length of 65536 tokens."}},
   {"error":{"type":"BadRequestError","message":"Requested token count exceeds the model's maximum context length of unknown tokens."}},
-  {"error":{"type":"BadRequestError","message":"Requested token count exceeds the model's maximum context length of 524288 tokens per message is not a valid field value."}}
+  {"error":{"type":"BadRequestError","message":"Requested token count exceeds the model's maximum context length of 65536 tokens per message is not a valid field value."}}
 ]

@@ -8,7 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { startGateway, type GatewayOptions, type LogEntry } from '../src/gateway.js';
 import { demoMap } from './map-fixture.js';
 import { directoryMetadata } from './filesystem-fixture.js';
-import type { RoleMap } from '../../shared/gateway.js';
+import { gatewayAdminStatusSchema, type RoleMap } from '../../shared/gateway.js';
+import { usageSummaryResultSchema } from '../../shared/supervisor-config.js';
 import type { UsageEvent } from '../../shared/usage.js';
 
 const fake = vi.hoisted(() => ({ servers: [] as unknown[], calls: [] as Array<{ url: URL; options: Record<string, unknown>; body: Buffer }>,
@@ -221,16 +222,16 @@ type FakeServer = Server & { port: number; unix: boolean; addressValue: unknown 
     await start();
     const body = { model: 'main', messages: [{ role: 'tool', content: 'fake tool result' }], tools: [{ type: 'function', function: { name: 'demo' } }], stream_options: { include_usage: true } };
     const response = await send(undefined, body); expect(response.statusCode).toBe(200);
-    expect(JSON.parse(fake.calls[0]!.body.toString())).toEqual({ ...body, model: 'demo-model-a', max_tokens: 4096 });
+    expect(JSON.parse(fake.calls[0]!.body.toString())).toEqual({ ...body, model: 'demo-model-a' });
     expect(response.headers.connection).toBe('close');
     const models = async () => JSON.parse((await send('/v1/models', undefined, { method: 'GET' })).body).data[0];
-    expect(await models()).toMatchObject({ context_length: 262144, max_model_len: 262144 });
+    expect(await models()).toMatchObject({ context_length: 200000, max_model_len: 200000 });
     expect((await send('/v1/roles/main', { backend: 'demo-b' }, { admin: true, method: 'PUT' })).statusCode).toBe(200);
     expect(await models()).toMatchObject({ context_length: 65536, max_model_len: 65536 });
     await gateway.close(); fake.servers = []; await start();
     expect(await models()).toMatchObject({ context_length: 65536 });
     await send('/v1/roles/main', { backend: 'demo-a' }, { admin: true, method: 'PUT' });
-    expect(await models()).toMatchObject({ context_length: 262144 });
+    expect(await models()).toMatchObject({ context_length: 200000 });
   });
   it('atomically selects a complete profile row and reports newly unmapped roles', async () => {
     await start();
@@ -243,7 +244,7 @@ type FakeServer = Server & { port: number; unix: boolean; addressValue: unknown 
     const status = JSON.parse((await send('/v1/status', undefined, { admin: true, method: 'GET' })).body);
     expect(status.roles.coder.health).toBe('unmapped'); expect(status.roles.fast.health).toBe('unmapped');
   });
-  it.each(['llamacpp', 'sglang', 'vllm', 'sglang-total'])('normalizes %s overflow using the mapped real limit', async engine => {
+  it.each(['llamacpp', 'sglang', 'vllm', 'sglang-total', 'sglang-total-full'])('normalizes %s overflow using the mapped real limit', async engine => {
     await start(); await send('/v1/roles/main', { backend: 'demo-b' }, { admin: true, method: 'PUT' });
     const fixture = await fs.readFile(join(process.cwd(), `gateway/test/fixtures/${engine}-overflow.json`));
     fake.reply = stream => { Object.assign(stream, { statusCode: 400 }); stream.end(fixture); };
@@ -290,11 +291,11 @@ type FakeServer = Server & { port: number; unix: boolean; addressValue: unknown 
       stream.end(`data: ${fixture.trim()}\n\n`);
     };
     const response = await send(); expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error.message).toBe("This model's maximum context length is 262144 tokens");
+    expect(JSON.parse(response.body).error.message).toBe("This model's maximum context length is 200000 tokens");
   });
-  it('normalizes SGLang total-token overflow from an HTTP-200 SSE error before sending response headers', async () => {
+  it.each(['sglang-total', 'sglang-total-full'])('normalizes %s overflow from an HTTP-200 SSE error before sending response headers', async engine => {
     await start(); await send('/v1/roles/main', { backend: 'demo-b' }, { admin: true, method: 'PUT' });
-    const fixture = await fs.readFile('gateway/test/fixtures/sglang-total-overflow.sse');
+    const fixture = await fs.readFile(`gateway/test/fixtures/${engine}-overflow.sse`);
     fake.reply = stream => {
       Object.assign(stream, { headers: { 'content-type': 'text/event-stream' } });
       stream.end(fixture);
@@ -321,7 +322,7 @@ type FakeServer = Server & { port: number; unix: boolean; addressValue: unknown 
     const response = await send();
     expect(response.statusCode).toBe(400); expect(response.headers['content-type']).toBe('application/json');
     expect(JSON.parse(response.body).error).toMatchObject({ code: 'context_length_exceeded',
-      message: "This model's maximum context length is 262144 tokens" });
+      message: "This model's maximum context length is 200000 tokens" });
   });
   it('preserves SSE preambles and later overflows after a non-overflow first data event', async () => {
     await start();
@@ -404,7 +405,7 @@ type FakeServer = Server & { port: number; unix: boolean; addressValue: unknown 
   it.each(['main', 'coder', 'fast'] as const)('reports context and rewrites the %s role', async role => {
     await start({ ports: { [role]: 8898 } });
     const models = await send('/v1/models', undefined, { method: 'GET' });
-    expect(JSON.parse(models.body).data[0]).toMatchObject({ id: role, context_length: 262144 });
+    expect(JSON.parse(models.body).data[0]).toMatchObject({ id: role, context_length: 200000 });
     expect((await send(undefined, { model: role })).statusCode).toBe(200);
     expect(JSON.parse(fake.calls[0]!.body.toString()).model).toBe('demo-model-a');
   });
@@ -416,7 +417,8 @@ type FakeServer = Server & { port: number; unix: boolean; addressValue: unknown 
   });
   it.each([
     { messages: [{ content: [{ type: 'image_url', image_url: { url: 'https://example.com/fake.png' } }] }] },
-    { reasoning_effort: 'high' }, { max_tokens: 0 }, { max_completion_tokens: '4096' }, { max_output_tokens: -1 }, { model: 'coder' },
+    { thinking_level: 'high' }, { thinkingLevel: 'high' }, { reasoning: { effort: 'high' } },
+    { max_tokens: 0 }, { max_completion_tokens: '4096' }, { max_output_tokens: -1 }, { model: 'coder' },
   ])('checks the request contract before forwarding %#', async override => {
     await start(); expect((await send(undefined, { model: 'main', ...override })).statusCode).toBe(400); expect(fake.calls).toHaveLength(0);
   });
@@ -425,18 +427,18 @@ type FakeServer = Server & { port: number; unix: boolean; addressValue: unknown 
     for (const backend of Object.values(map.backends)) backend.maxOutputTokens = 32768;
     await start({}, map);
     const response = await send(undefined, { model: 'main', max_tokens: 1, n_predict: nPredict });
-    expect(response.statusCode).toBe(400); expect(response.body).toContain('8192 tokens'); expect(fake.calls).toHaveLength(0);
+    expect(response.statusCode).toBe(400); expect(response.body).toContain('32768 tokens'); expect(fake.calls).toHaveLength(0);
   });
   it.each([
-    ['/v1/chat/completions', 'max_tokens'], ['/v1/completions', 'max_tokens'], ['/v1/responses', 'max_output_tokens'],
-  ])('caps omitted output limits on %s independently of backend defaults', async (path, field) => {
+    '/v1/chat/completions', '/v1/completions', '/v1/responses', '/v1/embeddings',
+  ])('leaves omitted output limits absent on %s', async path => {
     const map = demoMap(); map.backends['demo-a']!.maxOutputTokens = 32768;
     await start({}, map);
     expect((await send(path, { model: 'main' })).statusCode).toBe(200);
-    expect(JSON.parse(fake.calls[0]!.body.toString())).toEqual({ model: 'demo-model-a', [field]: 4096 });
+    expect(JSON.parse(fake.calls[0]!.body.toString())).toEqual({ model: 'demo-model-a' });
   });
   it.each([
-    { n_predict: 4096 }, { max_completion_tokens: 4096 }, { max_output_tokens: 4096 },
+    { n_predict: 4096 }, { max_tokens: 4096 }, { max_completion_tokens: 4096 }, { max_output_tokens: 4096 },
     { max_tokens: 4, n_predict: 12 }, { max_tokens: 12, n_predict: 4 },
     { max_tokens: 12, max_completion_tokens: 8, max_output_tokens: 6, n_predict: 4 },
   ])('preserves supplied output fields and limits independently %#', async limits => {
@@ -446,11 +448,65 @@ type FakeServer = Server & { port: number; unix: boolean; addressValue: unknown 
       expect(JSON.parse(fake.calls.at(-1)!.body.toString())).toEqual({ model: 'demo-model-a', ...limits });
     }
   });
-  it.each(['max_tokens', 'max_completion_tokens', 'max_output_tokens', 'n_predict'])('lowers only the supplied %s value above the contract cap', async field => {
+  it.each(['max_tokens', 'max_completion_tokens', 'max_output_tokens', 'n_predict'])('lowers only the supplied %s value above the backend cap', async field => {
     await start();
     const limits = { [field]: 8192, ...(field !== 'max_tokens' ? { max_tokens: 4 } : { max_completion_tokens: 4 }) };
     expect((await send(undefined, { model: 'main', ...limits })).statusCode).toBe(200);
     expect(JSON.parse(fake.calls.at(-1)!.body.toString())).toEqual({ model: 'demo-model-a', ...limits, [field]: 4096 });
+  });
+  it.each(['max_tokens', 'max_completion_tokens'])('uses the serving backend cap for %s when it exceeds the catalog cap', async field => {
+    const map = demoMap(); map.backends['demo-a']!.maxOutputTokens = 32768;
+    await start({}, map);
+    for (const value of [8192, 65536]) {
+      expect((await send(undefined, { model: 'main', [field]: value })).statusCode).toBe(200);
+      expect(JSON.parse(fake.calls.at(-1)!.body.toString())).toEqual({ model: 'demo-model-a', [field]: Math.min(value, 32768) });
+    }
+  });
+  it.each(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])('forwards reasoning_effort=%s without advertising thinking levels', async effort => {
+    const map = demoMap(); for (const backend of Object.values(map.backends)) backend.acceptsReasoningEffort = true;
+    await start({}, map);
+    const body = { model: 'main', messages: [{ role: 'user', content: 'Reply OK.' }], reasoning_effort: effort, stream: false,
+      tools: [{ type: 'function', function: { name: 'example', parameters: { type: 'object' } } }], temperature: 0.7 };
+    expect((await send(undefined, body)).statusCode).toBe(200);
+    expect(JSON.parse(fake.calls[0]!.body.toString())).toEqual({ ...body, model: 'demo-model-a' });
+    await flush(); expect(events[0]?.adjustments).toBeUndefined();
+    const status = gatewayAdminStatusSchema.parse(JSON.parse((await send('/v1/status', undefined, { admin: true, method: 'GET' })).body));
+    expect(status.roles.main).toMatchObject({ acceptsReasoningEffort: true, contract: { thinkingLevels: false }, adjustments: { reasoning_effort_dropped: 0 } });
+  });
+  it.each(['none', 'medium'])('drops reasoning_effort=%s when any profile backend lacks acceptance, counting it in status and usage', async effort => {
+    const map = demoMap(); map.backends['demo-a']!.acceptsReasoningEffort = true;
+    await start({}, map);
+    const body = { model: 'main', messages: [{ role: 'user', content: 'Reply OK.' }], reasoning_effort: effort, stream: false };
+    for (let index = 0; index < 2; index++) {
+      expect((await send(undefined, body)).statusCode).toBe(200);
+      const { reasoning_effort, ...expected } = body;
+      expect(JSON.parse(fake.calls.at(-1)!.body.toString())).toEqual({ ...expected, model: 'demo-model-a' });
+    }
+    await flush(); expect(events).toHaveLength(2);
+    for (const event of events) expect(event).toMatchObject({ status: 'ok', inputTokens: 20, adjustments: { reasoning_effort_dropped: 1 } });
+    const status = gatewayAdminStatusSchema.parse(JSON.parse((await send('/v1/status', undefined, { admin: true, method: 'GET' })).body));
+    expect(status.roles.main).toMatchObject({ acceptsReasoningEffort: false, adjustments: { reasoning_effort_dropped: 2 } });
+    expect(status.roles.coder).toMatchObject({ acceptsReasoningEffort: true, adjustments: { reasoning_effort_dropped: 0 } });
+    const result = usageSummaryResultSchema.parse(await summary());
+    expect(result).toMatchObject({ windows: [{ rows: [{ adjustments: { reasoning_effort_dropped: 2 } }] }] });
+  });
+  it('counts dropped reasoning effort on failed inference and retains it after restarting', async () => {
+    await start(); fake.reply = stream => { Object.assign(stream, { statusCode: 400 }); stream.end('{}'); };
+    expect((await send(undefined, { model: 'main', reasoning_effort: 'none' })).statusCode).toBe(400);
+    await flush(); expect(events[0]).toMatchObject({ status: 'error', adjustments: { reasoning_effort_dropped: 1 } });
+    await gateway!.close(); fake.servers = []; await start();
+    const status = JSON.parse((await send('/v1/status', undefined, { admin: true, method: 'GET' })).body);
+    expect(status.roles.main.adjustments).toEqual({ reasoning_effort_dropped: 1 });
+    expect(await summary()).toMatchObject({ windows: [{ rows: [{ requests: 1, errors: 1, adjustments: { reasoning_effort_dropped: 1 } }] }] });
+  });
+  it.each([true, false])('refuses malformed reasoning effort before forwarding or dropping (acceptance=%s)', async accepts => {
+    const map = demoMap(); for (const backend of Object.values(map.backends)) backend.acceptsReasoningEffort = accepts;
+    await start({}, map);
+    for (const value of [null, true, false, 1, [], {}, '', 'unknown', 'MEDIUM', ' medium ', 'ultra']) {
+      expect((await send(undefined, { model: 'main', reasoning_effort: value })).statusCode).toBe(400);
+    }
+    expect(fake.calls).toHaveLength(0); await flush();
+    for (const event of events) expect(event.adjustments).toBeUndefined();
   });
   it('preserves max_completion_tokens for a backend that rejects max_tokens', async () => {
     await start();

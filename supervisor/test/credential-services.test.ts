@@ -62,7 +62,7 @@ async function fixture() {
   for (const path of [credentials, dirname(dropIn), join(root, 'locks'), join(root, 'backups'), join(owner, '.pi/agent'), join(owner, 'drain'), join(owner, 'hermes')]) await mkdir(path, { recursive: true, mode: 0o700 });
   rootOwned.push(credentials, dirname(dropIn), join(root, 'locks'), join(root, 'backups'));
   const map: RoleMap = { version: 2, contracts: Object.fromEntries(['main', 'coder', 'fast'].map(role => [role, { input: ['text'], toolCalling: false, thinkingLevels: false, maxOutputTokens: 1024, advertisedContext: 4096 }])) as RoleMap['contracts'],
-    backends: { example: { provider: 'example', baseUrl: 'https://example.com/v1', servedName: 'example-model', contextLength: 4096, maxOutputTokens: 1024, input: ['text'], toolCalling: false, thinkingLevels: false } },
+    backends: { example: { provider: 'example', baseUrl: 'https://example.com/v1', servedName: 'example-model', contextLength: 4096, maxOutputTokens: 1024, input: ['text'], toolCalling: false, thinkingLevels: false, acceptsReasoningEffort: false } },
     profiles: {}, roles: { main: 'example', coder: null, fast: null } };
   const mapPath = join(root, 'role-map.json'); await writeFile(mapPath, JSON.stringify(map), { mode: 0o600 });
   await writeFile(pi, JSON.stringify({ providers: { 'local-example': { apiKey: secret, models: [] } } }), { mode: 0o600 });

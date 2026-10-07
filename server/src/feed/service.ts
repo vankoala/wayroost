@@ -21,7 +21,7 @@ import type { FeedRouting, Notifications } from '../notifications/service.js';
 import { shadowBackground, type BackgroundGate } from '../background.js';
 import type { Devices } from '../devices.js';
 
-// For you: Hermes' pulse (the 7am brief and the daytime checks) posts cards
+// For you: Hermes' pulse (the morning brief and the daytime checks) posts cards
 // through the bridge listener; you act on them here. "Do it" starts a Hermes
 // chat with the card's request, "Not now" hides it for a few hours, "Less like
 // this" turns the topic down for future runs. Phone notifications go out for

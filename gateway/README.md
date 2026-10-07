@@ -63,16 +63,36 @@ backends require HTTPS. URLs cannot carry user info, queries or fragments.
 
 The packaged `example/vllm` profile uses invented served names and backend ports.
 Each example role admits text and tools, has no thinking-level map, advertises a
-32,768-token context and caps output at 4,096 tokens. Set served names, listener
+32,768-token context and a 4,096-token catalog output cap. Set served names, listener
 owners, capabilities and limits in the local map to match the engine configuration.
 All profile rows and admin repoints must fit their role contracts. Requests exceeding a
 contract's capabilities receive 400 before forwarding. Generation
 limits (`max_tokens`, `max_completion_tokens`, `max_output_tokens`, `n_predict`)
 must be positive integers. Each supplied field is preserved, with values above
-the role's output cap lowered to that cap. When no limit is supplied, the gateway
-adds the cap as `max_tokens` for completions and chat or `max_output_tokens` for
-Responses. Embeddings have no default generation limit. Image contract checks
+the serving backend's `maxOutputTokens` lowered to that cap. When no limit is
+supplied, the gateway forwards without one so the engine can size output to the
+remaining context, as for a direct request. Image contract checks
 inspect only `image_url` and `input_image` parts in input message content.
+
+`thinkingLevels` controls the catalog's selectable thinking levels. Each backend
+separately declares `acceptsReasoningEffort` (boolean, default `false`), meaning
+its engine accepts top-level `reasoning_effort`, including `none`. The gateway
+intersects this flag across all non-null backends assigned to a role in profile
+rows and its current mapping, including a manual override. If all accept it,
+the field is forwarded unchanged even with `thinkingLevels: false`. Otherwise,
+the field is removed and counted as `reasoning_effort_dropped` in usage events,
+usage summaries and private status. Malformed values receive 400 before either
+forwarding or dropping; accepted string values are `none`, `minimal`, `low`,
+`medium`, `high`, `xhigh` and `max`. Other thinking-level fields still follow
+`thinkingLevels`. Omitting `reasoning_effort` adds no field or adjustment.
+
+Acceptance is engine and template dependent: SGLang passes effort to its template
+and defaults thinking switches from it; llama.cpp disables thinking for `none`
+and may expose other values to its template. A proxy that passes the field on
+inherits its upstream engine's acceptance. The example vLLM backends explicitly
+use `false`: versions whose schema accepts only `low`, `medium` and `high` reject
+`none`. Confirm the complete vocabulary against the installed engine before
+setting a backend's flag to `true`.
 
 The gateway pins config, admin and credential directory identities and uses
 Linux `/proc/self/fd` handles for file operations. Symlinks and directories or
@@ -104,8 +124,10 @@ the backend. Redirects are returned without following them.
   from its current backend. No backend probe is made.
 - `GET /health`: a credentialed backend model probe, returning JSON 200/503.
 - `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses`:
-  JSON with the matching role alias. Only `model` is rewritten. Tool definitions,
-  messages and provider extensions remain unchanged. SSE flows with backpressure.
+  JSON with the matching role alias. The role is rewritten to the served model;
+  supplied output limits are clamped and unsupported `reasoning_effort` is
+  removed with an adjustment count. Tool definitions, messages and other
+  provider extensions remain unchanged. SSE flows with backpressure.
 
 Unmapped inference resets as soon as its HTTP headers identify the route, before
 reading its body. Health remains available on those listeners. A mapped backend
@@ -135,7 +157,8 @@ Only the private Unix socket exposes admin operations:
 
 - `GET /healthz`: event-loop health even when all roles are unmapped.
 - `GET /v1/status`: each role's backend ID, model, contract, real context,
-  backend health, loopback backend port, in-flight requests and open consumer
+  backend health, loopback backend port, effective `acceptsReasoningEffort`,
+  persistent named adjustment counts, in-flight requests and open consumer
   connections. Backend URLs and credential references are omitted. An unexpected
   backend owner appears as `owner_mismatch`.
 - `POST /v1/credentials/<provider>/test`: one fixed, one-token request to the named
@@ -178,6 +201,8 @@ Private `usage.jsonl` retains raw metadata for 35 days, after which
 `usage.daily.jsonl` keeps daily totals. Serialized daily maintenance also enforces
 retention while idle. Startup discards an incomplete final raw record, preserving
 complete records. Summaries group by role and backend/model.
+Adjustment counts include failed requests and survive restart and daily
+compaction. Private status totals cover all retained usage for each role.
 CLI logs contain fixed route categories, status and timing, never content,
 headers, URLs, credential paths or underlying exception messages.
 
@@ -185,6 +210,7 @@ headers, URLs, credential paths or underlying exception messages.
 npm run -s typecheck
 npx vitest run gateway/test
 npx vitest run
+node gateway/test/parity-probe.mjs
 ```
 
 The `gateway-systemd` CI job runs under sudo on a hosted Ubuntu runner. It
@@ -195,3 +221,10 @@ three-second metadata deadline, and checks that a foreign backend UID receives
 no request bytes. The harness requires `CI=true` and root and is not a local
 smoke test. `cli-smoke.ts` is an optional development-port check for environments
 that allow sockets.
+
+`parity-probe.mjs` builds the gateway entry and starts it with a recording stub
+backend and temporary private state inside this clone. It checks ports before
+binding and uses only loopback ports 28000–28999. Both forwarding and dropping
+cases send a request with top-level `reasoning_effort` and no output limit,
+compare the recorded request in full, and check status and usage adjustment
+counts. All child processes, listeners and temporary files are removed on exit.

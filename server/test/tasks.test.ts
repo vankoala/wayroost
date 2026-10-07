@@ -80,7 +80,7 @@ function started(sid: string, command: string, at: number): HermesMessageRow[] {
   ];
 }
 
-/** The manager playbook's launch: `paseo run -d …` in the foreground, which prints the new worker's id. */
+/** A foreground detached launch, `paseo run -d …`, which prints the new worker's id. */
 function launch(id: string, at: number, command = `paseo run -d --provider pi --cwd ~/code/app --title "Fix" --label ${DUE_LABEL}=30 "Fix it"`) {
   const callId = `call-run-${++rowId}`;
   return [call(callId, 'terminal', { command }, at), result(callId, { output: runTable(id, 'running'), exit_code: 0, error: null }, at + 2 * SEC)];

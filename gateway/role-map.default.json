@@ -33,6 +33,7 @@
     "example-main": {
       "baseUrl": "http://127.0.0.1:19041/v1",
       "servedName": "example-main-model",
+      "acceptsReasoningEffort": false,
       "contextLength": 32768,
       "maxOutputTokens": 4096,
       "input": [
@@ -45,6 +46,7 @@
     "example-coder": {
       "baseUrl": "http://127.0.0.1:19042/v1",
       "servedName": "example-coder-model",
+      "acceptsReasoningEffort": false,
       "contextLength": 32768,
       "maxOutputTokens": 4096,
       "input": [
@@ -57,6 +59,7 @@
     "example-fast": {
       "baseUrl": "http://127.0.0.1:19043/v1",
       "servedName": "example-fast-model",
+      "acceptsReasoningEffort": false,
       "contextLength": 32768,
       "maxOutputTokens": 4096,
       "input": [

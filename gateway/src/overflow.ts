@@ -30,7 +30,7 @@ export function isContextOverflow(body: string, sse = false): boolean {
   }
   return fields.type === 'BadRequestError' && [
     /^The input \(\d+ tokens\) is longer than the model's context length \(\d+ tokens\)\.$/,
-    /^Requested token count exceeds the model's maximum context length of \d+ tokens\. You requested a total of \d+ tokens: \d+ tokens from the input messages and \d+ tokens for the completion\.$/,
+    /^Requested token count exceeds the model's maximum context length of \d+ tokens\. You requested a total of \d+ tokens: \d+ tokens from the input messages and \d+ tokens for the completion\.(?: Please reduce the number of tokens in the input messages or the completion to fit within the limit\.)?$/,
     /^This model's maximum context length is \d+ tokens\. However, your request has \d+ input tokens\. Please reduce the length of the input messages\.$/,
   ].some(pattern => pattern.test(message));
 }

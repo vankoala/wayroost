@@ -9,7 +9,7 @@ import { Readable } from 'node:stream';
 import { ConfigError, ConfigStore, readCredential, ROLE_PORTS, ROLES, type Backend,
   type Role } from './config.js';
 import { TrustedDirectory } from './directory.js';
-import { gatewayCredentialTestBodySchema, gatewayRepointBodySchema, isLoopbackUrl, type RoleContract } from '../../shared/gateway.js';
+import { gatewayCredentialTestBodySchema, gatewayRepointBodySchema, isLoopbackUrl, roleAcceptsReasoningEffort, type RoleContract } from '../../shared/gateway.js';
 import { usageEvent, type UsageEvent, type UsageEventInput } from '../../shared/usage.js';
 import { usageSummaryRequestSchema } from '../../shared/supervisor-config.js';
 import { inheritedListeners } from './activation.js';
@@ -61,7 +61,7 @@ class RequestError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
 }
 
-function checkRequestContract(input: Record<string, unknown>, contract: RoleContract, path: string): void {
+function checkRequestContract(input: Record<string, unknown>, contract: RoleContract, path: string, maxOutputTokens: number): void {
   const messages = path === '/v1/chat/completions' ? input.messages : path === '/v1/responses' ? input.input : undefined;
   const image = Array.isArray(messages) && messages.some(message => {
     if (!message || typeof message !== 'object' || Array.isArray(message)) return false;
@@ -76,21 +76,20 @@ function checkRequestContract(input: Record<string, unknown>, contract: RoleCont
     throw new RequestError(400, 'This role does not support tool calling.');
   }
   const reasoning = input.reasoning as { effort?: unknown } | undefined;
-  if (!contract.thinkingLevels && (['reasoning_effort', 'thinking_level', 'thinkingLevel'].some(key => input[key] !== undefined) || reasoning?.effort !== undefined)) {
+  if (!contract.thinkingLevels && (['thinking_level', 'thinkingLevel'].some(key => input[key] !== undefined) || reasoning?.effort !== undefined)) {
     throw new RequestError(400, 'This role does not accept a thinking level.');
   }
+  if (input.reasoning_effort !== undefined && (typeof input.reasoning_effort !== 'string'
+    || !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(input.reasoning_effort))) {
+    throw new RequestError(400, 'Use a supported reasoning_effort value: none, minimal, low, medium, high, xhigh or max.');
+  }
   const outputFields = ['max_tokens', 'max_completion_tokens', 'max_output_tokens', 'n_predict'];
-  let hasOutputLimit = false;
   for (const key of outputFields) {
     if (input[key] === undefined) continue;
     if (!Number.isSafeInteger(input[key]) || Number(input[key]) < 1) {
-      throw new RequestError(400, `The output limit for this role is ${contract.maxOutputTokens} tokens.`);
+      throw new RequestError(400, `The output limit for this backend is ${maxOutputTokens} tokens.`);
     }
-    hasOutputLimit = true;
-    input[key] = Math.min(Number(input[key]), contract.maxOutputTokens);
-  }
-  if (path !== '/v1/embeddings' && !hasOutputLimit) {
-    input[path === '/v1/responses' ? 'max_output_tokens' : 'max_tokens'] = contract.maxOutputTokens;
+    input[key] = Math.min(Number(input[key]), maxOutputTokens);
   }
 }
 
@@ -321,7 +320,11 @@ export async function startGateway(options: GatewayOptions): Promise<{ close(): 
         if (!input || typeof input !== 'object' || Array.isArray(input) || !('model' in input) || input.model !== role) {
           throw new RequestError(400, `Use the ${role} model alias at this address.`);
         }
-        checkRequestContract(input as Record<string, unknown>, snapshot.contracts[role], path);
+        checkRequestContract(input as Record<string, unknown>, snapshot.contracts[role], path, backend.maxOutputTokens);
+        if ('reasoning_effort' in input && !roleAcceptsReasoningEffort(snapshot, role)) {
+          delete input.reasoning_effort;
+          counts.adjustments = { reasoning_effort_dropped: 1 };
+        }
         const body = Buffer.from(JSON.stringify({ ...input, model: backend.servedName }));
         const headers = { 'content-type': 'application/json', 'content-length': String(body.length),
           accept: request.headers.accept ?? '*/*', ...await authorization(backend, credentials) };
@@ -356,7 +359,7 @@ export async function startGateway(options: GatewayOptions): Promise<{ close(): 
         const source = errorBody ? Readable.from((async function* () { yield errorBody; yield* upstream; })()) : upstream;
         await pipeline(source, tap, response);
         success = (upstream.statusCode ?? 502) < 400 && !tap.failed;
-        if (success) counts = tap.usage;
+        if (success) counts = { ...counts, ...tap.usage };
       } else plain(response, 404, 'Route not found.');
     } catch (error) {
       if (route === 'health' && !response.headersSent && !response.destroyed) json(response, 503, { role, status: 'down' });
@@ -388,7 +391,8 @@ export async function startGateway(options: GatewayOptions): Promise<{ close(): 
               } catch (error) { if (error instanceof BackendOwnerError) health = 'owner_mismatch'; }
             }
             return [role, { backend: id, backendModel: backend?.servedName ?? null, contextLength: backend?.contextLength ?? null,
-              contract: snapshot.contracts[role], health, backendPort: backend && isLoopbackUrl(backend.baseUrl) ? Number(new URL(backend.baseUrl).port || 80) : null,
+              contract: snapshot.contracts[role], acceptsReasoningEffort: roleAcceptsReasoningEffort(snapshot, role),
+              adjustments: await usage.adjustments(role), health, backendPort: backend && isLoopbackUrl(backend.baseUrl) ? Number(new URL(backend.baseUrl).port || 80) : null,
               inFlight: inFlight[role], openConnections: drain.count(role) }];
           })));
           json(response, 200, { roles, draining: drain.draining }); return;

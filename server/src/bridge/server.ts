@@ -40,7 +40,7 @@ export interface BridgeServerOptions {
   feed?: Pick<Feed, 'preferences' | 'ingest'>;
 }
 
-// The pulse (Hermes' 7am brief and daytime checks) posts what it found:
+// The pulse (Hermes' morning brief and daytime checks) posts what it found:
 //   GET  /pulse/v1/preferences  → level, quiet hours, "less like this", recent cards
 //   POST /pulse/v1/cards        { source, cards: [...] } → { created, updated, rejected }
 // Same token and checks as the bridge tools; these aren't offered to agents as tools.

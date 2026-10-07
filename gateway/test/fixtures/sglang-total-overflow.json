@@ -1,1 +1,1 @@
-{"error":{"message":"Requested token count exceeds the model's maximum context length of 524288 tokens. You requested a total of 524289 tokens: 524281 tokens from the input messages and 8 tokens for the completion.","type":"BadRequestError","code":400}}
+{"error":{"message":"Requested token count exceeds the model's maximum context length of 65536 tokens. You requested a total of 65537 tokens: 65529 tokens from the input messages and 8 tokens for the completion.","type":"BadRequestError","code":400}}

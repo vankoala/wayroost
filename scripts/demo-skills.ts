@@ -78,7 +78,7 @@ function demoList(): SkillInfo[] {
       updatedAt: ago(60 * 80),
     },
     {
-      name: 'meal-planner',
+      name: 'demo-meal-skill',
       description: 'Plans the meals for the week from what is already in the pantry.',
       platforms: [],
       origin: 'hermes-made',
@@ -114,7 +114,7 @@ class DemoSkillsHelper implements SkillsHelperApi {
         { at: ago(1), kind: 'synced', name: 'project-helper', place: 'win-agents' },
         { at: ago(12), kind: 'changed', name: 'notes-to-report', place: 'claude' },
         { at: ago(90), kind: 'changed', name: 'notes-to-report', place: 'shared' },
-        { at: ago(200), kind: 'added', name: 'meal-planner', place: 'hermes' },
+        { at: ago(200), kind: 'added', name: 'demo-meal-skill', place: 'hermes' },
         { at: ago(60 * 26), kind: 'added', name: 'trip-planner', place: 'shared' },
       ],
     };
@@ -129,7 +129,7 @@ class DemoSkillsHelper implements SkillsHelperApi {
     return { verdict: 'safe', findings: [] };
   }
   async skillShare(_place: string, name: string, confirmCaution: boolean) {
-    if (name === 'meal-planner' && !confirmCaution) {
+    if (name === 'demo-meal-skill' && !confirmCaution) {
       return {
         shared: false,
         scan: {

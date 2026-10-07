@@ -7,6 +7,7 @@
 // onto roles with every key's value before the move.
 import { z } from 'zod';
 import { MAX_OPERATION_KEYS, credentialSecretSchema, keyPathSchema, settingValueSchema, sha256Schema } from './settings.js';
+import { requestAdjustmentsSchema } from './usage.js';
 
 export const GATEWAY_ROLES = ['main', 'coder', 'fast'] as const;
 export type GatewayRole = (typeof GATEWAY_ROLES)[number];
@@ -28,7 +29,7 @@ export const GATEWAY_MODES = ['off', 'dual', 'only'] as const;
 export type GatewayMode = (typeof GATEWAY_MODES)[number];
 export const GATEWAY_MODE_FILE = '/etc/wayroost/gateway-mode';
 
-/** A backend entry's id in the role map: "main-sglang", "coder-local". */
+/** A backend entry's id in the role map: "example-main", "example-coder". */
 export const BACKEND_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 export const backendIdSchema = z.string().regex(BACKEND_ID);
 /**
@@ -60,8 +61,9 @@ const tokens = z.number().int().positive().max(16_777_216);
 export const roleContractSchema = z.object({
   input: inputSchema,
   toolCalling: z.boolean(),
-  /** Whether consumers may send a thinking level (pi's thinkingLevelMap). */
+  /** Whether the consumer catalog advertises selectable thinking levels (pi's thinkingLevelMap). */
   thinkingLevels: z.boolean(),
+  /** Catalog output cap shared by the role's backends; requests clamp supplied limits to the serving backend's cap. */
   maxOutputTokens: tokens,
   advertisedContext: tokens,
 }).strict();
@@ -119,6 +121,8 @@ export const backendSchema = z.object({
   input: inputSchema,
   toolCalling: z.boolean(),
   thinkingLevels: z.boolean(),
+  /** Accepts top-level reasoning_effort, including none; independent of selectable thinking levels. */
+  acceptsReasoningEffort: z.boolean().default(false),
   /**
    * The uid that must own the backend's listening socket. The gateway checks it
    * in the kernel's socket table before sending anything; required on loopback.
@@ -190,6 +194,13 @@ export const roleMapSchema = z.object({
 });
 export type RoleMap = z.infer<typeof roleMapSchema>;
 
+/** Intersect acceptance across a role's profile backends and its current mapping, including manual overrides. */
+export function roleAcceptsReasoningEffort(map: RoleMap, role: GatewayRole): boolean {
+  const ids = new Set([map.roles[role], ...Object.values(map.profiles).map(mapping => mapping[role])]);
+  ids.delete(null);
+  return ids.size > 0 && [...ids].every(id => id !== null && map.backends[id]?.acceptsReasoningEffort === true);
+}
+
 /** Credential names the map uses: the only names the credential verb accepts. */
 export function roleMapProviders(map: RoleMap): string[] {
   return [...new Set(Object.values(map.backends).flatMap(backend => backend.provider ? [backend.provider] : []))].sort();
@@ -202,6 +213,9 @@ const gatewayAdminRoleSchema = z.object({
   backend: backendIdSchema.nullable(),
   backendModel: z.string().max(256).nullable(), contextLength: z.number().int().positive().nullable(),
   contract: roleContractSchema,
+  acceptsReasoningEffort: z.boolean().optional(),
+  /** Persistent counts of named request changes, across successes and failures. */
+  adjustments: requestAdjustmentsSchema.optional(),
   health: z.enum(['up', 'down', 'unmapped', 'owner_mismatch', 'unknown']),
   backendPort: z.number().int().min(1).max(65_535).nullable(),
   inFlight: z.number().int().nonnegative(), openConnections: z.number().int().nonnegative(),
