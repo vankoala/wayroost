@@ -54,12 +54,12 @@ describe.skipIf(!existsSync(executablePath))('Checks in both themes and widths',
     });
     await writeFile(resolve(directory, 'demo.html'), '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="demo.css"></head><body><div id="root"></div><script src="demo.js"></script></body></html>');
     browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox'] });
-  });
+  }, 60_000);
 
   afterAll(async () => {
     await browser?.close();
     if (directory) await rm(directory, { recursive: true, force: true });
-  });
+  }, 30_000);
 
   for (const device of ['phone', 'desktop'] as const) {
     for (const theme of ['light', 'dark'] as const) {

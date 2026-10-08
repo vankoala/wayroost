@@ -2,9 +2,10 @@
 // Paseo 0.9 takes its own agent tools away per provider id, in config.json under
 // agents.providers.<id>.paseoTools = { enabled?, disabledTools? }. There is no per-profile
 // and no wildcard form, so every provider id gets its own entry, and the roles are
-// providers of their own, each based on pi. A provider that only a Paseo plugin registers
-// can't be limited: an entry for it needs extends and label, and then it clashes with
-// the plugin's provider.
+// providers of their own, each based on pi. Plugin-only providers stay uncovered under
+// the pinned schema, which requires extends and label for custom providers. Newer Paseo
+// schemas accept plugin overrides without those fields; the helper still skips entries
+// it cannot validate and reports them as uncovered.
 //
 // Applying the option is a merge: a provider keeps whatever it already has off, and the
 // option only adds to it. What it found and what it wrote are kept as a backup, and undo

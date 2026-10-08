@@ -12,6 +12,7 @@
 //
 //   npm install --prefix /tmp/paseo-X @getpaseo/server@X       (0.9 or later)
 //   npx tsx scripts/paseo-compat/tool-policy.ts /tmp/paseo-X/node_modules/@getpaseo/server
+// Add --config-only to check the installed schema, loader and registry without a listener.
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -23,6 +24,7 @@ import { EventHub } from '../../server/src/hub.js';
 import { PaseoAdapter } from '../../server/src/paseo/adapter.js';
 import { isolateHome } from './isolated-home.js';
 import { startCompatDaemon } from './isolation.js';
+import { checkToolPolicyConfig } from './tool-policy-config.js';
 import {
   APPROVAL_TOOLS,
   ROLE_PROVIDERS,
@@ -35,6 +37,16 @@ import { BackgroundGate } from '../../server/src/background.js';
 
 const serverDir = resolve(process.argv[2] ?? '');
 const version = JSON.parse(readFileSync(join(serverDir, 'package.json'), 'utf8')).version as string;
+if (process.argv.includes('--config-only')) {
+  try {
+    await checkToolPolicyConfig(serverDir, pass);
+    console.log(`PASS  Paseo ${version} tool limit config`);
+  } catch (err) {
+    console.error(`FAIL  Paseo ${version} tool limit config: ${(err as Error).message}`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
 const fakeAgent = join(dirname(fileURLToPath(import.meta.url)), 'fake-acp-agent.mjs');
 const root = mkdtempSync(join(tmpdir(), 'sb-paseo-tools-'));
 const realHomeUntouched = isolateHome(root); // before Paseo is loaded
@@ -225,9 +237,7 @@ try {
   }
   pass(true, 'the M1 config, option on and off, is valid Paseo config.json');
   pass(JSON.stringify(optionOff) === JSON.stringify(userProviders), 'undo gives back config.json exactly as it was');
-  // A plugin provider has no config entry; a limit-only one isn't valid, and a full one would clash with the plugin.
-  const pluginLimit = PersistedConfigSchema.safeParse({ version: 1, agents: { providers: { 'example-plugin': { paseoTools: { disabledTools: [...APPROVAL_TOOLS] } } } } });
-  pass(!pluginLimit.success, "a limit-only entry for a plugin's provider is rejected", pluginLimit.error?.issues[0]?.message);
+  await checkToolPolicyConfig(serverDir, pass);
   adapter.start();
   await until('connected', () => adapter.status().state === 'connected');
   const offered = (await adapter.options()).providers.map((p) => p.id);

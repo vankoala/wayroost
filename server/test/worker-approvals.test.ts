@@ -148,6 +148,16 @@ describe('owner-side worker approval policy', () => {
     expect(f.config().agents.providers['coder-worker']).toBeUndefined();
   });
 
+  it.each([true, false])('leaves a plugin without a config entry uncovered (enabled=%s)', async enabled => {
+    const f = fixture({}, enabled, false);
+    vi.mocked(f.daemon.providers).mockResolvedValue(['pi', 'example-plugin']);
+    const result = await f.setting.setEnabled(enabled);
+    expect(result).toMatchObject({ enabled, application: 'partial', uncoveredProviders: ['example-plugin'] });
+    expect(f.config().agents.providers).not.toHaveProperty('example-plugin');
+    expect(f.state().backup).not.toHaveProperty('example-plugin');
+    expect(await f.daemon.effectiveProviders()).not.toHaveProperty('example-plugin');
+  });
+
   it('uses Paseo validation for custom entries and leaves invalid plugin overrides untouched', async () => {
     const f = fixture({ 'demo-plugin': { extends: 'unsupported', label: 'Demo plugin', extra: 'keep' }, 'demo-acp': { extends: 'acp', label: 'Demo ACP' } }, true, false);
     expect((await f.setting.reconcile()).uncoveredProviders).toEqual(['demo-plugin', 'demo-acp']);
