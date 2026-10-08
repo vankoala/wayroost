@@ -10,7 +10,7 @@ import { api } from '../api.js';
 import { Page } from '../components/common.js';
 import { HiddenNote, LevelChip, SettingsSectionSource, SettingRow, SettingsConfirmPrompt, SettingsSectionGuard, useSettingsReadOnly, SettingsReadNotice, viewReady, TimingNotes, accessForValue, useSettingsChange, useSettingsCloudAgents, useSettingsDraft, useSettingsSection, useSettingsStatus, useSettingsView, type SettingsStatusState } from '../components/SettingsRows.js';
 import { formatCount, formatUsd, hermesSetting, isOpaqueName, rowNames, rowValue, settingAsText, settingsErrorText, type SettingsUsagePayload } from '../settingsModel.js';
-import { useStore } from '../store.js';
+import { captureRollout, getRolloutGeneration, useStore } from '../store.js';
 import { opTiming } from './SettingsAgents.js';
 
 /**
@@ -392,6 +392,8 @@ function ApiKeys() {
   const [busy, setBusy] = useState<string | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [restartRequired, setRestartRequired] = useState(false);
+  const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
+  useEffect(() => { setReport(null); setRestartRequired(false); setBusy(null); }, [rolloutGeneration]);
   if (!payload) return <SettingsReadNotice state={section} view="gateway.role-map" />;
   const map = payload.views?.find((view) => view.view === 'gateway.role-map');
   const backends = map?.values ?? [];
@@ -408,27 +410,32 @@ function ApiKeys() {
   const editable = access !== 'read-only';
 
   const act = async (kind: 'set' | 'remove' | 'test', provider: string, backend?: string) => {
+    const rollout = captureRollout('settingsPages');
+    if (!rollout.still() || !ready) return;
     setBusy(`${kind}-${provider}`);
     setReport(null);
     try {
       if (kind === 'set') {
         const answer = await api.settingsCredentialSet(provider, secrets.get(provider) ?? '');
+        if (!rollout.still()) return;
         setReport(answer.status === 'applied' ? `Saved for ${provider}. The field stays empty: the key is never shown back. Restart required: the model gateway. No restart has been scheduled.` : settingsErrorText(answer.code));
         if (answer.status === 'applied') { setSecrets(current => new Map(current).set(provider, '')); setRestartRequired(true); }
       } else if (kind === 'remove') {
         const answer = await api.settingsCredentialRemove(provider);
+        if (!rollout.still()) return;
         if (answer.status === 'applied') setRestartRequired(true);
         setReport(answer.status === 'applied' ? `Removed the key for ${provider}. Restart required: the model gateway. No restart has been scheduled.` : settingsErrorText(answer.code));
       } else {
         const answer = await api.settingsCredentialTest(provider, backend ?? '');
+        if (!rollout.still()) return;
         setReport(answer.test
           ? answer.test.ok ? `The key worked for ${provider}.` : (CREDENTIAL_TEST_TEXT[answer.test.code] ?? 'The test failed.')
           : 'The test could not run.');
       }
     } catch (error) {
-      setReport(error instanceof Error ? error.message : 'This PC did not answer.');
+      if (rollout.still()) setReport(error instanceof Error ? error.message : 'This PC did not answer.');
     } finally {
-      setBusy(null);
+      if (rollout.still()) setBusy(null);
     }
   };
 

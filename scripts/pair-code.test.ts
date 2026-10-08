@@ -55,7 +55,7 @@ describe('pairing recovery development flag', () => {
   it('prints both public SPKI fingerprints with a single combined desktop token and no key material', async () => {
     vi.stubEnv('WAYROOST_DEV_ALLOW_LOOPBACK', '1');
     const certFile = tls.certFile('server');
-    writeFileSync(config, JSON.stringify({ role: 'shadow', listen: { port: 8890 }, publicOrigin: 'http://127.0.0.1:8890', stateDir: join(root, 'state'), tls: { certFile } }));
+    writeFileSync(config, JSON.stringify({ role: 'shadow', listen: { port: 8890 }, publicOrigin: 'http://127.0.0.1:8890', stateDir: join(root, 'state'), localListener: { port: 8883 }, origins: ['https://127.0.0.1:8883'], tls: { certFile } }));
     vi.spyOn(process, 'argv', 'get').mockReturnValue(['node', 'pair-code', '--desktop', '--config', config]);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const devices = new Devices(join(root, 'devices'));
@@ -68,7 +68,7 @@ describe('pairing recovery development flag', () => {
     expect(output).toContain(`Server fingerprint: ${serverPin}`);
     expect(output).toContain(`Supervisor rescue fingerprint: ${rescuePin}`);
     const token = log.mock.calls.flatMap(args => args.join(' ').split('\n')).find(line => line.startsWith('{'))!;
-    expect(parsePairingToken(token)).toEqual({ code: made.code, serverPin, rescuePin });
+    expect(parsePairingToken(token)).toEqual({ code: made.code, serverPin, rescuePin, localPort: 8883 });
     expect(devices.pair(parsePairingToken(token).code, 'Demo desktop').device.kind).toBe('desktop');
     expect(output).toContain('Paste the whole token line');
     expect(output).not.toContain('type the code into the app');
@@ -76,7 +76,7 @@ describe('pairing recovery development flag', () => {
   });
   it.each(['phone', 'desktop'])('only desktop pairing requires the supervisor certificate (%s)', async kind => {
     certificates.missing = true;
-    writeFileSync(config, JSON.stringify({ role: 'shadow', listen: { port: 8890 }, publicOrigin: 'https://wayroost.example.com', stateDir: join(root, 'state'), tls: { certFile: tls.certFile('server') } }));
+    writeFileSync(config, JSON.stringify({ role: 'shadow', listen: { port: 8890 }, publicOrigin: 'https://wayroost.example.com', stateDir: join(root, 'state'), localListener: { port: 8883 }, origins: ['https://127.0.0.1:8883'], tls: { certFile: tls.certFile('server') } }));
     vi.spyOn(process, 'argv', 'get').mockReturnValue(['node', 'pair-code', `--${kind}`, '--config', config]);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});

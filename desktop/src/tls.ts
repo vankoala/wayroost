@@ -6,14 +6,28 @@ import { CODE_RE, normalizePairingCode } from '../../shared/pairing-code.js';
 import { appOrigins } from './hardening.js';
 
 export { ListenerIdentityError, ListenerNotPairedError };
-export interface DesktopPins { serverPin: string; rescuePin: string }
+export interface DesktopPins { serverPin: string; rescuePin: string; localPort?: number }
+
+export function localListenerPort(value: unknown): number {
+  if (value === undefined) return 8883;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 65535 || value === 8881 || value === 8880) throw new Error('Invalid local listener port.');
+  return value;
+}
+
+export function localListenerOrigin(pins?: DesktopPins): string {
+  return new URL(`https://127.0.0.1:${localListenerPort(pins?.localPort)}`).origin;
+}
+
+export function parseListenerPins(value: DesktopPins): DesktopPins {
+  return { serverPin: value.serverPin === '' ? '' : parsePin(value.serverPin), rescuePin: parsePin(value.rescuePin), localPort: localListenerPort(value.localPort) };
+}
 export interface DesktopPairingToken extends DesktopPins { code: string }
 export function parsePairingToken(value: string): DesktopPairingToken {
   if (value.length > 4096) throw new Error('Invalid desktop pairing token.');
   let token: Partial<DesktopPairingToken>;
   try { token = JSON.parse(value); } catch { throw new Error('Paste the desktop pairing token printed by sudo wayroost pair-desktop.'); }
   if (!token || typeof token.code !== 'string' || !CODE_RE.test(normalizePairingCode(token.code))) throw new Error('Invalid desktop pairing token.');
-  return { code: normalizePairingCode(token.code), serverPin: parsePin(token.serverPin), rescuePin: parsePin(token.rescuePin) };
+  return { code: normalizePairingCode(token.code), serverPin: parsePin(token.serverPin), rescuePin: parsePin(token.rescuePin), localPort: localListenerPort(token.localPort) };
 }
 
 /** Enrollment uses the pasted pin on each socket, before any code or cookie is sent. */

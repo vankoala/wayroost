@@ -32,7 +32,7 @@ let closed = 0;
 beforeEach(() => {
   closed = 0;
   localStorage.clear();
-  setState((s) => ({ ...s, statuses: connected }));
+  setState((s) => ({ ...s, statuses: connected, rollout: { settingsPages: true, revokes: true, chatFirst: true } }));
   vi.spyOn(api, 'hermesCommands').mockResolvedValue({ commands: [], runner: 'signalbox' });
   vi.spyOn(api, 'list').mockResolvedValue({ statuses: [connected.hermes, connected.paseo], conversations: [], approvals: [] });
 });
@@ -658,5 +658,23 @@ describe('what the folder says about itself', () => {
     await mount({ initialCwd: '/home/me/code/webapp', initialSource: 'hermes' });
     await settle();
     expect(check).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('site new-chat default', () => {
+  it.each([false, true])('uses chatFirst=%s when this device has no saved preference', async chatFirst => {
+    setState(s => ({ ...s, rollout: { settingsPages: true, revokes: true, chatFirst } }));
+    vi.spyOn(api, 'paseoOptions').mockResolvedValue(paseoOptions);
+    await mount();
+    expect(!!on('.advanced-toggle')).toBe(chatFirst);
+    expect(!!on('.basic-toggle')).toBe(!chatFirst);
+  });
+
+  it.each([false, true])('a saved Basic choice wins over chatFirst=%s', async chatFirst => {
+    localStorage.setItem('wayroost.newChat.advanced', '0');
+    setState(s => ({ ...s, rollout: { settingsPages: true, revokes: true, chatFirst } }));
+    await mount();
+    expect(on('.advanced-toggle')).not.toBeNull();
   });
 });

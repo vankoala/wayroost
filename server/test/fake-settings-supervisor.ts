@@ -21,7 +21,8 @@ export class FakeSettingsSupervisor implements SupervisorApi {
   agentAvailability = (['claude', 'codex', 'copilot'] as const).map(id => ({ id,
     installed: null as boolean | null, authenticated: null as boolean | null }));
   readonly backups = new Map<string, Record<string, unknown>>();
-  readonly status = vi.fn(async () => ({ overall: 'ok' as const, sentence: 'Ready', components: [], at: 0, configVerbs: currentConfigVerbs(true) }));
+  drainRestart?: SupervisorApi['drainRestart'];
+  readonly status = vi.fn<() => Promise<NonNullable<Awaited<ReturnType<SupervisorApi['status']>>>>>(async () => ({ overall: 'ok' as const, sentence: 'Ready', components: [], at: 0, configVerbs: { ...currentConfigVerbs(true), restartWhenIdleCertified: true } }));
   readonly events = vi.fn(() => () => {});
   readonly act = vi.fn<SupervisorApi['act']>();
   readonly action = vi.fn(async () => null);

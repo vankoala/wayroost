@@ -97,3 +97,12 @@ describe('the local listener', () => {
     expect(() => parseConfig({ ...shadow, origins: ['https://127.0.0.1:19010'], localListener: { port: 19010 } }, { env: {} })).toThrow(/Shadow/);
   });
 });
+
+
+it('defaults all rollout switches off and accepts independent explicit switches', () => {
+  expect(parseConfig(valid).rollout).toEqual({ settingsPages: false, revokes: false, chatFirst: false });
+  for (const key of ['settingsPages', 'revokes', 'chatFirst'] as const) {
+    expect(parseConfig({ ...valid, rollout: { [key]: true } }).rollout).toEqual({ settingsPages: false, revokes: false, chatFirst: false, [key]: true });
+    expect(() => parseConfig({ ...valid, rollout: { [key]: 'true' } })).toThrow(ConfigError);
+  }
+});

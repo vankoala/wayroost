@@ -91,7 +91,7 @@ function canonical(value: unknown): string {
 function send(reply: FastifyReply, response: unknown) {
   const code = (response as { code?: SettingsErrorCode | typeof CREDENTIAL_TEST_ERRORS[number] }).code;
   const status = !code ? 200 : code === 'invalid_parameters' || code === 'unknown_operation' ? 400
-    : ['not_permitted', 'pc_only', 'pc_only_read_only', 'shadow_read_only', 'confirm_invalid'].includes(code) ? 403
+    : ['not_permitted', 'pc_only', 'pc_only_read_only', 'shadow_read_only', 'not_rolled_out', 'confirm_invalid'].includes(code) ? 403
       : code === 'audit_unavailable' || code === 'unavailable' || code === 'backend_unavailable' ? 503 : 409;
   return reply.code(status).send(response);
 }
@@ -405,9 +405,15 @@ class SettingsPipeline {
   async checks(request: FastifyRequest): Promise<SettingsChecksResponse | SettingsApplyResponse> {
     const checks = this.options.checks;
     try {
-      const result = checks ? await checks.rows(this.audit.entries(), settingsContext(request, this.config)).catch(() => ({
+      const snapshot = checks ? await checks.rows(this.audit.entries(), settingsContext(request, this.config)).catch(() => ({
         generatedAt: this.now(), rows: [], unavailable: ['unavailable'],
       } as SettingsChecksResponse)) : { generatedAt: this.now(), rows: [] } as SettingsChecksResponse;
+      const needsCertification = snapshot.rows.some(row => row.fix && 'restart' in row.fix
+        && row.fix.restart.component === 'hermes' && row.fix.restart.when === 'idle');
+      const certified = needsCertification && await this.idleRestartCertified();
+      const result: SettingsChecksResponse = { ...snapshot, rows: snapshot.rows.map(row =>
+        !certified && row.fix && 'restart' in row.fix && row.fix.restart.component === 'hermes' && row.fix.restart.when === 'idle'
+          ? { ...row, fix: { restart: { component: 'hermes', when: 'now' } } } : row) };
       const entries = this.audit.unresolved().filter(entry => entry.target && !(entry.action === 'restart' && entry.runId));
       const targets = [...new Set(entries.map(entry => entry.target!))];
       result.rows.unshift(...targets.map(target => {
@@ -440,13 +446,24 @@ class SettingsPipeline {
     } catch { return { ok: false, code: 'failed' }; }
   }
 
+  private rolledOut(operation?: string): boolean {
+    return this.config.rollout.settingsPages && (this.config.rollout.revokes || !['hermes.revoke-always', 'hermes.skill-staging'].includes(operation ?? ''));
+  }
+
+  private async idleRestartCertified(): Promise<boolean> {
+    try { return (await this.supervisor?.status())?.configVerbs?.restartWhenIdleCertified === true; }
+    catch { return false; }
+  }
+
   async section(request: FastifyRequest, section: SettingsSection) {
     const context = settingsContext(request, this.config);
-    if (section === 'overview') return { section, changes: this.recent(context) };
+    if (section === 'overview') return { section, rollout: this.config.rollout, changes: this.recent(context) };
     const results = await Promise.all(views[section].map(async view => ({ ...await this.projected(view, context), view })));
     const operations = OPERATION_IDS.filter(id => operationSpec(id)!.section === section && operationSpec(id)!.callers.includes('server'))
       .map(operation => {
         const spec = operationSpec(operation)!;
+        if (!this.rolledOut(operation)) return { operation, title: spec.title, writer: !this.legacyRoutesViaPipeline && legacyOperations.has(operation) ? 'legacy' : 'pipeline', level: spec.level, timing: spec.timing, access: 'read-only',
+          ...('byParam' in spec.level ? { accessByValue: Object.fromEntries(Object.keys(spec.level.values).map(value => [value, 'read-only'])) } : {}) };
         if (!this.legacyRoutesViaPipeline && legacyOperations.has(operation)) {
           const access = context.role === 'primary' && request.device?.kind === 'desktop' && context.scopes.includes('settings') ? 'editable' : 'read-only';
           return { operation, title: spec.title, writer: 'legacy', level: 'pc-only', timing: spec.timing, access,
@@ -492,6 +509,7 @@ class SettingsPipeline {
       metadata.roleLoads = await readMetadata(this.options.roleLoads, roleLoadsSchema);
     }
     if (section === 'safety') {
+      metadata.restartWhenIdleCertified = await this.idleRestartCertified();
       const latest = this.audit.entries().filter(entry => entry.action === 'restart' && entry.target === 'hermes' && entry.runId
         && (entry.result === 'outcome_unknown' || entry.observed === 'supervisor')).at(-1)?.runId;
       const runIds = [...new Set([...this.drains.keys(), ...(latest ? [latest] : [])])];
@@ -505,7 +523,7 @@ class SettingsPipeline {
       }
     }
     if (section === 'agents' || section === 'models') metadata.agentAvailability = await readMetadata(this.options.agentAvailability, agentAvailabilitySchema);
-    return { section, legacyRoutesViaPipeline: this.legacyRoutesViaPipeline, views: results, operations, ...metadata };
+    return { section, rollout: this.config.rollout, legacyRoutesViaPipeline: this.legacyRoutesViaPipeline, views: results, operations, ...metadata };
   }
 
   recent(context?: SettingsRequestContext) {
@@ -513,7 +531,7 @@ class SettingsPipeline {
       id: entry.id, at: entry.at, action: entry.action, operation: entry.operation, target: entry.target,
       keys: entry.keys, device: entry.device ? { ...entry.device, name: '' } : undefined,
       level: entry.level, timing: entry.notes, result: entry.result, undoable: !!this.audit.token(entry.id),
-      ...(context ? { undoAccess: rowAccess(operationSpec(entry.operation ?? '') ? undoLevel(operationSpec(entry.operation ?? '')!) : 'pc-only', context) } : {}),
+      ...(context ? { undoAccess: this.rolledOut(entry.operation) ? rowAccess(operationSpec(entry.operation ?? '') ? undoLevel(operationSpec(entry.operation ?? '')!) : 'pc-only', context) : 'read-only' } : {}),
     }));
   }
 
@@ -610,6 +628,7 @@ class SettingsPipeline {
   async apply(request: FastifyRequest, input: unknown, notificationSnapshot?: SettingsSnapshot): Promise<SettingsApplyResponse> {
     const body = settingsApplyBodySchema.safeParse(input);
     if (!body.success || body.data.afterSeconds !== undefined) return refused('invalid_parameters');
+    if (!this.rolledOut(body.data.operation)) return refused('not_rolled_out');
     if (body.data.operation === 'settings.accept-current') return this.acceptCurrent(request, body.data);
     let parameters = body.data.params;
     if (!decideRead(settingsContext(request, this.config), 'pc-only').allowed) {
@@ -656,6 +675,7 @@ class SettingsPipeline {
     const operation = parseOperation(requestedOperation, parameters, 'server');
     if (!operation.ok) return refused(operation.code);
     const { spec, params } = operation;
+    if (!this.rolledOut(operation.operation)) return refused('not_rolled_out');
     if (spec.verb !== 'config.apply') return refused('invalid_parameters');
     if (this.blocked(operationTarget(spec, params)).length) return { status: 'refused', code: 'outcome_unknown', message: SETTINGS_RESOLUTION_MESSAGE };
     if (spec.recovery && body.data.expected) return refused('invalid_parameters');
@@ -843,11 +863,16 @@ class SettingsPipeline {
     if (!result.ok && !token) return this.finish(record, timing, refused(result.code), undoOf);
     const safetyBlocked = record.operation === 'wayroost.safety-commands'
       && this.store.safetyCommandsEnabled() !== this.safetyCommandsEnabled();
+    const idleCertified = record.operation === 'hermes.revoke-always' && await this.idleRestartCertified();
+    if (record.operation === 'hermes.revoke-always' && !idleCertified) {
+      timing = timing.map(note => note.label === 'restart-when-idle:hermes' ? { ...note, label: 'restart-now:hermes' } : note);
+      record.timing = timing.map(note => note.label);
+    }
     const change: ChangeResult = { id: record.id, operation: record.operation!, target: record.target as UndoToken['target'],
       keys: record.keys, timing: [...timing], effective: result.ok && !safetyBlocked ? timing.every(note => note.label === 'now') ? 'verified' : 'pending' : 'mismatch',
       undoable: !!token && !(result.ok && result.unchanged), ...(spec.lasts ? { lasts: spec.lasts } : {}),
       ...(record.target === 'hermes-config' ? { reloadOpenPages: true } : {}) };
-    if (record.operation === 'hermes.revoke-always') change.restartRequired = { component: 'hermes', choices: ['idle', 'now'], timing: [...timing] };
+    if (record.operation === 'hermes.revoke-always') change.restartRequired = { component: 'hermes', choices: idleCertified ? ['idle', 'now'] : ['now'], timing: [...timing] };
     if (result.ok && result.unchanged) { delete record.backupId; delete record.backupSha256; delete record.writtenSha256; }
     let response: SettingsApplyResponse;
     try { response = this.finish(record, timing, result.ok ? { status: 'applied', change } : { status: 'refused', code: result.code, change }, undoOf); }
@@ -855,7 +880,7 @@ class SettingsPipeline {
       if (!(error instanceof SettingsAuditError)) throw error;
       return { status: 'refused', code: 'audit_unavailable', change: { ...change, undoable: false } };
     }
-    if (result.ok && !result.unchanged && !undoOf && record.operation === 'hermes.revoke-always') {
+    if (result.ok && !result.unchanged && !undoOf && record.operation === 'hermes.revoke-always' && idleCertified) {
       const restartTiming: Timing = [{ label: 'restart-when-idle:hermes' }];
       const restartRecord: SettingsWriteRecord = { id: changeId(), at: this.now(), action: 'restart', operation: 'service.restart-hermes',
         target: 'hermes', keys: [], device: record.device, level: 'anywhere', timing: restartTiming.map(note => note.label), result: 'outcome_unknown' };
@@ -870,10 +895,12 @@ class SettingsPipeline {
   }
 
   async undo(request: FastifyRequest): Promise<SettingsApplyResponse> {
+    if (!this.config.rollout.settingsPages) return refused('not_rolled_out');
     const body = settingsUndoBodySchema.safeParse(request.body);
     if (!body.success) return refused('invalid_parameters');
     const saved = this.audit.token(body.data.change);
     if (!saved) return refused('undo_changed');
+    if (!this.rolledOut(saved.token.operation)) return refused('not_rolled_out');
     if (this.blocked(saved.token.target).length) return { status: 'refused', code: 'outcome_unknown', message: SETTINGS_RESOLUTION_MESSAGE };
     const spec = operationSpec(saved.token.operation)!;
     const level = stricterLevel(saved.entry.level, undoLevel(spec));
@@ -968,6 +995,7 @@ class SettingsPipeline {
     const body = settingsRestartBodySchema.safeParse(request.body);
     if (!body.success) return refused('invalid_parameters');
     const { component, when, confirm } = body.data;
+    if (component === 'hermes' && when === 'idle' && !await this.idleRestartCertified()) return refused('not_rolled_out');
     const timing: Timing = [{ label: when === 'idle' ? `restart-when-idle:${component}` : `restart-now:${component}` }];
     const level = when === 'idle' ? 'anywhere' : 'confirm';
     const record = this.metadata(request, 'restart', `service.restart-${component}`, component, [], level, timing);
@@ -1052,6 +1080,7 @@ export async function registerSettingsRoutes(app: FastifyInstance, config: AppCo
       if (result) return send(reply, result);
     }
     if (!isSettingsPolicyRoute(route)) return;
+    if (!['GET', 'HEAD'].includes(request.method) && !config.rollout.settingsPages) return send(reply, refused('not_rolled_out'));
     const method = request.method === 'HEAD' ? 'GET' : request.method;
     if (EARLIER_SETTINGS_ROUTES.includes(route as typeof EARLIER_SETTINGS_ROUTES[number])) {
       if (method !== 'GET' && config.role === 'shadow') return send(reply, refused('shadow_read_only'));

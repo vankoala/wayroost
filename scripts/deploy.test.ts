@@ -41,3 +41,27 @@ it.each([
     expect((error as { stdout: string }).stdout).not.toMatch(/\b(?:PLAN|WRITE)\b/);
   }
 });
+
+it.each([
+  { name: 'missing listener', listener: undefined },
+  { name: 'null listener', listener: null },
+  { name: 'existing disabled listener', listener: { host: '127.0.0.1', port: 18010, pcOnlyWrites: false } },
+  { name: 'existing enabled listener', listener: { host: '127.0.0.1', port: 8883, pcOnlyWrites: true } },
+].flatMap(row => [false, true].map(originPresent => ({ ...row, originPresent }))))('plans a server upgrade with $name, local origin present: $originPresent', ({ listener, originPresent }) => {
+  mkdirSync('.tmp', { recursive: true });
+  const folder = mkdtempSync(join(process.cwd(), '.tmp', 'deploy-listener-')); folders.push(folder);
+  const directory = join(folder, 'etc', 'wayroost');
+  mkdirSync(directory, { recursive: true });
+  const file = join(directory, 'config.json');
+  const origins = ['https://wayroost.example.com', ...(listener?.port === 18010 ? ['https://127.0.0.1:18010'] : []),
+    ...(originPresent ? ['https://127.0.0.1:8883'] : [])];
+  const original = JSON.stringify({ publicOrigin: 'https://wayroost.example.com', origins, localListener: listener });
+  writeFileSync(file, original);
+  const output = execFileSync('bash', ['deploy/install-wayroost-server.sh', '--dry-run', '--root', folder], { encoding: 'utf8' });
+  const contents = output.split(`WRITE ${file} mode=0600 owner=root:root\n`)[1]!.split('\nPLAN ')[0]!;
+  const config = JSON.parse(contents);
+  expect(config.localListener).toEqual(listener ?? { host: '127.0.0.1', port: 8883, pcOnlyWrites: false });
+  expect(config.origins).toEqual([...new Set([...origins, 'https://127.0.0.1:8881', 'https://127.0.0.1:8883'])]);
+  expect(config.listen).toEqual({ host: '127.0.0.1', port: 8881 });
+  expect(readFileSync(file, 'utf8')).toBe(original);
+});

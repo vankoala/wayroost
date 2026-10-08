@@ -19,7 +19,9 @@ it('loads the keys and supervisor configuration with the previous release\'s str
     await writeFile(site, JSON.stringify({ version: 1, configWrites: true, targets: {} }));
     expect(await loadKeys(keys)).toEqual(await currentKeys(keys));
     expect((await loadKeys(keys)).find(key => key.name === 'launcher')).toMatchObject({ scope: 'server' });
-    expect(await loadConfig(config)).toEqual(await currentConfig(config));
+    const { restartWhenIdleCertified, ...compatible } = await currentConfig(config);
+    expect(restartWhenIdleCertified).toBe(false);
+    expect(await loadConfig(config)).toEqual(compatible);
     expect(await loadConfig(config)).toMatchObject({ statusOnly: true });
     expect(await readFile(config, 'utf8')).not.toContain('configWrites');
     expect(await readFile(site, 'utf8')).toContain('configWrites');

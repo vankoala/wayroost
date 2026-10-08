@@ -2,6 +2,7 @@ import type { ListenerTls } from '../../lib/loopback-tls.js';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { rolloutSchema, type Rollout } from '../../shared/rollout.js';
 import { SUPERVISOR_DEFAULTS } from '../../shared/supervisor.js';
 import { isLoopbackHost as isLoopback } from '../../shared/gateway.js';
 import { parseSupervisorKey } from './supervisor-key.js';
@@ -61,6 +62,7 @@ function isKnownTimeZone(zone: string): boolean {
 const RawConfig = z
   .object({
     role: z.enum(['shadow', 'primary']).default('primary'),
+    rollout: rolloutSchema,
     listen: z
       .object({
         host: z.string().default('127.0.0.1'),
@@ -257,6 +259,7 @@ export interface ChecksConfig {
 }
 
 export interface AppConfig {
+  rollout: Rollout;
   role: ServerRole;
   listen: { host: string; port: number };
   /** The desktop app's PC-only port, when configured; it serves the same app over the same TLS. */
@@ -557,6 +560,7 @@ export function parseConfig(input: unknown, options: ParseOptions = {}): AppConf
 
   return {
     role,
+    rollout: raw.rollout,
     listen: raw.listen,
     ...(localListener ? { localListener } : {}),
     ...(raw.tls ? { tls: raw.tls } : {}),

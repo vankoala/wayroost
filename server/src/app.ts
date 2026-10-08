@@ -890,6 +890,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return {
       conversations,
       role: config.role,
+      rollout: config.rollout,
       notifications: config.role === 'primary',
       approvals,
       approvalNotifications: config.role === 'primary' ? deps.notifications?.approvalNotifications(approvals) ?? [] : [],

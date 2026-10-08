@@ -7,6 +7,7 @@ import { Devices } from '../src/devices.js';
 import { EventHub } from '../src/hub.js';
 import { EventJournal } from '../src/hub/journal.js';
 import { Checks } from '../src/checks/index.js';
+import { settingsChecksResponseSchema } from '../../shared/settings-checks.js';
 import type { SettingsOptions } from '../src/settings/routes.js';
 import { SettingsAudit } from '../src/settings/audit.js';
 import { blockedReason, parseSlash } from '../src/hermes/commands.js';
@@ -27,8 +28,8 @@ afterEach(async () => {
 
 async function fixture(options: { local?: boolean; gate?: boolean; shadow?: boolean; supervisor?: boolean; logs?: string[]; consumers?: boolean; checks?: SettingsOptions['checks'] } = {}) {
   let now = 1_800_000_000_000;
-  const config = makeConfig(undefined, { settings: { legacyRoutesViaPipeline: true },
-    localListener: { port: 19014, pcOnlyWrites: options.gate ?? true }, origins: ['https://127.0.0.1:19014'] });
+  const config = makeConfig(undefined, { settings: { legacyRoutesViaPipeline: true }, listen: { port: 8881 },
+    localListener: { port: 8883, pcOnlyWrites: options.gate ?? true }, origins: ['https://127.0.0.1:8883'] });
   if (options.shadow) config.role = 'shadow';
   roots.push(config.stateDir);
   const hub = new EventHub();
@@ -45,7 +46,7 @@ async function fixture(options: { local?: boolean; gate?: boolean; shadow?: bool
     ...(options.consumers ? { safetyCommands, workerApprovals: { status: async () => pendingWorkerApprovals(),
       setEnabled: vi.fn(async (enabled: boolean) => ({ ...pendingWorkerApprovals(), enabled })) } } : {}) });
   // Injection supplies a transport socket without opening a listener.
-  app.addHook('onRequest', async request => { Object.defineProperty(request.raw.socket, 'localPort', { configurable: true, value: options.local ? 19014 : 19010 }); });
+  app.addHook('onRequest', async request => { Object.defineProperty(request.raw.socket, 'localPort', { configurable: true, value: options.local ? 8883 : 8881 }); });
   apps.push(app);
   const write = async (operation: string, params: Record<string, unknown>, extra: Record<string, unknown> = {}, phone = false) => {
     const response = await app.inject({ method: 'POST', url: '/api/settings/apply', headers: postHeaders('fake', { cookie: phone ? PHONE_COOKIE : DESKTOP_COOKIE }),
@@ -57,6 +58,7 @@ async function fixture(options: { local?: boolean; gate?: boolean; shadow?: bool
     headers: postHeaders('fake', { cookie: phone ? PHONE_COOKIE : DESKTOP_COOKIE }), payload: { change, ...(confirm ? { confirm } : {}) } });
   const rows = () => readFileSync(join(config.stateDir, 'settings-audit.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   return { app, config, supervisor, events, devices, write, undo, rows, safetyCommands, hub,
+    setLocal: (local: boolean) => { options.local = local; },
     advance: (ms: number) => { now += ms; } };
 }
 
@@ -380,7 +382,7 @@ it('requires confirmed PC acceptance before another request and preserves the re
   const app = await buildApp({ config: f.config, hub: new EventHub(), devices: f.devices, supervisor: f.supervisor, safetyCommands,
     sources: { hermes: new FakeHermes(), paseo: new FakePaseo() }, logger: false,
     verifier: async () => ({ email: 'you@example.com', exp: 2_000_000_000 }) });
-  app.addHook('onRequest', async request => { Object.defineProperty(request.raw.socket, 'localPort', { configurable: true, value: 19014 }); });
+  app.addHook('onRequest', async request => { Object.defineProperty(request.raw.socket, 'localPort', { configurable: true, value: 8883 }); });
   apps.push(app);
   expect(safetyCommands.enabled()).toBe(true);
   expect(f.supervisor.configApply).toHaveBeenCalledOnce();
@@ -516,7 +518,7 @@ it('persists metadata without values, publishes only verified changes, and resto
   const config = f.config;
   const app = await buildApp({ config, hub: new EventHub(), sources: { hermes: new FakeHermes(), paseo: new FakePaseo() },
     verifier: async () => ({ email: 'you@example.com', exp: 2_000_000_000 }), supervisor: f.supervisor, logger: false });
-  app.addHook('onRequest', async request => { Object.defineProperty(request.raw.socket, 'localPort', { configurable: true, value: 19014 }); });
+  app.addHook('onRequest', async request => { Object.defineProperty(request.raw.socket, 'localPort', { configurable: true, value: 8883 }); });
   apps.push(app);
   const undone = await app.inject({ method: 'POST', url: '/api/settings/undo', headers: postHeaders('fake'), payload: { change: response.change.id } });
   expect(undone.json()).toMatchObject({ status: 'applied', change: { timing: [{ label: 'next-chat' }] } });
@@ -894,7 +896,7 @@ it('refuses missing config verbs and device scopes', async () => {
 it('does not promote a main-listener request using local Host and Origin headers', async () => {
   const f = await fixture();
   const response = await f.app.inject({ method: 'POST', url: '/api/settings/apply', headers: postHeaders('fake', {
-    host: '127.0.0.1:19014', origin: 'https://127.0.0.1:19014', 'x-wayroost-app': 'desktop',
+    host: '127.0.0.1:8883', origin: 'https://127.0.0.1:8883', 'x-wayroost-app': 'desktop',
   }), payload: { operation: 'paseo.routing-note', params: { text: 'Demo note' } } });
   expect(response.json()).toEqual({ status: 'refused', code: 'pc_only' });
   expect(f.supervisor.configApply).not.toHaveBeenCalled();
@@ -1044,4 +1046,125 @@ it.each(['apply', 'undo'] as const)('keeps recovery and completes the audit when
   expect(undone.json()).toMatchObject({ status: 'refused', code: 'outcome_unknown' });
   expect(f.supervisor.configApply).toHaveBeenCalledTimes(1);
   expect(f.supervisor.configUndo).toHaveBeenCalledTimes(action === 'apply' ? 0 : 1);
+});
+
+
+describe('site rollout switches', () => {
+  it('keeps reads and Checks available while refusing every settings write route', async () => {
+    const f = await fixture({ local: true, checks: { rows: async () => ({ generatedAt: 0, rows: [] }) } });
+    f.config.rollout.settingsPages = false;
+    for (const [method, url, payload] of [
+      ['POST', '/api/settings/apply', { operation: 'hermes.reasoning-effort', params: { effort: 'high' } }],
+      ['POST', '/api/settings/undo', { change: 'ch_000000000000000000000001' }],
+      ['POST', '/api/settings/restart', { component: 'hermes', when: 'now' }],
+      ['PUT', '/api/settings/notifications', {}],
+      ['PUT', '/api/settings/safety-commands', { enabled: false }],
+      ['PUT', '/api/settings/credentials/example', { secret: 'invented-value' }],
+    ] as const) {
+      const reply = await f.app.inject({ method, url, payload, headers: postHeaders('fake', { cookie: DESKTOP_COOKIE }) });
+      expect(reply.statusCode, url).toBe(403);
+      expect(reply.json(), url).toMatchObject({ code: 'not_rolled_out' });
+    }
+    const page = (await f.app.inject({ url: '/api/settings/sections/safety', headers: apiHeaders('fake', { cookie: DESKTOP_COOKIE }) })).json();
+    expect(page.rollout.settingsPages).toBe(false);
+    expect(page.views.some((view: { ok: boolean }) => view.ok)).toBe(true);
+    expect(page.operations.every((op: { access: string; accessByValue?: Record<string, string> }) => op.access === 'read-only' && Object.values(op.accessByValue ?? {}).every(access => access === 'read-only'))).toBe(true);
+    expect((await f.app.inject({ url: '/api/settings/checks', headers: apiHeaders('fake', { cookie: DESKTOP_COOKIE }) })).statusCode).toBe(200);
+    expect(f.supervisor.configApply).not.toHaveBeenCalled();
+    f.config.rollout.settingsPages = true;
+    expect((await f.write('hermes.reasoning-effort', { effort: 'high' })).json().status).toBe('applied');
+  });
+
+  it('gates revokes and staging independently of other settings writes', async () => {
+    const f = await fixture({ local: true });
+    f.config.rollout.revokes = false;
+    for (const [operation, params] of [
+      ['hermes.revoke-always', { entrySha256: createHash('sha256').update('echo example').digest('hex') }],
+      ['hermes.skill-staging', { enabled: true }],
+    ] as const) expect((await f.write(operation, params)).json()).toMatchObject({ code: 'not_rolled_out' });
+    expect((await f.write('hermes.reasoning-effort', { effort: 'high' })).json().status).toBe('applied');
+    f.config.rollout.revokes = true;
+    expect((await f.write('hermes.skill-staging', { enabled: true })).json().status).toBe('applied');
+  });
+
+  it('accepts a desktop PC-only write locally and refuses replay on the main listener', async () => {
+    const f = await fixture({ local: true });
+    expect((await f.write('hermes.approval-mode', { mode: 'off' })).json().status).toBe('applied');
+    f.setLocal(false);
+    expect((await f.write('hermes.approval-mode', { mode: 'smart' })).json()).toMatchObject({ code: 'pc_only' });
+    expect(f.supervisor.configApply).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])('schedules revoke restarts only when certified: %s', async certified => {
+    const f = await fixture({ local: true });
+    f.supervisor.status.mockImplementation(async () => ({ overall: 'ok', sentence: 'Ready', components: [], at: 0,
+      configVerbs: { version: 1, configWrites: true, catalogue: 1, verbs: [], restartWhenIdleCertified: certified } }));
+    const restart = vi.fn(async () => ({ ok: false as const, code: 'not_configured' as const }));
+    f.supervisor.drainRestart = restart;
+    const reply = (await f.write('hermes.revoke-always', { entrySha256: createHash('sha256').update('echo example').digest('hex') })).json();
+    expect(reply.status).toBe('applied');
+    expect(reply.change.restartRequired.choices).toEqual(certified ? ['idle', 'now'] : ['now']);
+    expect(reply.change.timing.filter((note: { surface?: string }) => ['messaging', 'api'].includes(note.surface ?? '')).map((note: { label: string }) => note.label))
+      .toEqual(Array(2).fill(certified ? 'restart-when-idle:hermes' : 'restart-now:hermes'));
+    expect(restart).toHaveBeenCalledTimes(certified ? 1 : 0);
+    expect(f.supervisor.documents['hermes-config']!.command_allowlist).toEqual([]);
+  });
+
+  it.each([false, true, undefined, 'unavailable'] as const)('offers a usable pending-revoke Checks restart with certification %s', async certification => {
+    let supervisor!: FakeSettingsSupervisor;
+    const checks = new Checks({
+      readView: view => supervisor.configRead({ view }),
+      hermesStartedAt: async () => 1_799_999_000_000,
+    });
+    const f = await fixture({ local: true, checks });
+    supervisor = f.supervisor;
+    const status = supervisor.status.getMockImplementation()!;
+    supervisor.status.mockImplementation(async () => {
+      if (certification === 'unavailable') throw new Error('unavailable');
+      const result = await status();
+      return { ...result, configVerbs: { ...result.configVerbs!, restartWhenIdleCertified: certification } };
+    });
+    const revoke = (await f.write('hermes.revoke-always', { entrySha256: createHash('sha256').update('echo example').digest('hex') })).json();
+    expect(revoke.status).toBe('applied');
+    const response = await f.app.inject({ url: '/api/settings/checks', headers: apiHeaders('fake', { cookie: PHONE_COOKIE }) });
+    const page = settingsChecksResponseSchema.parse(response.json());
+    const pending = page.rows.find(row => row.id === 'allowlist.revoke-pending')!;
+    const when = certification === true ? 'idle' : 'now';
+    expect(pending.state).toBe('warn');
+    expect(pending.fix).toEqual({ restart: { component: 'hermes', when } });
+    const restart = vi.fn<NonNullable<FakeSettingsSupervisor['drainRestart']>>(async () => ({ ok: false, code: 'not_configured' }));
+    supervisor.drainRestart = restart;
+    const send = (confirm?: string) => f.app.inject({ method: 'POST', url: '/api/settings/restart', headers: postHeaders('fake', { cookie: PHONE_COOKIE }),
+      payload: { component: 'hermes', when, ...(confirm ? { confirm } : {}) } });
+    const first = (await send()).json();
+    if (when === 'now') {
+      expect(first.status).toBe('confirm');
+      expect(restart).not.toHaveBeenCalled();
+      await send(first.confirm);
+    }
+    expect(restart).toHaveBeenCalledWith(expect.objectContaining({ component: 'hermes', when }));
+  });
+
+  it('projects cached Hermes idle fixes without changing the source rows or other restart components', async () => {
+    const page = { generatedAt: 0, rows: [
+      { id: 'allowlist.revoke-pending', state: 'warn' as const, sentence: 'The gateway still needs to load a revoked answer.',
+        fix: { restart: { component: 'hermes' as const, when: 'idle' as const } } },
+      { id: 'gateway.restart', state: 'warn' as const, sentence: 'Restart the model gateway.',
+        fix: { restart: { component: 'gateway' as const, when: 'idle' as const } } },
+    ] };
+    const f = await fixture({ checks: { rows: async () => page } });
+    const status = f.supervisor.status.getMockImplementation()!;
+    let certified = false;
+    f.supervisor.status.mockImplementation(async () => {
+      const result = await status();
+      return { ...result, configVerbs: { ...result.configVerbs!, restartWhenIdleCertified: certified } };
+    });
+    const get = async () => settingsChecksResponseSchema.parse((await f.app.inject({ url: '/api/settings/checks', headers: apiHeaders('fake') })).json());
+    expect((await get()).rows.map(row => row.fix)).toEqual([
+      { restart: { component: 'hermes', when: 'now' } }, { restart: { component: 'gateway', when: 'idle' } },
+    ]);
+    expect(page.rows[0]!.fix.restart.when).toBe('idle');
+    certified = true;
+    expect((await get()).rows[0]!.fix).toEqual({ restart: { component: 'hermes', when: 'idle' } });
+  });
 });

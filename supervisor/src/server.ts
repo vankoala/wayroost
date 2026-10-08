@@ -72,7 +72,7 @@ export function createSupervisor(options: SupervisorOptions) {
   });
   const status: StatusSource = async signal => {
     const capabilities = configVerbs ? await configVerbs.status() : undefined;
-    return { ...await componentStatus(signal), ...(capabilities ? { configVerbs: { ...capabilities, verbs: [...new Set([...capabilities.verbs, 'usage.summary'])] } } : {}) };
+    return { ...await componentStatus(signal), ...(capabilities ? { configVerbs: { ...capabilities, restartWhenIdleCertified: config.restartWhenIdleCertified, verbs: [...new Set([...capabilities.verbs, 'usage.summary'])] } } : {}) };
   };
   const clients = new Map<ServerResponse, { stream: EventStream; scope: Key['scope'] }>();
   const sendEvent = (event: SupervisorEvent) => {
@@ -149,6 +149,9 @@ export function createSupervisor(options: SupervisorOptions) {
         if (!configVerbs) { json(res, 200, { ok: false, code: 'not_configured' }); return; }
         let input: unknown;
         try { input = await readBody(); } catch { json(res, 400, { ok: false, code: 'invalid_parameters' }); return; }
+        if (serviceMethod === 'drainRestart' && !config.restartWhenIdleCertified && input && typeof input === 'object' && 'when' in input && input.when === 'idle' && 'component' in input && input.component === 'hermes') {
+          json(res, 409, { ok: false, code: 'not_rolled_out' }); return;
+        }
         const result = await configVerbs[serviceMethod](input, key);
         const outcome = result.ok && 'run' in result ? drainRunResult(result.run) : undefined;
         json(res, outcome === 'pending' ? 202 : outcome && outcome !== 'ok' ? 409 : 200, result); return;

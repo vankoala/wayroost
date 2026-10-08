@@ -47,6 +47,7 @@ mkdirSync(OUT, { recursive: true });
 const access = await createLocalAccess({ issuer: 'http://127.0.0.1:1' });
 const config = parseConfig(
   {
+    rollout: { settingsPages: true, revokes: true, chatFirst: true },
     listen: { host: '127.0.0.1', port: APP_PORT },
     // This PC's own listener, writes confirmed: the desktop settings shots open there,
     // which is the only place pc-only rows read whole values instead of digests.
@@ -524,6 +525,44 @@ async function checkContrast(page: Page, selector: string, minimum: number, labe
 }
 
 try {
+  for (const dark of [false, true]) {
+    for (const size of [phone, { width: 1280, height: 820 }]) {
+      const suffix = `${size.width}-${dark ? 'dark' : 'light'}`;
+      for (const switches of [
+        { settingsPages: false, revokes: false, chatFirst: false },
+        { settingsPages: true, revokes: false, chatFirst: true },
+        { settingsPages: true, revokes: true, chatFirst: true },
+      ]) {
+        config.rollout = switches;
+        await shoot(`rollout-safety-${switches.settingsPages}-${switches.revokes}-${suffix}`, {
+          ...size, dark, origin: 'local', path: '/settings/safety', ready: '.safety-approvals',
+          act: async page => {
+            const mode = page.locator('input[name="approval-mode"][value="manual"]');
+            if (await mode.isDisabled() === switches.settingsPages) problems.push('rollout: approval-mode access does not match settingsPages');
+            const revokes = page.locator('.safety-always button[aria-label^="Revoke"]');
+            if (!await revokes.count()) problems.push('rollout: saved allowlist is missing');
+            for (const revoke of await revokes.all()) {
+              if (await revoke.isDisabled() === (switches.settingsPages && switches.revokes)) problems.push('rollout: revoke access does not match its switches');
+            }
+            if (!switches.settingsPages && await page.locator('fieldset button:not(:disabled), fieldset input:not(:disabled), fieldset select:not(:disabled)').count()) problems.push('rollout: settings write control is enabled');
+          },
+        });
+      }
+      for (const enabled of [false, true]) {
+        config.rollout = { settingsPages: enabled, revokes: enabled, chatFirst: enabled };
+        await shoot(`rollout-chat-${enabled}-${suffix}`, {
+          ...size, dark, path: '/chats', ready: '.row',
+          act: async page => {
+            await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+            await page.locator(enabled ? '.advanced-toggle' : '.basic-toggle').waitFor();
+            await page.locator(enabled ? '.advanced-toggle' : '.basic-toggle').click();
+            await page.locator(enabled ? '.basic-toggle' : '.advanced-toggle').waitFor();
+          },
+        });
+      }
+      config.rollout = { settingsPages: true, revokes: true, chatFirst: true };
+    }
+  }
   const systemThemes: Record<string, Record<string, string>> = {};
   for (const theme of ['system', 'light', 'dark'] as const) {
     for (const os of ['light', 'dark'] as const) {
@@ -3276,7 +3315,10 @@ try {
     after: async (page) => {
       const box = page.locator('.notification-rules');
       await box.locator('select[aria-label="Alert 2 delivery"]').selectOption('push');
+      const saveResponse = page.waitForResponse(response => response.url().endsWith('/api/settings/notifications') && response.request().method() === 'PUT');
       await box.getByRole('button', { name: 'Save notification rules' }).click();
+      const saved = await saveResponse;
+      if (!saved.ok()) throw new Error(`Notification rules save refused: ${(await saved.json()).code}`);
       await until('the rules saved', async () => (await page.getByText('Saved.', { exact: true }).count()) > 0, 5_000);
       await page.reload();
       await page.waitForSelector('.notification-rules');

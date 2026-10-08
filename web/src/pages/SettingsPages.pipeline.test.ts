@@ -51,7 +51,7 @@ beforeEach(() => {
   sent = [];
   invalidWrites = [];
   installFetch();
-  setState((s) => ({ ...s, device: desktop, toasts: [], unpaired: false, sessionExpired: false }));
+  setState((s) => ({ ...s, rollout: { settingsPages: true, revokes: true, chatFirst: true }, device: desktop, toasts: [], unpaired: false, sessionExpired: false }));
 });
 
 function installFetch() {
@@ -127,6 +127,7 @@ function sectionFor(kind: 'desktop' | 'phone') {
     access,
     agents: {
       section: 'agents',
+      rollout: { settingsPages: true, revokes: true, chatFirst: true },
       agentAvailability: [{ id: 'copilot', installed: false, authenticated: null }],
       views: [
         { ok: true, view: 'hermes.agents', present: true, sha256: 'a'.repeat(64), values: [
@@ -161,6 +162,7 @@ function sectionFor(kind: 'desktop' | 'phone') {
     },
     models: {
       section: 'models',
+      rollout: { settingsPages: true, revokes: true, chatFirst: true },
       agentAvailability: [{ id: 'claude', installed: true, authenticated: true }, { id: 'codex', installed: true, authenticated: false }, { id: 'copilot', installed: false, authenticated: null }],
       modelStatus: [{ role: 'main', health: 'up', inFlight: 2 }],
       views: [
@@ -205,6 +207,8 @@ function sectionFor(kind: 'desktop' | 'phone') {
     },
     safety: {
       section: 'safety',
+      rollout: { settingsPages: true, revokes: true, chatFirst: true },
+      restartWhenIdleCertified: true,
       views: [
         { ok: true, view: 'hermes.safety', present: true, sha256: 'f'.repeat(64), values: [
           value(['approvals', 'mode'], 'smart'),
@@ -853,6 +857,7 @@ describe('Settings → Safety', () => {
 describe('Overview → Recent changes', () => {
   const changesPayload = {
     section: 'overview',
+    rollout: { settingsPages: true, revokes: true, chatFirst: true },
     changes: [
       {
         id: 'ch_0000000000000000000000a1',
@@ -2576,7 +2581,7 @@ describe('settings integration flows', () => {
     startedAt: 1, attempts: 0, probeAttempts: 0, busy: ['call'], protocol: 1 });
 
   it.each([...OWNER_FILE_TARGETS, ...ROOT_TARGETS])('sends the exact accept-current request for %s even with no target view', async target => {
-    sections.checks = { section: 'checks', views: [], operations: [{ operation: 'settings.accept-current', title: 'Accept the current file as is', access: 'editable' }] };
+    sections.checks = { section: 'checks', rollout: { settingsPages: true, revokes: true, chatFirst: true }, views: [], operations: [{ operation: 'settings.accept-current', title: 'Accept the current file as is', access: 'editable' }] };
     nextReply = { status: 200, body: confirmAnswer };
     const id = 'settings.blocked-' + target;
     await render(h(CheckRows, { rows: [{ id, state: 'fail', sentence: 'Accept the current file as is',

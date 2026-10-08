@@ -87,6 +87,8 @@ export type Timing = readonly TimingNote[];
 export const SETTINGS_ERROR_CODES = [
   /** The server runs in shadow and refuses every settings write. */
   'shadow_read_only',
+  /** The site has not enabled this settings write. */
+  'not_rolled_out',
   /** The settings audit can't be appended (its chain is broken); writes stop, chats keep working. */
   'audit_unavailable',
   /** A launched config write could not be confirmed; reconcile with config.read. */
@@ -520,7 +522,7 @@ export const changeResultSchema = z.object({
   undoable: z.boolean(),
   /** An open Hermes settings page can restore every stale value, including revoked entries: reload it before saving. */
   reloadOpenPages: z.boolean().optional(),
-  restartRequired: z.object({ component: z.literal('hermes'), choices: z.tuple([z.literal('idle'), z.literal('now')]),
+  restartRequired: z.object({ component: z.literal('hermes'), choices: z.union([z.tuple([z.literal('now')]), z.tuple([z.literal('idle'), z.literal('now')])]),
     timing: timingSchema, runId: z.uuid({ version: 'v4' }).optional(), code: settingsErrorCodeSchema.optional() }).strict().optional(),
 }).strict();
 export type ChangeResult = z.infer<typeof changeResultSchema>;

@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react';
+import type { Rollout } from '../../shared/rollout.js';
 import type {
   Approval,
   DeviceInfo,
@@ -55,6 +56,7 @@ export interface ViewerImage {
 }
 
 export interface AppState {
+  rollout?: import('../../shared/rollout.js').Rollout;
   /** Bumped when Hermes' scheduled jobs change, so an open Scheduled-jobs page refetches. */
   schedulesVersion: number;
   /** For you: cards to show (new and seen), by id; null until loaded or when it's turned off. */
@@ -108,12 +110,21 @@ const initialState: AppState = {
 
 let state = initialState;
 let authenticationGeneration = 0;
+const rolloutGenerations: Record<keyof Rollout, number> = { settingsPages: 0, revokes: 0, chatFirst: 0 };
 let nativeAuthentication = false;
 let applyingNativeAuthentication = false;
 const listeners = new Set<() => void>();
 
 export function getAuthenticationGeneration(): number { return authenticationGeneration; }
 export function authenticationBlocked(): boolean { return state.unpaired || state.sessionExpired; }
+
+export function getRolloutGeneration(key: keyof Rollout): number { return rolloutGenerations[key]; }
+
+/** A closed rollout cannot resume work captured before it, even after reopening. */
+export function captureRollout(...keys: (keyof Rollout)[]): { still(): boolean } {
+  const captured = keys.map(key => [key, getRolloutGeneration(key)] as const);
+  return { still: () => captured.every(([key, generation]) => state.rollout?.[key] === true && getRolloutGeneration(key) === generation) };
+}
 
 export function getState(): AppState {
   return state;
@@ -127,6 +138,9 @@ export function setState(update: (s: AppState) => AppState): void {
   // Late requests, socket events and UI callbacks cannot repopulate a suspended generation.
   if (authenticationBlocked() && !authenticationChanged) return;
   if (authenticationChanged) authenticationGeneration += 1;
+  for (const key of Object.keys(rolloutGenerations) as (keyof Rollout)[]) {
+    if (state.rollout?.[key] === true && next.rollout?.[key] !== true) rolloutGenerations[key] += 1;
+  }
   state = next;
   for (const listener of listeners) listener();
 }

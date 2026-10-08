@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
 import { act, createElement as h } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NotificationSettingsView } from '../../shared/protocol';
 import { NotificationRules } from './components/NotificationRules';
 import { ForYouSettings } from './components/ForYouSettings';
-import { api } from './api';
+import { api, serializeNotificationSettingsSave } from './api.js';
 import { disablePush, enablePush, pushState } from './push';
 import { getState, setState } from './store';
 
@@ -68,6 +68,7 @@ vi.mock('./push', () => ({
 
 const initial = getState();
 const startingView = fixture.view;
+beforeEach(() => setState(s => ({ ...s, rollout: { settingsPages: true, revokes: true, chatFirst: true } })));
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
@@ -102,6 +103,204 @@ const select = (box: HTMLElement, label: string): HTMLSelectElement =>
   box.querySelector(`select[aria-label="${label}"]`) as HTMLSelectElement;
 const button = (box: HTMLElement, label: string): HTMLButtonElement =>
   box.querySelector(`button[aria-label="${label}"]`) as HTMLButtonElement;
+
+describe('notification write rollout', () => {
+  it.each(['quiet hours', 'phone alerts'].flatMap(control => [false, undefined].map(settingsPages => ({ control, settingsPages }))))
+  ('cancels a delayed $control save when settings metadata becomes $settingsPages', async ({ control, settingsPages }) => {
+    const box = await render();
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    vi.mocked(api.notificationSettings).mockImplementationOnce(async () => { await waiting; return fixture.view; });
+    await act(async () => {
+      if (control === 'quiet hours') {
+        const start = select(box, 'Quiet hours start');
+        start.value = '22:00';
+        start.dispatchEvent(new Event('change', { bubbles: true }));
+      } else button(box, 'Notify when an agent needs you').click();
+    });
+    await act(async () => setState(s => ({ ...s, rollout: settingsPages === undefined ? undefined
+      : { settingsPages, revokes: false, chatFirst: false } })));
+    await act(async () => release());
+    expect(fixture.saved).toEqual([]);
+    expect(fixture.view.quietHours).toEqual(startingView.quietHours);
+    expect(fixture.view.push).toEqual(startingView.push);
+    expect(select(box, 'Quiet hours start').matches(':disabled')).toBe(true);
+  });
+
+  it.each(['rules', 'quiet hours', 'phone alerts'])('cancels a queued %s save before it reads or writes', async control => {
+    const box = await render();
+    await act(async () => {
+      const delivery = select(box, 'Alert 2 delivery');
+      delivery.value = 'push';
+      delivery.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    let release!: () => void;
+    const queued = serializeNotificationSettingsSave(() => new Promise<void>(resolve => { release = resolve; }));
+    await act(async () => {
+      button(box, control === 'rules' ? 'Save notification rules' : control === 'quiet hours' ? 'Quiet hours' : 'Notify when an agent needs you').click();
+    });
+    await act(async () => setState(s => ({ ...s, rollout: undefined })));
+    const reads = vi.mocked(api.notificationSettings).mock.calls.length;
+    await act(async () => { release(); await queued; });
+    expect(vi.mocked(api.notificationSettings)).toHaveBeenCalledTimes(reads);
+    expect(fixture.saved).toEqual([]);
+  });
+
+  it('does not resume a cancelled save when settings rollout reopens before its read returns', async () => {
+    const box = await render();
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    vi.mocked(api.notificationSettings).mockImplementationOnce(async () => { await waiting; return fixture.view; });
+    await act(async () => {
+      const start = select(box, 'Quiet hours start');
+      start.value = '22:00';
+      start.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => setState(s => ({ ...s, rollout: { settingsPages: false, revokes: false, chatFirst: false } })));
+    await act(async () => setState(s => ({ ...s, rollout: { settingsPages: true, revokes: false, chatFirst: false } })));
+    await act(async () => release());
+    expect(fixture.saved).toEqual([]);
+    await act(async () => button(box, 'Quiet hours').click());
+    expect(fixture.saved).toEqual([{ quietHours: null }]);
+  });
+});
+
+describe('For-you rollout', () => {
+  it.each([false, undefined, true])('requires explicit enabled settings metadata for every write, received %s', async settingsPages => {
+    fixture.feedEnabled = true;
+    const feed = api.feed;
+    vi.spyOn(api, 'feed').mockImplementation(async () => {
+      const list = await feed();
+      return { ...list, settings: { ...list.settings, lessLike: [{ topic: 'Example topic', example: 'Example card', at: 0 }] } };
+    });
+    setState(s => ({ ...s, rollout: settingsPages === undefined ? undefined : { settingsPages, revokes: false, chatFirst: false } }));
+    const save = vi.spyOn(api, 'feedSettings');
+    const box = (await render(true)).querySelector<HTMLElement>('.foryou-settings')!;
+    expect(box.textContent).toContain('Quiet hours');
+    expect(button(box, 'Bring back Example topic')).toBeTruthy();
+    const deviceSwitch = button(box, 'Notifications on this device');
+    const deviceTest = [...box.querySelectorAll<HTMLButtonElement>('button')].find(control => control.textContent?.trim() === 'Send a test')!;
+    expect(deviceSwitch.matches(':disabled')).toBe(false);
+    expect(deviceTest.matches(':disabled')).toBe(false);
+    const controls = [...box.querySelectorAll<HTMLButtonElement | HTMLSelectElement>('button, select')].filter(control => control !== deviceSwitch && control !== deviceTest);
+    expect(controls.length).toBeGreaterThan(5);
+    for (const control of controls) expect(control.matches(':disabled'), control.getAttribute('aria-label') ?? control.textContent).toBe(settingsPages !== true);
+    await act(async () => button(box, 'Quiet hours').click());
+    expect(save).toHaveBeenCalledTimes(settingsPages === true ? 1 : 0);
+    if (settingsPages !== true) {
+      await act(async () => {
+        for (const control of controls) {
+          if (control.tagName === 'SELECT') control.dispatchEvent(new Event('change', { bubbles: true }));
+          else control.click();
+        }
+      });
+      expect(save).not.toHaveBeenCalled();
+      expect(enablePush).not.toHaveBeenCalled();
+      expect(disablePush).not.toHaveBeenCalled();
+      expect(api.pushTest).not.toHaveBeenCalled();
+    }
+  });
+
+  it('locks already loaded For-you controls when settings rollout disappears', async () => {
+    fixture.feedEnabled = true;
+    const save = vi.spyOn(api, 'feedSettings');
+    const box = (await render(true)).querySelector<HTMLElement>('.foryou-settings')!;
+    expect(button(box, 'Quiet hours').disabled).toBe(false);
+    await act(async () => setState(s => ({ ...s, rollout: undefined })));
+    expect(button(box, 'Quiet hours').disabled).toBe(true);
+    await act(async () => button(box, 'Quiet hours').click());
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('refuses a quiet-hours save if rollout is disabled while its current values are loading', async () => {
+    fixture.feedEnabled = true;
+    const box = (await render(true)).querySelector<HTMLElement>('.foryou-settings')!;
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const feed = api.feed;
+    vi.spyOn(api, 'feed').mockImplementationOnce(async () => { await pending; return feed(); });
+    const save = vi.spyOn(api, 'feedSettings');
+    await act(async () => {
+      const control = select(box, 'Quiet hours start');
+      control.value = '22:00';
+      control.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => setState(s => ({ ...s, rollout: { settingsPages: false, revokes: false, chatFirst: false } })));
+    await act(async () => release());
+    expect(save).not.toHaveBeenCalled();
+    expect(select(box, 'Quiet hours start').disabled).toBe(true);
+  });
+
+  it.each(['read', 'queue'].flatMap(wait => [false, undefined].flatMap(settingsPages =>
+    [false, true].map(batched => ({ wait, settingsPages, batched })))))
+  ('cancels a quiet-hours save waiting on $wait after rollout becomes $settingsPages and reopens, batched: $batched', async ({ wait, settingsPages, batched }) => {
+    fixture.feedEnabled = true;
+    const box = (await render(true)).querySelector<HTMLElement>('.foryou-settings')!;
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const feed = api.feed;
+    const read = vi.spyOn(api, 'feed');
+    if (wait === 'read') read.mockImplementationOnce(async () => { await waiting; return feed(); });
+    const queued = wait === 'queue' ? serializeNotificationSettingsSave(() => waiting) : undefined;
+    const save = vi.spyOn(api, 'feedSettings');
+    await act(async () => {
+      const start = select(box, 'Quiet hours start');
+      start.value = '22:00';
+      start.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    const close = () => setState(s => ({ ...s, rollout: settingsPages === undefined ? undefined
+      : { settingsPages, revokes: false, chatFirst: false } }));
+    const reopen = () => setState(s => ({ ...s, rollout: { settingsPages: true, revokes: false, chatFirst: false } }));
+    if (batched) await act(async () => { close(); reopen(); });
+    else {
+      await act(async () => close());
+      await act(async () => reopen());
+    }
+    const reads = read.mock.calls.length;
+    await act(async () => { release(); await queued; });
+    expect(read).toHaveBeenCalledTimes(reads);
+    expect(save).not.toHaveBeenCalled();
+    expect(fixture.view.quietHours).toEqual(startingView.quietHours);
+    expect(select(box, 'Quiet hours start').value).toBe('21:00');
+    expect(select(box, 'Quiet hours start').disabled).toBe(false);
+    await act(async () => {
+      const start = select(box, 'Quiet hours start');
+      start.value = '22:00';
+      start.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    expect(save).toHaveBeenCalledExactlyOnceWith({ quietHours: { start: '22:00', end: '07:00' } });
+  });
+
+  it.each(['quiet hours', 'phone alerts', 'proactivity', 'topic'])('cancels a queued %s write through a missing-metadata and reenable cycle', async control => {
+    fixture.feedEnabled = true;
+    const feed = api.feed;
+    vi.spyOn(api, 'feed').mockImplementation(async () => {
+      const list = await feed();
+      return { ...list, settings: { ...list.settings, lessLike: [{ topic: 'Example topic', example: 'Example card', at: 0 }] } };
+    });
+    const box = (await render(true)).querySelector<HTMLElement>('.foryou-settings')!;
+    let release!: () => void;
+    const queued = serializeNotificationSettingsSave(() => new Promise<void>(resolve => { release = resolve; }));
+    const save = vi.spyOn(api, 'feedSettings');
+    await act(async () => {
+      if (control === 'proactivity') {
+        const level = select(box, 'How often Hermes speaks up');
+        level.value = 'low';
+        level.dispatchEvent(new Event('change', { bubbles: true }));
+      } else button(box, control === 'quiet hours' ? 'Quiet hours'
+        : control === 'phone alerts' ? 'Notify when an agent needs you' : 'Bring back Example topic').click();
+    });
+    await act(async () => {
+      setState(s => ({ ...s, rollout: undefined }));
+      setState(s => ({ ...s, rollout: { settingsPages: true, revokes: false, chatFirst: false } }));
+    });
+    await act(async () => { release(); await queued; });
+    expect(save).not.toHaveBeenCalled();
+    expect(button(box, 'Quiet hours').disabled).toBe(false);
+    await act(async () => button(box, 'Quiet hours').click());
+    expect(save).toHaveBeenCalledExactlyOnceWith({ quietHours: null });
+  });
+});
 
 describe('phone controls without For you', () => {
   it('subscribes an HTTPS browser from the settings switch with For you disabled', async () => {

@@ -63,7 +63,7 @@ import type { SettingsChecksResponse } from '../../shared/settings-checks.js';
 import type { DrainRestartComponent } from '../../shared/settings.js';
 import type { SettingsCredentialPayload, SettingsRefusal, SettingsRestartPayload, SettingsSectionPayload, SettingsUsagePayload } from './settingsModel.js';
 import { isApprovalDetail, isApprovalSnapshot } from '../../shared/approval-validation';
-import { approvalKey, convKey, getAuthenticationGeneration, markUnpaired, setState, toast, withEarlyItems } from './store';
+import { captureRollout, approvalKey, convKey, getAuthenticationGeneration, markUnpaired, setState, toast, withEarlyItems } from './store.js';
 import { ApiError, beginAuthenticatedRequest, checkAuthentication, checkAuthenticationGeneration, reportAuthenticationAnomaly } from './authentication';
 import { authenticationEndpoint } from '../../shared/authentication';
 import { speechRequest } from './voice/request';
@@ -429,7 +429,10 @@ export const api = {
   settingsRestart: (component: DrainRestartComponent, when: 'idle' | 'now', confirm?: string) =>
     settingsCall<SettingsRestartPayload>('POST', SETTINGS_API.restart, { component, when, ...(confirm ? { confirm } : {}) }),
   setNotificationSettings: async (body: SettingsNotificationsWriteBody): Promise<NotificationSettingsView> => {
+    const rollout = captureRollout('settingsPages');
+    if (!rollout.still()) throw new Error('This setting was turned off on this site');
     const result = await request<SettingsApplyResponse>('PUT', '/api/settings/notifications', body);
+    if (!rollout.still()) throw new Error('This setting was turned off on this site');
     if (result.status !== 'applied') throw new ApiError(result.status === 'refused'
       ? `Settings change refused: ${result.code.replaceAll('_', ' ')}.` : 'This settings change needs confirmation.', 'http');
     return api.notificationSettings();
@@ -504,6 +507,13 @@ export function dropThreads(threads: readonly ThreadRef[]): void {
   });
 }
 
+/** Client writes refused when settings pages have not rolled out. */
+export const ROLLOUT_GATED_API = [
+  'settingsApply', 'settingsUndo', 'settingsRestart', 'settingsCredentialSet', 'settingsCredentialRemove',
+  'settingsCredentialTest', 'setNotificationSettings', 'feedSettings', 'setSafetyCommands', 'setCloudAgent',
+  'setWorkerApprovals', 'setHermesCredentials', 'clearHermesCredentials',
+].map(name => ({ name: name as keyof typeof api, key: 'settingsPages' as const }));
+
 const threadCount = (n: number) => `${n} ${n === 1 ? 'thread' : 'threads'}`;
 
 /**
@@ -533,12 +543,15 @@ export async function loadFeed(): Promise<FeedSettings | null> {
   }
 }
 
-export async function refreshList(): Promise<void> {
+export async function refreshList(rollout?: ReturnType<typeof captureRollout>): Promise<void> {
+  if (rollout && !rollout.still()) return;
   const generation = getAuthenticationGeneration();
   const data = await api.list();
+  if (rollout && !rollout.still()) return;
   processResponse(generation, () => setState((s) => ({
     ...s,
     listLoaded: true,
+    rollout: data.rollout ?? { settingsPages: false, revokes: false, chatFirst: false },
     statuses: Object.fromEntries(data.statuses.map((st) => [st.source, st])) as typeof s.statuses,
     conversations: Object.fromEntries(data.conversations.map((c) => [convKey(c.source, c.id), c])),
     approvals: Object.fromEntries(data.approvals.map((a) => [approvalKey(a), a])),

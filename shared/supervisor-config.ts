@@ -104,6 +104,7 @@ export const gatewayPersistenceSchema = z.union([
 export const configVerbsStatusSchema = z.object({
   version: z.number().int().positive(),
   configWrites: z.boolean(),
+  restartWhenIdleCertified: z.boolean().optional(),
   /** Preserve unknown future verbs; callers check membership for verbs they understand. */
   verbs: z.array(z.string().min(1).max(128)),
   /** The catalogue's version (settings-ops.ts), so a caller can tell an older supervisor. */

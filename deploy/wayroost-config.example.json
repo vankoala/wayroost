@@ -6,7 +6,8 @@
   },
   "publicOrigin": "https://wayroost.example.com",
   "origins": [
-    "https://127.0.0.1:8881"
+    "https://127.0.0.1:8881",
+    "https://127.0.0.1:8883"
   ],
   "devices": {
     "enabled": true
@@ -38,5 +39,15 @@
   "stateDir": "/var/lib/wayroost",
   "tls": {
     "certFile": "/etc/wayroost/server-tls-cert.pem"
+  },
+  "rollout": {
+    "settingsPages": false,
+    "revokes": false,
+    "chatFirst": false
+  },
+  "localListener": {
+    "host": "127.0.0.1",
+    "port": 8883,
+    "pcOnlyWrites": false
   }
 }

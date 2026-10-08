@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, Menu, net, Notification, powerMonitor, safeStorage, session, shell } from 'electron';
-import { desktopOrigin, installCertificatePin, ListenerIdentityError, ListenerNotPairedError, parsePairingToken, pairPinnedDesktop, pinnedOriginRequest, type DesktopPins } from './tls.js';
+import { localListenerOrigin, parseListenerPins, desktopOrigin, installCertificatePin, ListenerIdentityError, ListenerNotPairedError, parsePairingToken, pairPinnedDesktop, pinnedOriginRequest, type DesktopPins } from './tls.js';
 import { ListenerCertificateDateError, parsePin } from '../../lib/loopback-tls.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -28,7 +28,7 @@ if (development) {
   app.setPath('userData', directory);
   app.setPath('sessionData', directory);
 }
-const origin = desktopOrigin(developmentSetting(development ? process.env.WAYROOST_URL : undefined, app.isPackaged, development ? 'http://127.0.0.1:8896' : 'https://127.0.0.1:8881'), development);
+let origin = desktopOrigin(developmentSetting(development ? process.env.WAYROOST_URL : undefined, app.isPackaged, development ? 'http://127.0.0.1:8896' : localListenerOrigin()), development);
 let pins: DesktopPins | undefined;
 let identityProblem: string | undefined;
 let rescueIdentityProblem: string | undefined;
@@ -204,7 +204,8 @@ async function start() {
     try {
       secureStorage();
       const saved = JSON.parse(safeStorage.decryptString(readFileSync(pinPath))) as DesktopPins;
-      pins = { serverPin: saved.serverPin === '' ? '' : parsePin(saved.serverPin), rescuePin: parsePin(saved.rescuePin) };
+      pins = parseListenerPins(saved);
+      origin = localListenerOrigin(pins);
     } catch { identityProblem = 'Saved fingerprints are unavailable. Pair this desktop again using sudo wayroost pair-desktop.'; }
   }
   const partition = session.fromPartition('persist:wayroost');
@@ -382,7 +383,8 @@ async function start() {
             if (typeof key !== 'string' || key.length > 4096) throw new Error('Enter the rescue key.');
             await checkRescueKey(rescueUrl, key, { pin: () => token.rescuePin });
           }
-          const cookie = await pairPinnedDesktop(origin, token);
+          const pairingOrigin = localListenerOrigin(token);
+          const cookie = await pairPinnedDesktop(pairingOrigin, token);
           // A pin is fixed for the network service's lifetime: restart rather than reuse cached decisions.
           switchingIdentity = true; client.stop();
           if (!window.isDestroyed()) { window.webContents.stop(); window.destroy(); }
@@ -390,9 +392,9 @@ async function start() {
           await partition.clearStorageData({ storages: ['cookies', 'serviceworkers', 'cachestorage'] });
           await partition.clearCache();
           // Save trust first so a failed update cannot leave the replacement key beside the old pin.
-          writeFileSync(pinPath, safeStorage.encryptString(JSON.stringify({ serverPin: token.serverPin, rescuePin: token.rescuePin })), { mode: 0o600 });
+          writeFileSync(pinPath, safeStorage.encryptString(JSON.stringify({ serverPin: token.serverPin, rescuePin: token.rescuePin, localPort: token.localPort })), { mode: 0o600 });
           if (typeof key === 'string' && key) writeFileSync(keyPath, safeStorage.encryptString(key), { mode: 0o600 });
-          await partition.cookies.set({ url: origin, name: 'wr_device', value: cookie, httpOnly: true, secure: true, sameSite: 'strict', path: '/', expirationDate: Date.now() / 1000 + 400 * 86400 });
+          await partition.cookies.set({ url: pairingOrigin, name: 'wr_device', value: cookie, httpOnly: true, secure: true, sameSite: 'strict', path: '/', expirationDate: Date.now() / 1000 + 400 * 86400 });
           await partition.cookies.flushStore();
           app.relaunch(); app.quit();
           return { sentence: 'Desktop paired and fingerprints saved. Restarting Wayroost…' };
@@ -408,7 +410,7 @@ async function start() {
         if (!development && candidateRescuePin) {
           if (!pins) {
             // Rescue-only setup works while the server is down; no server fingerprint is inferred.
-            pins = { serverPin: '', rescuePin: candidateRescuePin };
+            pins = { serverPin: '', rescuePin: candidateRescuePin, localPort: 8883 };
           }
           writeFileSync(pinPath, safeStorage.encryptString(JSON.stringify(pins)), { mode: 0o600 });
         }

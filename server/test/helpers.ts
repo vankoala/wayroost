@@ -100,6 +100,7 @@ export function makeConfig(staticDir?: string, extra: Record<string, unknown> = 
   const stateDir = mkdtempSync(join(tmpdir(), 'sb-state-'));
   seedDevices(stateDir);
   return parseConfig({
+    rollout: { settingsPages: true, revokes: true, chatFirst: true },
     publicOrigin: ORIGIN,
     access: { teamDomain: ISSUER, aud: AUD, allowedEmails: [EMAIL] },
     stateDir,

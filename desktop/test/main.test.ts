@@ -525,7 +525,7 @@ describe('window visibility through authentication recovery', () => {
 const serverPin = 'sha256/' + Buffer.alloc(32, 1).toString('base64');
 const rescuePin = 'sha256/' + Buffer.alloc(32, 2).toString('base64');
 const token = JSON.stringify({ code: 'a'.repeat(26), serverPin, rescuePin });
-async function production(saved: { serverPin: string; rescuePin: string } | null = { serverPin, rescuePin }, packaged = true) {
+async function production(saved: { serverPin: string; rescuePin: string; localPort?: number } | null = { serverPin, rescuePin }, packaged = true) {
   vi.useFakeTimers();
   const argv = process.argv;
   process.argv = argv.filter(arg => arg !== '--wayroost-desktop-dev');
@@ -642,7 +642,7 @@ describe('protocol launch isolation', () => {
     await production({ serverPin, rescuePin }, false);
     expect(mocks.app.setAsDefaultProtocolClient).toHaveBeenCalledExactlyOnceWith('wayroost', process.execPath, [home]);
     expect(mocks.app.setPath).not.toHaveBeenCalled();
-    expect(mocks.partition.fetch).toHaveBeenCalledWith('https://127.0.0.1:8881/api/me', expect.anything());
+    expect(mocks.partition.fetch).toHaveBeenCalledWith('https://127.0.0.1:8883/api/me', expect.anything());
   });
 });
 
@@ -673,6 +673,29 @@ describe('automatic login registration', () => {
 });
 
 describe('production TLS wiring', () => {
+  it('uses the canonical origin from saved port 443 for HTTP, WebSocket and internal navigation', async () => {
+    await production({ serverPin, rescuePin, localPort: 443 });
+    expect(mocks.partition.fetch).toHaveBeenCalledWith('https://127.0.0.1/api/me', expect.anything());
+    expect(mocks.windows[0]!.loadURL).toHaveBeenCalledWith('https://127.0.0.1');
+    expect(mocks.socketOpened).toHaveBeenCalledExactlyOnceWith('wss://127.0.0.1/ws', { session: mocks.partition, useSessionCookies: true, origin: 'https://127.0.0.1', headers: { 'x-wayroost-app': 'desktop' } });
+    for (const event of ['will-navigate', 'will-redirect']) {
+      for (const url of ['https://127.0.0.1/chats', 'https://127.0.0.1:443/chats']) {
+        const preventDefault = vi.fn();
+        mocks.windows[0]!.webContents.emit(event, { preventDefault }, url);
+        expect(preventDefault).not.toHaveBeenCalled();
+      }
+    }
+    expect(mocks.shell.openExternal).not.toHaveBeenCalled();
+  });
+  it('pairs port 443 with the canonical origin and preserves the pinned port', async () => {
+    await production(null);
+    mocks.rescueKeyCheck.mockResolvedValue({}); mocks.pairPinned.mockResolvedValue('demo-cookie');
+    const pairing = { code: 'a'.repeat(26), serverPin, rescuePin, localPort: 443 };
+    expect((await rescueRequest()('setup', { code: JSON.stringify(pairing), key: 'demo-rescue-key' })).sentence).toContain('Desktop paired');
+    expect(mocks.pairPinned).toHaveBeenCalledWith('https://127.0.0.1', pairing);
+    expect(mocks.partition.cookies.set).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://127.0.0.1', value: 'demo-cookie', secure: true }));
+    expect(JSON.parse(mocks.files.get(demoPath('listener-pins'))!.toString())).toEqual({ serverPin, rescuePin, localPort: 443 });
+  });
   it('installs both certificate verifiers and request gates before the first app load, fetch or socket', async () => {
     await production();
     const before = Math.min(mocks.windows[0]!.loadURL.mock.invocationCallOrder[0]!, mocks.partition.fetch.mock.invocationCallOrder[0]!, mocks.socketOpened.mock.invocationCallOrder[0]!);
@@ -680,25 +703,25 @@ describe('production TLS wiring', () => {
       expect(hook).toHaveBeenCalledOnce();
       expect(hook.mock.invocationCallOrder[0]).toBeLessThan(before);
     }
-    for (const url of ['https://127.0.0.1:8881/api/me', 'wss://127.0.0.1:8881/ws']) {
+    for (const url of ['https://127.0.0.1:8883/api/me', 'wss://127.0.0.1:8883/ws']) {
       const callback = vi.fn(); headerGuard()({ url, requestHeaders: { Cookie: 'wr_device=demo-cookie' } }, callback);
       expect(callback).toHaveBeenCalledWith({ requestHeaders: { Cookie: 'wr_device=demo-cookie', 'x-wayroost-app': 'desktop' } });
     }
-    for (const url of ['http://127.0.0.1:8881', 'https://127.0.0.1:8880', 'https://example.com']) {
+    for (const url of ['http://127.0.0.1:8883', 'https://127.0.0.1:8880', 'https://example.com']) {
       const callback = vi.fn(); headerGuard()({ url, requestHeaders: {} }, callback); expect(callback).toHaveBeenCalledWith({ cancel: true });
     }
-    const callback = vi.fn(); headerGuard(true)({ url: 'https://127.0.0.1:8881/api/me' }, callback);
+    const callback = vi.fn(); headerGuard(true)({ url: 'https://127.0.0.1:8883/api/me' }, callback);
     expect(callback).toHaveBeenCalledWith({ cancel: true });
   });
   it('sends the desktop marker on the native socket only to the pinned app origin, after the certificate verifier', async () => {
     await production();
-    expect(mocks.socketOpened).toHaveBeenCalledExactlyOnceWith('wss://127.0.0.1:8881/ws', { session: mocks.partition, useSessionCookies: true, origin: 'https://127.0.0.1:8881', headers: { 'x-wayroost-app': 'desktop' } });
+    expect(mocks.socketOpened).toHaveBeenCalledExactlyOnceWith('wss://127.0.0.1:8883/ws', { session: mocks.partition, useSessionCookies: true, origin: 'https://127.0.0.1:8883', headers: { 'x-wayroost-app': 'desktop' } });
     expect(mocks.partition.setCertificateVerifyProc.mock.invocationCallOrder[0]).toBeLessThan(mocks.socketOpened.mock.invocationCallOrder[0]!);
     expect(mocks.socketOpened.mock.calls.every(([, options]) => (options as { session: unknown }).session !== mocks.rescueSession)).toBe(true);
   });
   it.each([undefined, { serverPin: '', rescuePin }])('blocks every app request and opens no native socket without a server pin (%j)', async saved => {
     const client = await production(saved ?? null);
-    const callback = vi.fn(); headerGuard()({ url: 'https://127.0.0.1:8881/api/me', requestHeaders: {} }, callback);
+    const callback = vi.fn(); headerGuard()({ url: 'https://127.0.0.1:8883/api/me', requestHeaders: {} }, callback);
     expect(callback).toHaveBeenCalledWith({ cancel: true });
     expect(mocks.partition.fetch).not.toHaveBeenCalled(); expect(mocks.sockets).toHaveLength(0);
     expect(mocks.windows[0]!.loadURL).not.toHaveBeenCalled();
@@ -722,7 +745,7 @@ describe('production TLS wiring', () => {
     const appWindow = mocks.windows[0]!;
     expect(appWindow.visible).toBe(true);
     await vi.advanceTimersByTimeAsync(20000);
-    await appWindow.loadURL('https://127.0.0.1:8881'); await flush();
+    await appWindow.loadURL('https://127.0.0.1:8883'); await flush();
     expect(appWindow.visible).toBe(true); expect(mocks.windows).toHaveLength(1);
     expect(mocks.tray.update.mock.calls.at(-1)![0].sentence).toContain('supervisor');
     mocks.rescueStatus.mockResolvedValue({ overall: 'ok', sentence: 'Demo is running.', components: [], at: 0 });
@@ -750,12 +773,12 @@ describe('production TLS wiring', () => {
     expect((await request('setup', { key: 'demo-rescue-key', rescuePin: rotatedPin })).sentence).toContain('fresh desktop pairing token');
     expect(mocks.rescueKeyCheck).not.toHaveBeenCalled(); expect(mocks.pairPinned).not.toHaveBeenCalled();
     mocks.rescueKeyCheck.mockResolvedValue({}); mocks.pairPinned.mockResolvedValue('demo-cookie');
-    const rotatedToken = JSON.stringify({ code: 'b'.repeat(26), serverPin, rescuePin: rotatedPin });
+    const rotatedToken = JSON.stringify({ code: 'b'.repeat(26), serverPin, rescuePin: rotatedPin, localPort: 8883 });
     expect((await request('setup', { code: rotatedToken, key: 'demo-rescue-key' })).sentence).toContain('Desktop paired');
     const options = mocks.rescueKeyCheck.mock.calls[0]![2];
     expect(options.pin()).toBe(rotatedPin);
-    expect(mocks.pairPinned).toHaveBeenCalledWith('https://127.0.0.1:8881', { code: 'b'.repeat(26), serverPin, rescuePin: rotatedPin });
-    expect(JSON.parse(mocks.files.get(demoPath('listener-pins'))!.toString())).toEqual({ serverPin, rescuePin: rotatedPin });
+    expect(mocks.pairPinned).toHaveBeenCalledWith('https://127.0.0.1:8883', { code: 'b'.repeat(26), serverPin, rescuePin: rotatedPin, localPort: 8883 });
+    expect(JSON.parse(mocks.files.get(demoPath('listener-pins'))!.toString())).toEqual({ serverPin, rescuePin: rotatedPin, localPort: 8883 });
     expect(mocks.app.relaunch).toHaveBeenCalledOnce(); expect(mocks.app.quit).toHaveBeenCalledOnce();
   });
   it('does not poll an untrusted supervisor or repeatedly focus recovery on upgrades', async () => {
@@ -800,13 +823,13 @@ describe('production TLS wiring', () => {
     expect(mocks.fs.writeFileSync.mock.invocationCallOrder[pinWrite]).toBeLessThan(mocks.fs.writeFileSync.mock.invocationCallOrder[keyWrite]!);
     expect(mocks.fs.writeFileSync.mock.invocationCallOrder[pinWrite]).toBeLessThan(mocks.partition.cookies.set.mock.invocationCallOrder[0]!);
     expect(mocks.partition.cookies.flushStore.mock.invocationCallOrder[0]).toBeLessThan(mocks.app.relaunch.mock.invocationCallOrder[0]!);
-    expect(JSON.parse(mocks.files.get(demoPath('listener-pins'))!.toString())).toEqual({ serverPin, rescuePin });
+    expect(JSON.parse(mocks.files.get(demoPath('listener-pins'))!.toString())).toEqual({ serverPin, rescuePin, localPort: 8883 });
   });
   it.each(['closeAllConnections', 'clearStorageData', 'clearCache'] as const)('blocks rescue traffic while replacement credentials await %s and relaunch', async stage => {
     await production(); mocks.tray.setup(); await flush();
     const request = rescueRequest();
     const rotatedPin = 'sha256/' + Buffer.alloc(32, 3).toString('base64');
-    const rotatedToken = JSON.stringify({ code: 'b'.repeat(26), serverPin, rescuePin: rotatedPin });
+    const rotatedToken = JSON.stringify({ code: 'b'.repeat(26), serverPin, rescuePin: rotatedPin, localPort: 8883 });
     const cleanup = deferred<void>();
     mocks.partition[stage].mockImplementationOnce(() => cleanup.promise);
     mocks.rescueKeyCheck.mockResolvedValue({}); mocks.pairPinned.mockResolvedValue('demo-cookie');
@@ -876,7 +899,7 @@ describe('production TLS wiring', () => {
     await production(); mocks.tray.setup(); await flush();
     const request = rescueRequest();
     const rotatedPin = 'sha256/' + Buffer.alloc(32, 3).toString('base64');
-    const rotatedToken = JSON.stringify({ code: 'b'.repeat(26), serverPin, rescuePin: rotatedPin });
+    const rotatedToken = JSON.stringify({ code: 'b'.repeat(26), serverPin, rescuePin: rotatedPin, localPort: 8883 });
     mocks.rescueKeyCheck.mockResolvedValue({}); mocks.pairPinned.mockResolvedValue('demo-cookie');
     mocks.partition.cookies.flushStore.mockRejectedValueOnce(new Error('Demo cookie persistence failed'));
     expect((await request('setup', { code: rotatedToken, key: 'demo-replacement-key' })).sentence).toBe('Demo cookie persistence failed');
@@ -954,7 +977,7 @@ describe('production TLS wiring', () => {
       // Windows encryption (DPAPI) has no backend to ask: the pins open and the pinned app loads.
       expect(backend).not.toHaveBeenCalled();
       expect(mocks.storage.decryptString).toHaveBeenCalled();
-      expect(mocks.windows[0]!.loadURL).toHaveBeenCalledWith('https://127.0.0.1:8881');
+      expect(mocks.windows[0]!.loadURL).toHaveBeenCalledWith('https://127.0.0.1:8883');
     }
   });
   it('saves a first rescue fingerprint only when explicitly supplied and never infers a server pin', async () => {
@@ -963,7 +986,7 @@ describe('production TLS wiring', () => {
     expect((await request('setup', { key: 'demo-rescue-key' })).sentence).toContain('Enter the supervisor rescue fingerprint');
     expect(mocks.rescueKeyCheck).not.toHaveBeenCalled();
     expect((await request('setup', { key: 'demo-rescue-key', rescuePin })).sentence).toContain('Rescue key saved');
-    expect(JSON.parse(mocks.files.get(demoPath('listener-pins'))!.toString())).toEqual({ serverPin: '', rescuePin });
+    expect(JSON.parse(mocks.files.get(demoPath('listener-pins'))!.toString())).toEqual({ serverPin: '', rescuePin, localPort: 8883 });
     expect(mocks.pairPinned).not.toHaveBeenCalled(); expect(mocks.sockets).toHaveLength(0);
   });
 });

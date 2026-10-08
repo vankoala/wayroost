@@ -389,6 +389,7 @@ export interface PairResult {
 export const PAIR_PATH = '/pair';
 
 export interface ListResponse {
+  rollout?: import('./rollout.js').Rollout;
   role?: 'primary' | 'shadow';
   notifications?: boolean;
   /** Pending approvals the server currently routes to an app toast. */

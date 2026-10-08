@@ -1,4 +1,4 @@
-import { api } from './api';
+import { api } from './api.js';
 
 // Phone notifications for this browser: the service worker (public/sw.js) plus a
 // Web Push subscription Signalbox keeps. iPhones only allow it for Signalbox
@@ -38,6 +38,7 @@ function deviceLabel(): string {
   return os === 'iPhone' || os === 'iPad' ? os : `${browser} on ${os}`;
 }
 
+/** Re-register an existing subscription so this device recovers after pairing or a reinstall. */
 export async function pushState(): Promise<PushState> {
   if (!supported()) return isIos() && !standalone() ? 'needs-install' : 'unsupported';
   if (Notification.permission === 'denied') return 'denied';
@@ -56,16 +57,22 @@ export async function enablePush(): Promise<PushState> {
   if (!supported()) return isIos() && !standalone() ? 'needs-install' : 'unsupported';
   const permission = await Notification.requestPermission();
   if (permission !== 'granted') return permission === 'denied' ? 'denied' : 'off';
-  const registration = (await navigator.serviceWorker.getRegistration('/')) ?? (await navigator.serviceWorker.register('/sw.js', { scope: '/' }));
+  let registration = await navigator.serviceWorker.getRegistration('/');
+  if (!registration) {
+    registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+  }
   await navigator.serviceWorker.ready;
-  const key = keyBytes((await api.pushKey()).publicKey);
+  const response = await api.pushKey();
+  const key = keyBytes(response.publicKey);
   let subscription = await registration.pushManager.getSubscription();
   // One made with another key (a reinstall) can't be used: start over.
   if (subscription && !sameKey(subscription, key)) {
     await subscription.unsubscribe();
     subscription = null;
   }
-  subscription ??= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  }
   const json = subscription.toJSON() as { endpoint: string; keys: { p256dh: string; auth: string } };
   await api.pushAddDevice({ endpoint: json.endpoint, keys: json.keys, label: deviceLabel() });
   return 'on';

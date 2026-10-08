@@ -4,7 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, us
 import type { SettingsApplyResponse, SettingsErrorCode, SettingsLevel, SettingsSection, Timing } from '../../../shared/settings.js';
 import type { CloudAgent, CloudAgentsStatus, DeviceInfo } from '../../../shared/protocol.js';
 import { api } from '../api.js';
-import { toast, useStore } from '../store.js';
+import { captureRollout, getRolloutGeneration, getState, toast, useStore } from '../store.js';
 import { setState as setStoreState } from '../store.js';
 import { READ_VIEWS, operationKeys, operationSpec, operationTarget, undoLevel, type ReadViewId } from '../../../shared/settings-ops.js';
 import { useFocusTrap } from './common.js';
@@ -86,6 +86,7 @@ interface SettingsReadGuard {
   sections: Partial<Record<SettingsSection, SectionState>>;
   readOnly: boolean;
   refreshing: boolean;
+  rolloutPermits: (body: SettingsChangeBody) => boolean;
   permits: (body: SettingsChangeBody) => boolean;
 }
 
@@ -99,8 +100,9 @@ export function SettingsSectionSource({ section, children }: { section: Settings
   return <SettingsSourceContext.Provider value={{ ...sources, [section]: state }}>{children}</SettingsSourceContext.Provider>;
 }
 
-export function useSettingsReadOnly(): boolean {
-  return useContext(SettingsReadContext)?.readOnly ?? false;
+export function useSettingsReadOnly(operation?: string): boolean {
+  const guard = useContext(SettingsReadContext);
+  return (guard?.readOnly ?? false) || !!operation && !!guard && !guard.rolloutPermits({ operation, params: {} });
 }
 
 export function useSettingsRefreshing(): boolean {
@@ -115,23 +117,33 @@ export function useSettingsSection(section: SettingsSection): SectionState {
   return shared ?? state;
 }
 
+function settingsReadGeneration(): string {
+  const rollout = getState().rollout;
+  return `${rollout?.settingsPages === true}:${getRolloutGeneration('settingsPages')}:${rollout?.revokes === true}:${getRolloutGeneration('revokes')}`;
+}
+
 function useSettingsSectionRead(section: SettingsSection, enabled = true): SectionState {
   const version = useStore((s) => s.settingsVersion);
+  const rollout = useStore(settingsReadGeneration);
+  const requestedRollout = useRef(rollout);
   const [state, setState] = useState<Omit<SectionState, 'reload'>>({ status: 'loading' });
   const seq = useRef(0);
   const reload = useCallback(() => {
     const mine = ++seq.current;
+    requestedRollout.current = rollout;
+    const captured = captureRollout(...(['settingsPages', 'revokes'] as const).filter(key => getState().rollout?.[key] === true));
+    const current = () => mine === seq.current && captured.still() && rollout === settingsReadGeneration();
     // Keep loaded editors mounted while a new snapshot is requested.
     setState((current) => ({ ...current, refreshing: true }));
     const failed = (message: string) => {
-      if (mine !== seq.current) return;
+      if (!current()) return;
       setState(current => current.payload
         ? { status: 'error', payload: current.payload, message: `Could not refresh settings. Showing previously loaded values. ${message}` }
         : { status: 'error', message });
     };
     api.settingsSection(section).then(
       (payload) => {
-        if (mine !== seq.current) return;
+        if (!current()) return;
         if (payload && typeof payload === 'object' && 'status' in payload && payload.status === 'refused') {
           failed(settingsErrorText((payload as { code?: SettingsErrorCode }).code));
           return;
@@ -146,24 +158,27 @@ function useSettingsSectionRead(section: SettingsSection, enabled = true): Secti
         failed(error instanceof Error ? error.message : 'This PC did not answer.');
       },
     );
-  }, [section]);
+  }, [section, rollout]);
   useEffect(() => { if (enabled) reload(); return () => { ++seq.current; }; }, [reload, version, enabled]);
-  return { ...state, reload };
+  return { ...state, refreshing: state.refreshing || requestedRollout.current !== rollout, reload };
 }
 
 /** Dependent status reads follow settings changes and ignore superseded responses. */
 export function useSettingsStatus<T>(read: () => Promise<unknown>, validate: (value: unknown) => value is T, refreshVersion = 0): SettingsStatusState<T> {
   const version = useStore(s => s.settingsVersion);
+  const rollout = useStore(settingsReadGeneration);
   const [state, setState] = useState<Omit<SettingsStatusState<T>, 'reload'>>({ status: 'loading' });
   const seq = useRef(0);
   const reload = useCallback(() => {
     const mine = ++seq.current;
+    const captured = captureRollout(...(['settingsPages', 'revokes'] as const).filter(key => getState().rollout?.[key] === true));
+    const current = () => mine === seq.current && captured.still() && rollout === settingsReadGeneration();
     setState(current => ({ ...current, refreshing: true }));
     const failed = (message: string) => {
-      if (mine === seq.current) setState({ status: 'error', message });
+      if (current()) setState({ status: 'error', message });
     };
     read().then(value => {
-      if (mine !== seq.current) return;
+      if (!current()) return;
       if (value && typeof value === 'object' && 'status' in value && value.status === 'refused') {
         failed(settingsErrorText((value as { code?: SettingsErrorCode }).code));
       } else if (!validate(value)) {
@@ -172,7 +187,7 @@ export function useSettingsStatus<T>(read: () => Promise<unknown>, validate: (va
         setState({ status: 'ready', value });
       }
     }, (error: unknown) => failed(error instanceof Error ? error.message : 'This PC did not answer.'));
-  }, [read, validate]);
+  }, [read, validate, rollout]);
   useEffect(() => { reload(); return () => { ++seq.current; }; }, [reload, version, refreshVersion]);
   return { ...state, reload };
 }
@@ -211,6 +226,8 @@ export function SettingsSectionGuard({ section, views = [], dependency, reads = 
   children: ReactNode;
 }) {
   const device = useStore(s => s.device);
+  const settingsEnabled = useStore(s => s.rollout?.settingsPages === true);
+  const revokesEnabled = useStore(s => s.rollout?.revokes === true);
   const sources = useContext(SettingsSourceContext);
   const own = useSettingsSectionRead(section, !sources[section]);
   const ownDependent = useSettingsSectionRead(dependency?.section ?? section, !!dependency && !sources[dependency.section]);
@@ -223,7 +240,12 @@ export function SettingsSectionGuard({ section, views = [], dependency, reads = 
   const dependentMissing = dependency && !usesLegacyWriter ? failedView(dependent, dependency.views) : undefined;
   const failed = state.status === 'error' || !!missing || !!dependency && !usesLegacyWriter && (dependent.status === 'error' || !!dependentMissing)
     || reads.some(read => read.status === 'error');
-  const readOnly = failed || state.status !== 'ready' || !!state.refreshing
+  const rolloutEnabled = settingsEnabled && state.payload?.rollout?.settingsPages === true;
+  const permitsOperation = (operation: string) => rolloutEnabled
+    && (!['hermes.revoke-always', 'hermes.skill-staging'].includes(operation) || revokesEnabled && state.payload?.rollout?.revokes === true);
+  const rolloutPermits = (body: SettingsChangeBody) => permitsOperation('operation' in body ? body.operation
+    : state.payload?.changes?.find(entry => entry.id === body.change)?.operation ?? '');
+  const readOnly = !rolloutEnabled || failed || state.status !== 'ready' || !!state.refreshing
     || !!dependency && !usesLegacyWriter && (dependent.status !== 'ready' || !!dependent.refreshing)
     || reads.some(read => read.status !== 'ready' || read.refreshing);
   const refreshing = !failed && (!!state.refreshing || !!dependency && !usesLegacyWriter && !!dependent.refreshing || reads.some(read => read.refreshing));
@@ -234,12 +256,13 @@ export function SettingsSectionGuard({ section, views = [], dependency, reads = 
   const [reset, setReset] = useState({ failed, generation: 0 });
   if (reset.failed !== failed) setReset({ failed, generation: reset.generation + (failed ? 1 : 0) });
   const display = (read: SectionState, payload: SettingsSectionPayload | undefined): SectionState => payload
-    ? { status: 'ready', payload, reload: read.reload } : read;
+    ? { status: 'ready', payload: { ...payload, ...(payload.changes ? { changes: payload.changes.map(change =>
+      permitsOperation(change.operation) ? change : { ...change, undoAccess: 'read-only' as const }) } : {}) }, reload: read.reload } : read;
   const sections: SettingsReadGuard['sections'] = { [section]: display(state, previous.current ?? state.payload) };
   if (dependency) sections[dependency.section] = display(dependent, previousDependent.current ?? dependent.payload);
   const managed = (dependency?.section === 'safety' ? dependent : state).payload?.views?.find(view => view.view === 'hermes.managed');
   const permits = (body: SettingsChangeBody): boolean => {
-    if (readOnly) return false;
+    if (readOnly || !rolloutPermits(body)) return false;
     if (!('operation' in body)) {
       const change = state.payload?.changes?.find(entry => entry.id === body.change);
       return !!change?.undoable && accessForUndo(change, device) !== 'read-only';
@@ -256,10 +279,11 @@ export function SettingsSectionGuard({ section, views = [], dependency, reads = 
       key.every((part, index) => JSON.stringify(part) === JSON.stringify(entry.path[index]))
       || entry.path.every((part, index) => JSON.stringify(part) === JSON.stringify(key[index]))));
   };
-  return <SettingsReadContext.Provider value={{ sections, readOnly, refreshing, permits }}>
+  return <SettingsReadContext.Provider value={{ sections, readOnly, refreshing, rolloutPermits, permits }}>
     <SettingsReadNotice state={state} view={missing} />
     {dependency && !usesLegacyWriter && <SettingsReadNotice state={dependent} view={dependentMissing} />}
     {reads.map((read, index) => <SettingsReadNotice key={index} state={read} />)}
+    {!rolloutEnabled && <p className="muted" role="status">Settings writes have not been enabled on this site. Current values and Checks remain available.</p>}
     {failed && <div className="group"><div className="kv"><div className="grow muted">This section is read-only until its settings can be read.</div></div></div>}
     {reset.generation > 0 && <div className="group"><div className="kv" role="status"><div className="grow muted">Your unsaved changes here were discarded because the settings couldn't be read</div></div></div>}
     <fieldset key={reset.generation} disabled={readOnly} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
@@ -330,6 +354,7 @@ interface PendingConfirm {
   sequence: number;
   requestOrder: number;
   body: SettingsChangeBody;
+  rollout: ReturnType<typeof captureRollout>;
   onApplied?: () => void;
   owner: number;
   code: string;
@@ -373,6 +398,12 @@ export function useSettingsChange(payload?: SettingsSectionPayload, onApplied?: 
   const owner = useRef(++confirmSeq);
   const pending = usePendingConfirm();
   const live = useRef(true);
+  const settingsGeneration = useStore(() => getRolloutGeneration('settingsPages'));
+  const revokesGeneration = useStore(() => getRolloutGeneration('revokes'));
+  useEffect(() => {
+    setBusy(null);
+    if (pendingConfirm?.owner === owner.current && !pendingConfirm.rollout.still()) setPendingConfirm(null);
+  }, [settingsGeneration, revokesGeneration]);
   useEffect(() => {
     live.current = true;
     return () => {
@@ -385,20 +416,23 @@ export function useSettingsChange(payload?: SettingsSectionPayload, onApplied?: 
     if (live.current && 'change' in body && !currentGuard.current?.readOnly) toast('Undo is no longer available for this change.', 'info');
   };
   useEffect(() => {
-    if (pendingConfirm?.owner === owner.current && !allowed(pendingConfirm.body) && !guard?.readOnly) {
+    if (pendingConfirm?.owner === owner.current && !allowed(pendingConfirm.body)
+      && (!guard?.readOnly || !guard.rolloutPermits(pendingConfirm.body))) {
       const body = pendingConfirm.body;
       setPendingConfirm(null);
       explainUnavailableUndo(body);
     }
   });
 
-  const send = (body: SettingsChangeBody, confirm?: string): Promise<ApplyOutcome> => {
+  const send = (body: SettingsChangeBody, rollout: ReturnType<typeof captureRollout>, confirm?: string): Promise<ApplyOutcome> => {
+    if (!rollout.still()) return Promise.resolve(cancelled());
     const legacy = 'operation' in body && payload?.operations?.find(info => 'operation' in body && info.operation === body.operation)?.writer === 'legacy';
     if (legacy && 'operation' in body) {
       const call = body.operation === 'wayroost.safety-commands' ? api.setSafetyCommands(Boolean(body.params.enabled))
         : body.operation === 'paseo.worker-approvals' ? api.setWorkerApprovals(Boolean(body.params.enabled))
         : api.setCloudAgent(body.params.provider as 'claude' | 'codex' | 'opencode', Boolean(body.params.enabled));
       return call.then(raw => {
+        if (!rollout.still()) return cancelled();
         const valid = body.operation === 'paseo.worker-approvals' ? WorkerApprovalsStatus.safeParse(raw).success
           : body.operation === 'paseo.provider-enabled' ? isCloudAgentsStatus(raw)
           : !!raw && typeof raw === 'object' && 'enabled' in raw && typeof raw.enabled === 'boolean' && 'commands' in raw && Array.isArray(raw.commands);
@@ -413,8 +447,16 @@ export function useSettingsChange(payload?: SettingsSectionPayload, onApplied?: 
     return request.then(describeApplyResponse, (error: unknown) => failedOutcome(error));
   };
 
+  const cancelled = (): ApplyOutcome => ({ kind: 'refused', code: 'not_rolled_out', message: settingsErrorText('not_rolled_out') });
+  const capture = (body: SettingsChangeBody) => {
+    const operation = 'operation' in body ? body.operation : Object.values(currentGuard.current?.sections ?? {})
+      .flatMap(section => section?.payload?.changes ?? []).find(change => change.id === body.change)?.operation
+      ?? payload?.changes?.find(change => change.id === body.change)?.operation;
+    return captureRollout('settingsPages', ...(['hermes.revoke-always', 'hermes.skill-staging'].includes(operation ?? '') ? ['revokes' as const] : []));
+  };
+
   type HeldRequest = Omit<PendingConfirm, 'code' | 'summary' | 'expiresAt' | 'owner'>;
-  const current = (held: HeldRequest) => live.current && sequences.current.get(held.key) === held.sequence;
+  const current = (held: HeldRequest) => live.current && held.rollout.still() && sequences.current.get(held.key) === held.sequence;
   const start = (key: string) => {
     const sequence = (sequences.current.get(key) ?? 0) + 1;
     sequences.current.set(key, sequence);
@@ -425,12 +467,16 @@ export function useSettingsChange(payload?: SettingsSectionPayload, onApplied?: 
   };
   const settle = (outcome: ApplyOutcome, held: HeldRequest): ApplyOutcome => {
     // A superseded response cannot update its row or the shared confirmation.
-    if (!current(held)) return outcome;
+    if (!current(held)) {
+      if (busyOrder.current === held.requestOrder) setBusy(null);
+      if (pendingConfirm?.owner === owner.current && pendingConfirm.requestOrder === held.requestOrder) setPendingConfirm(null);
+      return cancelled();
+    }
     if (busyOrder.current === held.requestOrder) setBusy(null);
     if (outcome.kind === 'confirm') {
       if (held.requestOrder === requestOrder) {
         // Hold the latest prompt through a refresh; recheck access when reads settle.
-        if (allowed(held.body) || live.current && currentGuard.current?.refreshing) setPendingConfirm({ ...held, owner: owner.current, code: outcome.code, summary: outcome.summary, expiresAt: outcome.expiresAt });
+        if (allowed(held.body) || live.current && currentGuard.current?.refreshing && currentGuard.current.rolloutPermits(held.body)) setPendingConfirm({ ...held, owner: owner.current, code: outcome.code, summary: outcome.summary, expiresAt: outcome.expiresAt });
         else explainUnavailableUndo(held.body);
       }
     } else if (pendingConfirm?.owner === owner.current && pendingConfirm.requestOrder === held.requestOrder) {
@@ -450,8 +496,9 @@ export function useSettingsChange(payload?: SettingsSectionPayload, onApplied?: 
   };
 
   const run = async (key: string, body: SettingsChangeBody, sourceView?: ReadViewId, onApplied?: () => void): Promise<ApplyOutcome> => {
-    if (!allowed(body)) return { kind: 'refused', code: 'unavailable', message: settingsErrorText('unavailable') };
-    const order = start(key);
+    const rollout = capture(body);
+    if (!rollout.still() || !allowed(body)) return { kind: 'refused', code: 'unavailable', message: settingsErrorText('unavailable') };
+    const order = { ...start(key), rollout };
     if (pendingConfirm) setPendingConfirm(null);
     if ('operation' in body && payload?.operations?.find(info => 'operation' in body && info.operation === body.operation)?.writer !== 'legacy' && body.expected === undefined && body.operation !== 'settings.accept-current' && !operationSpec(body.operation)?.recovery && operationSpec(body.operation)?.keys !== 'recorded') {
       const spec = operationSpec(body.operation);
@@ -469,7 +516,7 @@ export function useSettingsChange(payload?: SettingsSectionPayload, onApplied?: 
       body = { ...body, expected: view.present ? { file: { sha256: view.sha256 } }
         : { keys: paths === 'recorded' ? [] : paths.map((_path, index) => ({ key: index, exists: false })) } };
     }
-    const outcome = await send(body);
+    const outcome = await send(body, rollout);
     return settle(outcome, { ...order, body, onApplied });
   };
 
@@ -482,14 +529,14 @@ export function useSettingsChange(payload?: SettingsSectionPayload, onApplied?: 
     }
     const next = { ...held, ...start(held.key) };
     setPendingConfirm(next);
-    const outcome = await send(held.body, held.code);
+    const outcome = await send(held.body, held.rollout, held.code);
     return settle(outcome, next);
   };
 
   return {
     busy,
     // Only the row that holds the request shows the prompt and can confirm it.
-    pending: pending && pending.owner === owner.current ? pending : null,
+    pending: pending && pending.owner === owner.current && pending.rollout.still() ? pending : null,
     run,
     confirmNow,
     dismiss: () => {

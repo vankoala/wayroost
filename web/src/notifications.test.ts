@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NotificationSettingsView } from '../../shared/protocol';
 import type { SettingsNotificationsBody } from '../../shared/settings';
 import { api, request } from './api';
@@ -68,6 +68,8 @@ describe('an alert the server sent to the app', () => {
 });
 
 describe('the settings request', () => {
+  beforeEach(() => setState(s => ({ ...s, rollout: { settingsPages: true, revokes: false, chatFirst: false } })));
+
   it('reads the rules and the hours from Wayroost’s own settings', async () => {
     const calls: Array<[string, string, unknown]> = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init: RequestInit = {}) => {

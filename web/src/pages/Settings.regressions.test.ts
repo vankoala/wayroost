@@ -64,7 +64,7 @@ beforeEach(async () => {
   fixture.setBridgePaused.mockReset().mockResolvedValue({ enabled: true, paused: true, recent: { sent: 0, queued: 0, started: 0 } });
   fixture.setWorkerUpdates.mockReset().mockResolvedValue({ enabled: true, defaultMinutes: 30, timeBoxes: [30, 60, 120] });
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
-  setState(() => ({ ...initial, email: 'owner@example.com', statuses: {
+  setState(() => ({ ...initial, rollout: { settingsPages: true, revokes: false, chatFirst: false }, email: 'owner@example.com', statuses: {
     hermes: { source: 'hermes', state: 'connected' }, paseo: { source: 'paseo', state: 'connected' },
   } }));
   container = document.createElement('div');

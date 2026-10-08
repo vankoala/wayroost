@@ -4,7 +4,7 @@ import type { Session } from 'electron';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { X509Certificate } from 'node:crypto';
 import { spkiFingerprint, verifyPinnedCertificate } from '../../lib/loopback-tls.js';
-import { desktopOrigin, installCertificatePin, pairPinnedDesktop, parsePairingToken, pinnedOriginRequest, pinnedRequest } from '../src/tls.js';
+import { localListenerPort, localListenerOrigin, parseListenerPins, desktopOrigin, installCertificatePin, pairPinnedDesktop, parsePairingToken, pinnedOriginRequest, pinnedRequest } from '../src/tls.js';
 import { RescueClient } from '../src/rescue-client.js';
 import { installAppHeader } from '../src/hardening.js';
 import { loopbackTlsFixtures } from '../../tests/loopback-tls-fixtures.js';
@@ -123,4 +123,29 @@ describe('listener pinning', () => {
     await rejected;
     expect(fake.sent()).toEqual({ bytes: 0, requests: 0 });
   });
+});
+
+
+it('persists the local listener port with its TLS pin and defaults older pins to 8883', () => {
+  expect(parseListenerPins({ serverPin: pin, rescuePin: otherPin })).toEqual({ serverPin: pin, rescuePin: otherPin, localPort: 8883 });
+  const token = parsePairingToken(JSON.stringify({ code: 'AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AA', serverPin: pin, rescuePin: otherPin, localPort: 8883 }));
+  expect(localListenerOrigin(token)).toBe('https://127.0.0.1:8883');
+  expect(parseListenerPins(JSON.parse(JSON.stringify(token))).localPort).toBe(8883);
+  expect(pinnedOriginRequest('https://127.0.0.1:8881/api/settings/apply', localListenerOrigin(token), token.serverPin)).toBe(false);
+  expect(pinnedOriginRequest('https://127.0.0.1:8883/api/settings/apply', localListenerOrigin(token), token.serverPin)).toBe(true);
+  for (const value of [0, -1, 65536, 8881, 8880, '8883', 8883.5]) expect(() => localListenerPort(value)).toThrow();
+});
+
+it.each([
+  [443, 'https://127.0.0.1'],
+  [8883, 'https://127.0.0.1:8883'],
+] as const)('uses the canonical HTTPS origin for local listener port %s', (localPort, origin) => {
+  const token = parsePairingToken(JSON.stringify({ code: 'a'.repeat(26), serverPin: pin, rescuePin: otherPin, localPort }));
+  const saved = parseListenerPins(JSON.parse(JSON.stringify(token)));
+  expect(saved.localPort).toBe(localPort);
+  expect(localListenerOrigin(token)).toBe(origin);
+  expect(localListenerOrigin(saved)).toBe(origin);
+  expect(desktopOrigin(localListenerOrigin(saved))).toBe(origin);
+  expect(pinnedOriginRequest(`${origin}/api/me`, localListenerOrigin(saved), pin)).toBe(true);
+  expect(pinnedOriginRequest(`${origin.replace('https:', 'wss:')}/ws`, localListenerOrigin(saved), pin)).toBe(true);
 });

@@ -33,7 +33,8 @@ it('generates an explicitly paired desktop origin while preserving public Access
   const access = { teamDomain: 'https://example.cloudflareaccess.com', aud: 'obviously-fake-audience', allowedEmails: ['you@example.com'] };
   writeFileSync(join(root, 'etc/wayroost/config.json'), JSON.stringify({ publicOrigin: 'https://wayroost.example.com', origins: ['https://other.example.com'], access, devices: { enabled: false } }));
   const raw = generated(plan(root));
-  expect(raw.origins).toEqual(['https://other.example.com', 'https://127.0.0.1:8881']);
+  expect(raw.origins).toEqual(['https://other.example.com', 'https://127.0.0.1:8881', 'https://127.0.0.1:8883']);
+  expect(raw.localListener).toEqual({ host: '127.0.0.1', port: 8883, pcOnlyWrites: false });
   expect(raw.publicOrigin).toBe('https://wayroost.example.com');
   expect(raw.access).toEqual(access);
   expect(raw.devices).toEqual({ enabled: true });
@@ -44,9 +45,10 @@ it('generates an explicitly paired desktop origin while preserving public Access
   const installed = parseConfig(raw, { ...credential, env: { WAYROOST_ROLE: 'shadow' } });
   expect(installed.role).toBe('shadow');
   expect(installed.listen).toEqual({ host: '127.0.0.1', port: 8881 });
+  expect(installed.localListener).toEqual({ host: '127.0.0.1', port: 8883, pcOnlyWrites: false });
   expect(installed.stateDir).toBe('/var/lib/wayroost-shadow');
   expect(installed.supervisor?.socket).toBe('/run/wayroost/supervisor.sock');
-  expect(installed.origins.map((o) => o.origin)).toContain('https://127.0.0.1:8881');
+  expect(installed.origins.map((o) => o.origin)).toEqual(expect.arrayContaining(['https://127.0.0.1:8881', 'https://127.0.0.1:8883']));
   // A shadow never takes the primary's state, whatever the config says.
   expect(() => parseConfig({ ...raw, stateDir: '/var/lib/wayroost' }, credential)).toThrow(/primary-owned/);
   // Pairing the desktop on the local origin, in an empty state directory of the shadow's own.
@@ -64,7 +66,7 @@ it('generates an explicitly paired desktop origin while preserving public Access
   const code = devices.createCode('desktop', { recovery: true });
   const app = await buildApp({ config, devices, verifier: async () => { throw new Error('local requests must not use Access'); }, hub: new EventHub(), sources: { hermes: new FakeHermes(), paseo: new FakePaseo() }, logger: false });
   try {
-    const result = await app.inject({ method: 'POST', url: '/api/pair', headers: { host: '127.0.0.1:8881', origin: 'https://127.0.0.1:8881', 'x-wayroost-app': 'desktop', 'x-wayroost-request': '1' }, payload: { code: code.code, name: 'Demo desktop', kind: 'desktop' } });
+    const result = await app.inject({ method: 'POST', url: '/api/pair', headers: { host: '127.0.0.1:8883', origin: 'https://127.0.0.1:8883', 'x-wayroost-app': 'desktop', 'x-wayroost-request': '1' }, payload: { code: code.code, name: 'Demo desktop', kind: 'desktop' } });
     expect(result.statusCode).toBe(200);
     expect(result.headers['set-cookie']).toContain('wr_device=');
   } finally { await app.close(); }

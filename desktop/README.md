@@ -6,7 +6,7 @@ ignored and installed inside this checkout; a symlink to another checkout
 lets dependency cleanup modify that checkout.
 Development uses
 `WAYROOST_URL=http://127.0.0.1:8896` and
-`WAYROOST_RESCUE_URL=http://127.0.0.1:8898`. Installed defaults are `https://127.0.0.1:8881` and `https://127.0.0.1:8880`;
+`WAYROOST_RESCUE_URL=http://127.0.0.1:8898`. Installed defaults are `https://127.0.0.1:8883` and `https://127.0.0.1:8880`;
 a packaged (installed) app ignores both variables.
 HTTP requires the development flag supplied by `npm run desktop:dev`; unpackaged
 apps without that flag also use pinned HTTPS. Tests use development ports and invented keys.
@@ -23,11 +23,20 @@ other unpackaged launches leave the installed app's login registration alone.
 
 Before first connection, run `sudo wayroost pair-desktop` in the PC's terminal
 and paste its combined JSON token into the bundled recovery form. The token
-includes the single-use pairing code, server SPKI fingerprint and supervisor
-rescue SPKI fingerprint. The native enrollment transport validates TLS before
-sending the code, checks `/api/me`, then encrypts both pins with `safeStorage`
+includes the single-use pairing code, local listener port (8883 by default), server
+SPKI fingerprint and supervisor rescue SPKI fingerprint. The local listener uses
+the server certificate; the tunnel and phones use the main listener on 8881.
+The native enrollment transport validates TLS before sending the code, checks `/api/me`, then encrypts both pins with `safeStorage`
 and restarts the app. The server's cookie is saved only after that check.
 Without a saved pin the app never loads the remote pairing page or sends credentials.
+
+When upgrading from a server config without `localListener`, re-run the server
+installer as root to add `127.0.0.1:8883` and its HTTPS origin. Existing listener
+config is preserved; a new listener starts with `pcOnlyWrites: false`. Saved
+`listener-pins` without a local port use 8883. After the server is running with
+that listener, obtain a fresh `sudo wayroost pair-desktop` token and pair again
+to pin its TLS and save its port. Keep `pcOnlyWrites` false until the live desktop
+check described in [settings rollout](../docs/settings-rollout.md#desktop-listener) passes.
 
 The rescue form also accepts the install-time rescue key and an explicitly
 pasted supervisor fingerprint, independently of server pairing. Encrypted pins

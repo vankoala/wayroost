@@ -4,7 +4,7 @@ import { drainRunResult, type DrainRestartRun } from '../../../shared/supervisor
 import type { DrainRestartComponent } from '../../../shared/settings.js';
 import { api } from '../api.js';
 import { settingsErrorText, settingsRestartResponseSchema, type SettingsRestartPayload } from '../settingsModel.js';
-import { useStore } from '../store.js';
+import { captureRollout, getRolloutGeneration, useStore } from '../store.js';
 import { LevelChip, SettingsConfirmPrompt, TimingNotes } from './SettingsRows.js';
 
 /**
@@ -25,18 +25,24 @@ function resultFor(run: DrainRestartRun): SettingsRestartPayload {
 }
 
 /** Restart choices send only the component and timing named by the server. */
-export function SettingsRestart({ component, when, disabled = false, refreshing = false, disableWhileRunning = false, initialRun, onAccepted }: {
+export function SettingsRestart({ component, when, disabled = false, refreshing = false, disableWhileRunning = false, requiresRevokes = false, initialRun, onAccepted }: {
   component: DrainRestartComponent;
   when?: 'idle' | 'now';
   disabled?: boolean;
   refreshing?: boolean;
   disableWhileRunning?: boolean;
+  requiresRevokes?: boolean;
   initialRun?: DrainRestartRun;
   onAccepted?: () => void;
 }) {
   const device = useStore(s => s.device);
+  const settingsEnabled = useStore(s => s.rollout?.settingsPages === true);
+  const revokesEnabled = useStore(s => s.rollout?.revokes === true);
+  const settingsGeneration = useStore(() => getRolloutGeneration('settingsPages'));
+  const revokesGeneration = useStore(() => requiresRevokes ? getRolloutGeneration('revokes') : 0);
+  const capture = () => captureRollout('settingsPages', ...(requiresRevokes ? ['revokes' as const] : []));
   const hasAccess = !!device?.scopes.includes('settings');
-  const unavailable = disabled || !hasAccess;
+  const unavailable = disabled || !hasAccess || !settingsEnabled || requiresRevokes && !revokesEnabled;
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<SettingsRestartPayload>();
   const [trackedRun, setTrackedRun] = useState<DrainRestartRun>();
@@ -49,12 +55,12 @@ export function SettingsRestart({ component, when, disabled = false, refreshing 
   const readOnly = unavailable || refreshing || running;
   // Follow the tracked run to its end, whatever later requests answer (a second request may be refused as busy).
   const pollId = currentRun && currentRun.endedAt === undefined && currentRun.component === component ? currentRun.id : undefined;
-  const [pending, setPending] = useState<{ when: 'idle' | 'now'; code?: string; summary: string; expiresAt?: number } | null>(null);
+  const [pending, setPending] = useState<{ when: 'idle' | 'now'; code?: string; summary: string; expiresAt?: number; rollout: ReturnType<typeof captureRollout> } | null>(null);
   const sequence = useRef(0);
   const available = useRef(!readOnly);
   available.current = !readOnly;
   const authorized = useRef(!unavailable);
-  authorized.current = hasAccess;
+  authorized.current = !unavailable;
   const accepted = useRef(onAccepted);
   accepted.current = onAccepted;
   // A different component, device or access level starts afresh; a different timing only closes an open
@@ -68,7 +74,12 @@ export function SettingsRestart({ component, when, disabled = false, refreshing 
     return () => { ++sequence.current; };
   }, [component, device?.id, hasAccess]);
   useEffect(() => { setPending(null); }, [when]);
-  useEffect(() => { if (unavailable) setPending(null); }, [unavailable]);
+  useEffect(() => {
+    if (!unavailable) return;
+    setPending(null);
+    setBusy(false);
+  }, [unavailable]);
+  useEffect(() => { setPending(null); setBusy(false); }, [settingsGeneration, revokesGeneration]);
 
   /** Show an observed run, if it supersedes the one shown (one rule for snapshots, polls and request answers). */
   const adopt = (observed: DrainRestartRun, source: 'snapshot' | 'poll' | 'request', payload?: SettingsRestartPayload) => {
@@ -85,26 +96,28 @@ export function SettingsRestart({ component, when, disabled = false, refreshing 
   useEffect(() => {
     if (!pollId || !hasAccess) return;
     let live = true;
+    const rollout = captureRollout(...(settingsEnabled ? ['settingsPages' as const] : []), ...(requiresRevokes && revokesEnabled ? ['revokes' as const] : []));
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
+      if (!live || !rollout.still()) return;
       try {
         const parsed = settingsRestartResponseSchema.safeParse(await api.settingsRestartRun(pollId));
-        if (!live) return;
+        if (!live || !rollout.still()) return;
         if (!parsed.success || !('run' in parsed.data) || !parsed.data.run || parsed.data.run.id !== pollId || parsed.data.run.component !== component) {
           setReadError(true);
         } else {
           adopt(parsed.data.run, 'poll', parsed.data);
           if (parsed.data.run.endedAt !== undefined) return;
         }
-      } catch { if (live) setReadError(true); }
-      if (live) timer = setTimeout(() => void poll(), 1000);
+      } catch { if (live && rollout.still()) setReadError(true); }
+      if (live && rollout.still()) timer = setTimeout(() => void poll(), 1000);
     };
     timer = setTimeout(() => void poll(), 1000);
     return () => { live = false; clearTimeout(timer); };
-  }, [pollId, component, hasAccess]);
+  }, [pollId, component, hasAccess, settingsEnabled, revokesEnabled, requiresRevokes, settingsGeneration, revokesGeneration]);
 
-  const send = async (choice: 'idle' | 'now', code?: string) => {
-    if (!available.current) return;
+  const send = async (choice: 'idle' | 'now', code?: string, rollout = capture()) => {
+    if (!rollout.still() || !available.current) { setPending(current => current?.rollout === rollout ? null : current); return; }
     const mine = ++sequence.current;
     setBusy(true);
     setPending(null);
@@ -116,10 +129,10 @@ export function SettingsRestart({ component, when, disabled = false, refreshing 
     } catch {
       answer = { status: 'refused', code: 'unavailable' };
     }
-    if (mine !== sequence.current || !authorized.current) return;
+    if (mine !== sequence.current || !authorized.current || !rollout.still()) return;
     setBusy(false);
     if (answer.status === 'confirm') {
-      setPending({ when: choice, code: answer.confirm, summary: answer.summary, expiresAt: answer.expiresAt });
+      setPending({ rollout, when: choice, code: answer.confirm, summary: answer.summary, expiresAt: answer.expiresAt });
     } else {
       // A request answer with a run follows the same rule as polls and snapshots; one without a run
       // (refused as busy, say) only reports itself and keeps the tracked run.
@@ -128,10 +141,15 @@ export function SettingsRestart({ component, when, disabled = false, refreshing 
       if (answer.status === 'accepted' || answer.status === 'completed') accepted.current?.();
     }
   };
+  const interruptionWarning = component === 'hermes'
+    ? 'Restart now may interrupt active WhatsApp turns, phone calls, jobs, background commands and delegated work.'
+    : 'Restart now may interrupt active work.';
   const choose = (choice: 'idle' | 'now') => {
+    const rollout = capture();
+    if (!rollout.still() || !available.current) return;
     if (choice === 'now') {
-      setPending({ when: choice, summary: 'Restart now may interrupt active work. Continue?' });
-    } else void send(choice);
+      setPending({ rollout, when: choice, summary: `${interruptionWarning} Continue?` });
+    } else void send(choice, undefined, rollout);
   };
   return <div className="setting-stack">
     <div className="setting-inline">
@@ -142,6 +160,7 @@ export function SettingsRestart({ component, when, disabled = false, refreshing 
       <LevelChip level="confirm" />
     </div>
     {running && <div className="muted">Another restart can be requested after the tracked run ends.</div>}
+    {when === 'now' && <div className="muted">{interruptionWarning}</div>}
     {when && <TimingNotes timing={[{ label: when === 'idle' ? `restart-when-idle:${component}` : `restart-now:${component}` }]} />}
     {result && <div role="status" className="muted">
       {result.status === 'accepted' ? 'Restart accepted. ' : result.status === 'completed' ? 'Restart completed. '
@@ -152,8 +171,8 @@ export function SettingsRestart({ component, when, disabled = false, refreshing 
       {'timing' in result && result.timing && <TimingNotes timing={result.timing} />}
       {readError && <div>The restart status could not be read. Checking again…</div>}
     </div>}
-    <SettingsConfirmPrompt pending={pending} busy={busy} disabled={readOnly}
-      onConfirm={() => { if (pending) void send(pending.when, pending.code); }}
+    <SettingsConfirmPrompt pending={pending?.rollout.still() ? pending : null} busy={busy} disabled={readOnly}
+      onConfirm={() => { if (pending) void send(pending.when, pending.code, pending.rollout); }}
       onCancel={() => { ++sequence.current; setPending(null); }} />
   </div>;
 }

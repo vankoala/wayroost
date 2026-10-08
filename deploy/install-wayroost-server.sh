@@ -105,11 +105,12 @@ import { readFileSync } from 'node:fs';
 const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 config.role = 'shadow';
 config.listen = { host: '127.0.0.1', port: 8881 };
+config.localListener ??= { host: '127.0.0.1', port: 8883, pcOnlyWrites: false };
 // A shadow's own state: the server refuses a primary-owned directory such as /var/lib/wayroost.
 config.stateDir = '/var/lib/wayroost-shadow';
 config.staticDir = '/opt/wayroost/server/dist/web';
 config.tls = { certFile: '/etc/wayroost/server-tls-cert.pem' };
-config.origins = [...new Set([...(config.origins ?? []).filter(value => !/^http:\/\/(127\.|localhost)/.test(value)), 'https://127.0.0.1:8881'])];
+config.origins = [...new Set([...(config.origins ?? []).filter(value => !/^http:\/\/(127\.|localhost)/.test(value)), 'https://127.0.0.1:8881', 'https://127.0.0.1:8883'])];
 config.devices = { ...config.devices, enabled: true };
 if (process.argv[3]) config.safetyHelper = { socket: '/run/wayroost-paseo-safety/helper.sock' };
 // These listeners and writers stay off even before the runtime's shadow gates.
@@ -219,4 +220,4 @@ else
   run systemctl enable wayroost-server.service
   run systemctl restart wayroost-server.service
 fi
-echo 'Wayroost server planned/installed: shadow on 127.0.0.1:8881, state /var/lib/wayroost-shadow.'
+echo 'Wayroost server planned/installed: shadow on 127.0.0.1:8881 (local listener 127.0.0.1:8883), state /var/lib/wayroost-shadow.'

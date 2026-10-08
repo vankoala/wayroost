@@ -28,6 +28,8 @@ export const configSchema = z.object({
   busyStaleMs: z.number().int().positive().default(60000),
   /** Probes remain available, but every action is refused. */
   statusOnly: z.boolean().default(true),
+  /** Enable idle restarts only after the production executor has been certified. */
+  restartWhenIdleCertified: z.boolean().default(false),
   adopt: adoptSchema.default({}),
 }).strict();
 export type Config = z.infer<typeof configSchema>;

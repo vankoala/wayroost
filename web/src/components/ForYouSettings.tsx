@@ -1,10 +1,10 @@
 import { BellRing, Gauge, Info, LoaderCircle, Moon, ShieldAlert, Smartphone, Sparkles, ThumbsDown, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import type { FeedSettings, ProactivityLevel } from '../../../shared/protocol';
+import type { FeedSettings, ProactivityLevel } from '../../../shared/protocol.js';
 import { api, serializeNotificationSettingsSave } from '../api.js';
-import { disablePush, enablePush, pushState, type PushState } from '../push';
-import { toast } from '../store';
-import { SettingsTiming } from './SettingsTiming';
+import { disablePush, enablePush, pushState, type PushState } from '../push.js';
+import { captureRollout, getRolloutGeneration, getState, toast, useStore } from '../store.js';
+import { SettingsTiming } from './SettingsTiming.js';
 
 const LEVELS: Array<{ id: ProactivityLevel; label: string; help: string }> = [
   { id: 'off', label: 'Off', help: 'No brief and no daytime checks' },
@@ -32,82 +32,103 @@ const PUSH_HELP: Record<PushState, string> = {
 
 /** Settings → For you: how often Hermes speaks up, quiet hours, phone notifications, turned-down topics. */
 export function ForYouSettings() {
+  const writable = useStore(s => s.rollout?.settingsPages === true);
   const [settings, setSettings] = useState<FeedSettings | null>(null);
   const [push, setPush] = useState<PushState | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [deviceBusy, setDeviceBusy] = useState<string | null>(null);
+  const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
+  useEffect(() => { setBusy(null); }, [rolloutGeneration]);
 
   useEffect(() => {
     let live = true;
+    const rollout = captureRollout(...(writable ? ['settingsPages' as const] : []));
     api.feed().then(
       (list) => {
-        if (live) setSettings(list.settings);
+        if (live && rollout.still()) setSettings(list.settings);
       },
       () => {}, // For you is off here: no section
     );
+    return () => { live = false; };
+  }, [writable, rolloutGeneration]);
+
+  useEffect(() => {
+    let live = true;
     pushState().then(
-      (state) => {
-        if (live) setPush(state);
-      },
-      () => {
-        if (live) setPush('unsupported');
-      },
+      (state) => { if (live) setPush(state); },
+      () => { if (live) setPush('unsupported'); },
     );
-    return () => {
-      live = false;
-    };
+    return () => { live = false; };
   }, []);
 
   if (!settings) return null;
 
+  const requireWritable = (generation: ReturnType<typeof captureRollout>): void => {
+    if (!generation.still()) {
+      throw new Error('Settings writes have not been enabled on this site.');
+    }
+  };
+
   const save = async (key: string, patch: Omit<Parameters<typeof api.feedSettings>[0], 'quietHours'> & {
     quietHours?: Partial<NonNullable<FeedSettings['quietHours']>> | null;
   }) => {
+    if (getState().rollout?.settingsPages !== true) return;
+    const generation = captureRollout('settingsPages');
     setBusy(key);
     try {
       const next = await serializeNotificationSettingsSave(async () => {
+        requireWritable(generation);
         const { quietHours, ...rest } = patch;
+        const current = quietHours ? await api.feed() : undefined;
+        requireWritable(generation);
         const body = quietHours
-          ? { ...rest, quietHours: { ...((await api.feed()).settings.quietHours ?? DEFAULT_QUIET), ...quietHours } }
+          ? { ...rest, quietHours: { ...(current!.settings.quietHours ?? DEFAULT_QUIET), ...quietHours } }
           : { ...rest, ...(quietHours === null ? { quietHours: null } : {}) };
+        requireWritable(generation);
         return api.feedSettings(body);
       });
+      if (!generation.still()) return;
       setSettings(next);
     } catch (err) {
-      toast((err as Error).message);
+      if (generation.still()) toast((err as Error).message);
     } finally {
-      setBusy(null);
+      if (generation.still()) setBusy(null);
     }
   };
 
   const togglePhone = async () => {
-    setBusy('phone');
+    setDeviceBusy('phone');
     try {
       const next = push === 'on' ? await disablePush() : await enablePush();
       setPush(next);
       if (next === 'denied') toast('Notifications are blocked for this site in the browser settings.');
-      setSettings((await api.feed()).settings);
+      const writable = getState().rollout?.settingsPages === true;
+      const rollout = captureRollout(...(writable ? ['settingsPages' as const] : []));
+      const generation = getRolloutGeneration('settingsPages');
+      const current = await api.feed();
+      if (rollout.still() && generation === getRolloutGeneration('settingsPages') && writable === (getState().rollout?.settingsPages === true)) setSettings(current.settings);
     } catch (err) {
       toast((err as Error).message);
     } finally {
-      setBusy(null);
+      setDeviceBusy(null);
     }
   };
 
   const test = async () => {
-    setBusy('test');
+    setDeviceBusy('test');
     try {
       await api.pushTest();
       toast('Sent. It should show up in a few seconds.', 'info');
     } catch (err) {
       toast((err as Error).message);
     } finally {
-      setBusy(null);
+      setDeviceBusy(null);
     }
   };
 
   const level = LEVELS.find((l) => l.id === settings.level) ?? LEVELS[2]!;
   const quiet = settings.quietHours;
-  const spinner = (key: string) => busy === key && <LoaderCircle size={16} className="spin" />;
+  const spinner = (key: string) => (busy === key || deviceBusy === key) && <LoaderCircle size={16} className="spin" />;
 
   return (
     <>
@@ -124,7 +145,7 @@ export function ForYouSettings() {
           <select
             value={settings.level}
             onChange={(e) => save('level', { level: e.target.value as ProactivityLevel })}
-            disabled={busy !== null || !settings.pulseFound}
+            disabled={!writable || busy !== null || deviceBusy !== null || !settings.pulseFound}
             aria-label="How often Hermes speaks up"
           >
             {LEVELS.map((l) => (
@@ -161,7 +182,7 @@ export function ForYouSettings() {
             className="switch"
             aria-checked={Boolean(quiet)}
             aria-label="Quiet hours"
-            disabled={busy !== null}
+            disabled={!writable || busy !== null || deviceBusy !== null}
             onClick={() => save('quiet', { quietHours: quiet ? null : DEFAULT_QUIET })}
           />
         </div>
@@ -172,7 +193,7 @@ export function ForYouSettings() {
             <select
               value={quiet.start}
               onChange={(e) => save('quiet', { quietHours: { start: e.target.value } })}
-              disabled={busy !== null}
+              disabled={!writable || busy !== null || deviceBusy !== null}
               aria-label="Quiet hours start"
             >
               {TIMES.map((t) => (
@@ -185,7 +206,7 @@ export function ForYouSettings() {
             <select
               value={quiet.end}
               onChange={(e) => save('quiet', { quietHours: { end: e.target.value } })}
-              disabled={busy !== null}
+              disabled={!writable || busy !== null || deviceBusy !== null}
               aria-label="Quiet hours end"
             >
               {TIMES.map((t) => (
@@ -213,7 +234,7 @@ export function ForYouSettings() {
                 className="switch"
                 aria-checked={push === 'on'}
                 aria-label="Notifications on this device"
-                disabled={busy !== null}
+                disabled={busy !== null || deviceBusy !== null}
                 onClick={togglePhone}
               />
             )}
@@ -236,7 +257,7 @@ export function ForYouSettings() {
                 className="switch"
                 aria-checked={settings.push.approvals}
                 aria-label="Notify when an agent needs you"
-                disabled={busy !== null}
+                disabled={!writable || busy !== null || deviceBusy !== null}
                 onClick={() => save('approvals', { push: { approvals: !settings.push.approvals } })}
               />
             </div>
@@ -253,7 +274,7 @@ export function ForYouSettings() {
                 className="switch"
                 aria-checked={settings.push.cards}
                 aria-label="Notify about new For-you cards"
-                disabled={busy !== null}
+                disabled={!writable || busy !== null || deviceBusy !== null}
                 onClick={() => save('cards', { push: { cards: !settings.push.cards } })}
               />
             </div>
@@ -262,7 +283,7 @@ export function ForYouSettings() {
               <div className="grow muted">
                 {settings.pushDevices === 1 ? '1 device gets notifications.' : `${settings.pushDevices} devices get notifications.`}
               </div>
-              <button type="button" className="btn btn-secondary" onClick={test} disabled={busy !== null}>
+              <button type="button" className="btn btn-secondary" onClick={test} disabled={busy !== null || deviceBusy !== null}>
                 {spinner('test')} Send a test
               </button>
             </div>
@@ -283,7 +304,7 @@ export function ForYouSettings() {
                     <button
                       type="button"
                       aria-label={`Bring back ${l.topic}`}
-                      disabled={busy !== null}
+                      disabled={!writable || busy !== null || deviceBusy !== null}
                       onClick={() => save('less', { removeLessLike: l.topic })}
                     >
                       <X size={13} />

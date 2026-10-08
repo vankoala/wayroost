@@ -2,7 +2,7 @@
 import { act, createElement, type ReactElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DeviceInfo } from '../../../shared/protocol.js';
+import type { DeviceInfo, ListResponse, NotificationSettingsView } from '../../../shared/protocol.js';
 import type { SettingsChecksResponse } from '../../../shared/settings-checks.js';
 import { parseOperation, readViewValues, SETTINGS_OPERATIONS } from '../../../shared/settings-ops.js';
 import { settingsApplyBodySchema } from '../../../shared/settings.js';
@@ -15,6 +15,9 @@ import { ModelsSettingsPage } from './SettingsModels.js';
 import { ChecksSettingsPage } from './SettingsChecks.js';
 import { parseRoute, settingsPath } from '../router.js';
 import { SettingsRestart } from '../components/SettingsRestart.js';
+import { NotificationRules } from '../components/NotificationRules.js';
+import { RecentChanges } from '../components/RecentChanges.js';
+import { api, refreshList } from '../api.js';
 
 const phone: DeviceInfo = { id: 'dv_000000000000000000000001', name: 'Example phone', kind: 'phone', scopes: ['settings'], created: 0, lastSeen: 0 };
 const desktop: DeviceInfo = { ...phone, id: 'dv_000000000000000000000002', name: 'Example desktop', kind: 'desktop', scopes: ['settings', 'pc-settings'] };
@@ -49,6 +52,8 @@ beforeEach(() => {
     models: { section: 'models', views: [view('gateway.role-map'), view('gateway.state'), view('hermes.models'), view('pi.settings'), view('pi.models')], operations: [] },
     checks: { section: 'checks', views: [view('hermes.models'), view('gateway.state'), { ok: true, view: 'hermes.managed', present: false }], operations: [] },
   } as Record<string, SettingsSectionPayload>;
+  for (const payload of Object.values(sections)) payload.rollout = { settingsPages: true, revokes: true, chatFirst: true };
+  sections.safety!.restartWhenIdleCertified = true;
   for (const [operation, spec] of Object.entries(SETTINGS_OPERATIONS)) {
     sections[spec.section]?.operations?.push({ operation, title: spec.title, access: 'editable', ...('byParam' in spec.level ? { accessByValue: Object.fromEntries(Object.entries(spec.level.values).map(([value, level]) => [value, level === 'pc-only' ? 'read-only' : 'editable'])) } : {}) });
   }
@@ -77,7 +82,7 @@ beforeEach(() => {
     return Response.json({ status: 'refused', code: 'not_configured' });
   });
   vi.stubGlobal('fetch', fetchMock);
-  setState(s => ({ ...s, device: desktop, toasts: [], unpaired: false, sessionExpired: false }));
+  setState(s => ({ ...s, rollout: { settingsPages: true, revokes: true, chatFirst: true }, device: desktop, toasts: [], unpaired: false, sessionExpired: false }));
   container = document.createElement('div');
   document.body.append(container);
   root = createRoot(container);
@@ -87,6 +92,7 @@ afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -94,8 +100,9 @@ async function render(element: ReactElement) { await act(async () => root.render
 async function refresh() { await act(async () => setState(s => ({ ...s, settingsVersion: s.settingsVersion + 1 }))); }
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>(done => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 async function click(label: string) {
   const button = Array.from(container.querySelectorAll<HTMLButtonElement>('button')).find(el => (el.getAttribute('aria-label') ?? el.textContent?.trim()) === label);
@@ -641,6 +648,8 @@ describe('Revoke and restart', () => {
       ? Promise.resolve(Response.json({ status: 'refused', code: 'still_busy', run: { ...run, state: 'still-busy', outcome: 'still_busy', endedAt: 1 } }))
       : original(input, init));
     await render(createElement(SafetySettingsPage));
+    expect(container.textContent).toContain('Wayroost schedules a tracked restart when idle after saving the revocation.');
+    expect(container.querySelector('.safety-always .setting-timing')!.textContent).toContain('after a required restart');
     expect(container.textContent).not.toContain('Restart when idle');
     applyReply = { status: 'refused', code: 'precondition_changed' };
     await click('Revoke git status');
@@ -783,7 +792,7 @@ describe('Revoke and restart', () => {
     await click('Restart now');
     const { response } = delaySafetyRead();
     await refresh();
-    expect(container.querySelector('[role="alertdialog"]')!.textContent).toContain('Restart now may interrupt active work. Continue?');
+    expect(container.querySelector('[role="alertdialog"]')!.textContent).toContain('Restart now may interrupt active WhatsApp turns, phone calls, jobs, background commands and delegated work. Continue?');
     expect(confirmButton().matches(':disabled')).toBe(true);
     await act(async () => confirmButton().click());
     expect(writes).toHaveLength(1);
@@ -913,4 +922,361 @@ describe('Visible usage refresh', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
     expect(usageRequests()).toBe(4);
   });
+});
+
+
+it('disables every settings write control while showing current values before rollout', async () => {
+  sections.safety!.rollout = { settingsPages: false, revokes: false, chatFirst: false };
+  await render(createElement(SafetySettingsPage));
+  expect(container.textContent).toContain('Current values and Checks remain available');
+  expect(container.textContent).toContain('git status');
+  for (const element of container.querySelectorAll('fieldset input, fieldset select, fieldset textarea, fieldset button')) {
+    expect(element.matches(':disabled')).toBe(true);
+  }
+  expect(writes).toEqual([]);
+});
+
+it.each([false, undefined])('offers only Restart now when revoke certification is %s and names interrupted work', async certified => {
+  sections.safety!.restartWhenIdleCertified = certified;
+  await render(createElement(SafetySettingsPage));
+  expect(container.textContent).toContain('Choose Restart now after saving the revocation.');
+  expect(container.textContent).not.toContain('Wayroost schedules a tracked restart when idle');
+  expect(container.querySelector('.safety-always .setting-timing')!.textContent).toContain("the next restart of Hermes' gateway, which you time");
+  expect(container.querySelector('.safety-always .setting-timing')!.textContent).not.toContain('after a required restart');
+  await click('Revoke git status');
+  expect(container.textContent).toContain('Restart now');
+  expect(container.textContent).toContain('phone calls, jobs, background commands and delegated work');
+  expect([...container.querySelectorAll('button')].some(button => button.textContent?.includes('Restart when idle'))).toBe(false);
+  await click('Restart now');
+  expect(writes).toHaveLength(1);
+  expect(container.querySelector('[role="alertdialog"]')!.textContent).toContain('phone calls, jobs, background commands and delegated work');
+  await click('Confirm');
+  expect(writes.at(-1)!.body).toEqual({ component: 'hermes', when: 'now' });
+});
+
+it('closes an idle restart confirmation when certification disappears from the refreshed section', async () => {
+  setState(s => ({ ...s, device: phone }));
+  await render(createElement(SafetySettingsPage));
+  await click('Revoke git status');
+  restartReply = { ...confirm, expiresAt: Date.now() + 60_000 };
+  await click('Restart when idle');
+  expect(container.querySelector('[role="alertdialog"]')).not.toBeNull();
+  delete sections.safety!.restartWhenIdleCertified;
+  await refresh();
+  expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+  expect(container.textContent).toContain('Choose Restart now after saving the revocation.');
+  expect([...container.querySelectorAll('button')].some(button => button.textContent?.includes('Restart when idle'))).toBe(false);
+  await click('Restart now');
+  expect(writes).toHaveLength(2);
+  await click('Confirm');
+  expect(writes.at(-1)!.body).toEqual({ component: 'hermes', when: 'now' });
+});
+
+describe('settings section rollout', () => {
+  function expectWritesDisabled(disabled: boolean) {
+    expect(container.textContent).toContain('git status');
+    expect(container.querySelectorAll('input, select, button[role="switch"], button[aria-label^="Revoke "]').length).toBeGreaterThan(0);
+    for (const control of container.querySelectorAll('input, select, button[role="switch"], button[aria-label^="Revoke "]')) {
+      expect(control.matches(':disabled'), control.getAttribute('aria-label') ?? control.getAttribute('value') ?? undefined)
+        .toBe(disabled || control.matches('input[value="smart"], input[value="off"]'));
+    }
+  }
+
+  it.each([false, undefined])('requires enabled section rollout metadata, received %s', async settingsPages => {
+    sections.safety!.rollout = settingsPages === undefined ? undefined : { settingsPages, revokes: true, chatFirst: false };
+    await render(createElement(SafetySettingsPage));
+    expectWritesDisabled(true);
+    await act(async () => control('Revoke git status').click());
+    expect(writes).toEqual([]);
+    sections.safety!.rollout = { settingsPages: true, revokes: true, chatFirst: false };
+    await refresh();
+    expectWritesDisabled(false);
+    await click('Revoke git status');
+    expect(writes).toHaveLength(1);
+  });
+
+  it.each([false, undefined])('disables cached section editors when refreshed list rollout is %s', async settingsPages => {
+    await render(createElement(SafetySettingsPage));
+    expectWritesDisabled(false);
+    const sectionReads = fetchMock.mock.calls.filter(([url]) => String(url).includes('/sections/')).length;
+    vi.spyOn(api, 'list').mockResolvedValue({ conversations: [], approvals: [], statuses: [],
+      ...(settingsPages === undefined ? {} : { rollout: { settingsPages, revokes: false, chatFirst: false } }) });
+    await act(async () => refreshList());
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/sections/')).length).toBeGreaterThan(sectionReads);
+    expectWritesDisabled(true);
+    await act(async () => control('Revoke git status').click());
+    expect(writes).toEqual([]);
+    expect(container.textContent).toContain('Settings writes have not been enabled on this site.');
+  });
+
+  it('cancels a cached confirmation when refreshed site rollout turns off', async () => {
+    applyReply = { status: 'confirm', confirm: confirm.confirm, summary: 'Revoke git status.', expiresAt: Date.now() + 60_000 };
+    await render(createElement(SafetySettingsPage));
+    await click('Revoke git status');
+    expect(container.querySelector('[role="alertdialog"]')).not.toBeNull();
+    vi.spyOn(api, 'list').mockResolvedValue({ conversations: [], approvals: [], statuses: [], rollout: { settingsPages: false, revokes: false, chatFirst: false } });
+    await act(async () => refreshList());
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(writes).toHaveLength(1);
+  });
+});
+
+describe('revokes rollout', () => {
+  const enabled = { settingsPages: true, revokes: true, chatFirst: false };
+
+  function expectRevokesDisabled(disabled: boolean) {
+    expect(control('Revoke git status').matches(':disabled')).toBe(disabled);
+    expect(control('Skill changes wait for your OK').matches(':disabled')).toBe(disabled);
+    expect(container.querySelector('input[value="manual"]')!.matches(':disabled')).toBe(false);
+  }
+
+  it.each([false, undefined])('requires explicit section revokes metadata, received %s', async revokes => {
+    sections.safety!.rollout = { ...enabled, revokes } as SettingsSectionPayload['rollout'];
+    await render(createElement(SafetySettingsPage));
+    expectRevokesDisabled(true);
+    await act(async () => {
+      control('Revoke git status').click();
+      control('Skill changes wait for your OK').click();
+    });
+    expect(writes).toEqual([]);
+    sections.safety!.rollout = enabled;
+    await refresh();
+    expectRevokesDisabled(false);
+  });
+
+  it.each([false, undefined])('refreshes cached sections and locks revoke and skill-staging controls when list revokes is %s', async revokes => {
+    await render(createElement(SafetySettingsPage));
+    expectRevokesDisabled(false);
+    const sectionReads = fetchMock.mock.calls.filter(([url]) => String(url).includes('/sections/')).length;
+    vi.spyOn(api, 'list').mockResolvedValue({ conversations: [], approvals: [], statuses: [],
+      rollout: { ...enabled, revokes } as ListResponse['rollout'] });
+    await act(async () => refreshList());
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/sections/')).length).toBeGreaterThan(sectionReads);
+    expectRevokesDisabled(true);
+    await act(async () => {
+      control('Revoke git status').click();
+      control('Skill changes wait for your OK').click();
+    });
+    expect(writes).toEqual([]);
+  });
+
+  it.each(['Revoke git status', 'Skill changes wait for your OK'])('cancels a held %s request when revokes turns off', async label => {
+    applyReply = { status: 'confirm', confirm: confirm.confirm, summary: 'Change the saved setting.', expiresAt: Date.now() + 60_000 };
+    await render(createElement(SafetySettingsPage));
+    await click(label);
+    expect(container.querySelector('[role="alertdialog"]')).not.toBeNull();
+    await act(async () => setState(s => ({ ...s, rollout: { ...enabled, revokes: false } })));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(writes).toHaveLength(1);
+    await act(async () => setState(s => ({ ...s, rollout: enabled })));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+  });
+
+  it('does not restore a confirmation that arrives after revokes turns off', async () => {
+    await render(createElement(SafetySettingsPage));
+    const response = deferred<Awaited<ReturnType<typeof api.settingsApply>>>();
+    const apply = vi.spyOn(api, 'settingsApply').mockReturnValueOnce(response.promise);
+    await act(async () => control('Skill changes wait for your OK').click());
+    expect(apply).toHaveBeenCalledOnce();
+    const section = deferred<SettingsSectionPayload>();
+    vi.spyOn(api, 'settingsSection').mockReturnValue(section.promise);
+    await act(async () => setState(s => ({ ...s, rollout: { ...enabled, revokes: false } })));
+    await act(async () => response.resolve({ status: 'confirm', confirm: confirm.confirm, summary: 'Stage skill changes.', expiresAt: Date.now() + 60_000 }));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    await act(async () => section.resolve(sections.safety!));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(apply).toHaveBeenCalledOnce();
+  });
+
+  it('discards an in-flight confirmation even if revokes is re-enabled before it arrives', async () => {
+    await render(createElement(SafetySettingsPage));
+    const response = deferred<Awaited<ReturnType<typeof api.settingsApply>>>();
+    const apply = vi.spyOn(api, 'settingsApply').mockReturnValueOnce(response.promise);
+    await act(async () => control('Skill changes wait for your OK').click());
+    await act(async () => setState(s => ({ ...s, rollout: { ...enabled, revokes: false } })));
+    await act(async () => setState(s => ({ ...s, rollout: enabled })));
+    await act(async () => response.resolve({ status: 'confirm', confirm: confirm.confirm, summary: 'Stage skill changes.', expiresAt: Date.now() + 60_000 }));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(apply).toHaveBeenCalledOnce();
+  });
+
+  it('ignores a superseded section response after a rollout change', async () => {
+    await render(createElement(SafetySettingsPage));
+    const stale = deferred<SettingsSectionPayload>();
+    const read = vi.spyOn(api, 'settingsSection').mockReturnValueOnce(stale.promise);
+    await refresh();
+    sections.safety!.rollout = { ...enabled, revokes: false };
+    await act(async () => setState(s => ({ ...s, rollout: { ...enabled, revokes: false } })));
+    expect(read.mock.calls.length).toBeGreaterThan(1);
+    await act(async () => stale.resolve({ ...sections.safety!, rollout: enabled }));
+    expectRevokesDisabled(true);
+    sections.safety!.rollout = enabled;
+    await act(async () => setState(s => ({ ...s, rollout: enabled })));
+    expectRevokesDisabled(false);
+  });
+
+  it.each(['hermes.revoke-always', 'hermes.skill-staging'])('requires explicit section revokes metadata for undo of %s', async operation => {
+    sections.overview = { section: 'overview', rollout: { ...enabled, revokes: false }, changes: [{ id: 'ch_000000000000000000000001', at: 0,
+      action: 'apply', operation, target: 'hermes-config', keys: [], level: 'anywhere', timing: [{ label: 'now' }], result: 'ok', undoable: true, undoAccess: 'editable' }] };
+    await render(createElement(RecentChanges));
+    const undo = container.querySelector<HTMLButtonElement>('button[aria-label^="Undo "]')!;
+    expect(undo.matches(':disabled')).toBe(true);
+    await act(async () => undo.click());
+    expect(writes).toEqual([]);
+  });
+
+  it.each(['hermes.revoke-always', 'hermes.skill-staging'])('locks cached undo of %s and cancels its held request when revokes turns off', async operation => {
+    sections.overview = { section: 'overview', rollout: enabled, changes: [{ id: 'ch_000000000000000000000001', at: 0,
+      action: 'apply', operation, target: 'hermes-config', keys: [], level: 'anywhere', timing: [{ label: 'now' }], result: 'ok', undoable: true, undoAccess: 'editable' }] };
+    restartReply = { status: 'confirm', confirm: confirm.confirm, summary: 'Restore the previous setting.', expiresAt: Date.now() + 60_000 };
+    await render(createElement(RecentChanges));
+    const undo = container.querySelector<HTMLButtonElement>('button[aria-label^="Undo "]')!;
+    expect(undo.matches(':disabled')).toBe(false);
+    await act(async () => undo.click());
+    expect(container.querySelector('[role="alertdialog"]')).not.toBeNull();
+    await act(async () => setState(s => ({ ...s, rollout: { ...enabled, revokes: false } })));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(undo.matches(':disabled')).toBe(true);
+    await act(async () => undo.click());
+    expect(writes).toHaveLength(1);
+  });
+});
+
+describe('restart rollout revocation', () => {
+  const enabled = { settingsPages: true, revokes: true, chatFirst: false };
+
+  it.each(['settingsPages', 'revokes'].flatMap(switchName => ['before', 'after', 'during refresh'].map(arrival => ({ switchName, arrival }))))
+  ('discards a late restart confirmation $arrival re-enabling $switchName', async ({ switchName, arrival }) => {
+    setState(s => ({ ...s, device: phone }));
+    if (switchName === 'settingsPages') {
+      await render(createElement(SettingsRestart, { component: 'hermes', when: 'now' }));
+    } else {
+      sections.safety!.restartWhenIdleCertified = false;
+      await render(createElement(SafetySettingsPage));
+      await click('Revoke git status');
+    }
+    const response = deferred<unknown>();
+    restartReply = response.promise;
+    await click('Restart now');
+    await click('Confirm');
+    const sent = writes.length;
+    const section = deferred<SettingsSectionPayload>();
+    if (arrival === 'during refresh') vi.spyOn(api, 'settingsSection').mockReturnValue(section.promise);
+    await act(async () => setState(s => ({ ...s, rollout: { ...enabled, [switchName]: false } })));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    if (arrival === 'after') await act(async () => setState(s => ({ ...s, rollout: enabled })));
+    await act(async () => response.resolve({ ...confirm, expiresAt: Date.now() + 60_000 }));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    await act(async () => setState(s => ({ ...s, rollout: enabled })));
+    if (arrival === 'during refresh') await act(async () => section.resolve(sections.safety!));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(writes).toHaveLength(sent);
+    restartReply = { status: 'refused', code: 'busy' };
+    await click('Restart now');
+    await click('Confirm');
+    expect(writes).toHaveLength(sent + 1);
+    expect(writes.at(-1)!.body).toEqual({ component: 'hermes', when: 'now' });
+  });
+
+  it('ignores an accepted restart response after settings rollout closes', async () => {
+    const response = deferred<unknown>();
+    restartReply = response.promise;
+    const accepted = vi.fn();
+    await render(createElement(SettingsRestart, { component: 'hermes', when: 'now', onAccepted: accepted }));
+    await click('Restart now');
+    await click('Confirm');
+    await act(async () => setState(s => ({ ...s, rollout: undefined })));
+    await act(async () => response.resolve({ status: 'accepted', run: { ...run, startedAt: 2 } }));
+    expect(container.textContent).not.toContain('Restart accepted.');
+    expect(accepted).not.toHaveBeenCalled();
+    await act(async () => setState(s => ({ ...s, rollout: enabled })));
+    expect(container.querySelector('[role="alertdialog"]')).toBeNull();
+    await click('Restart now');
+    expect(writes).toHaveLength(1);
+  });
+});
+
+describe('settings rollout loading', () => {
+  const notifications: NotificationSettingsView = {
+    rules: [{ event: 'agent-finished', source: '*', delivery: 'toast' }],
+    quietHours: { start: '21:00', end: '07:00' }, push: { approvals: true, cards: false },
+    pushAvailable: false, pushDevices: 0, presence: 'active', timeZoneConfigured: false,
+  };
+
+  async function loadControls() {
+    setState(s => ({ ...s, rollout: undefined, listLoaded: false }));
+    vi.spyOn(api, 'notificationSettings').mockResolvedValue(notifications);
+    const save = vi.spyOn(api, 'setNotificationSettings').mockResolvedValue(notifications);
+    await render(createElement('div', {}, createElement(NotificationRules), createElement(SettingsRestart, { component: 'hermes', when: 'idle' })));
+    expect(container.textContent).toContain('You are at this PC');
+    expect(container.textContent).toContain('Quiet hours');
+    return save;
+  }
+
+  function expectDisabled(disabled: boolean) {
+    for (const element of container.querySelectorAll('button, select')) {
+      const label = element.getAttribute('aria-label') ?? element.textContent;
+      expect(element.matches(':disabled'), label).toBe(disabled || label === 'Save notification rules');
+    }
+  }
+
+  it.each([false, true, undefined])('requires an explicit enabled switch after delayed list loading: %s', async settingsPages => {
+    const list = deferred<ListResponse>();
+    vi.spyOn(api, 'list').mockReturnValueOnce(list.promise);
+    const loading = refreshList();
+    const save = await loadControls();
+    expectDisabled(true);
+    await act(async () => {
+      control('Quiet hours').click();
+      control('Add a rule').click();
+      Array.from(container.querySelectorAll('button')).find(button => button.textContent === 'Restart when idle')!.click();
+    });
+    expect(save).not.toHaveBeenCalled();
+    expect(writes).toEqual([]);
+    await act(async () => {
+      list.resolve({ conversations: [], approvals: [], statuses: [],
+        ...(settingsPages === undefined ? {} : { rollout: { settingsPages, revokes: false, chatFirst: false } }) });
+      await loading;
+    });
+    expectDisabled(settingsPages !== true);
+    if (settingsPages === true) {
+      await click('Quiet hours');
+      expect(save).toHaveBeenCalledWith({ quietHours: null });
+      await click('Restart when idle');
+      expect(writes[0]!.body).toEqual({ component: 'hermes', when: 'idle' });
+    }
+  });
+
+  it('keeps writes disabled when list loading fails after notification values arrive', async () => {
+    const list = deferred<ListResponse>();
+    vi.spyOn(api, 'list').mockReturnValueOnce(list.promise);
+    const loading = refreshList().catch(() => {});
+    const save = await loadControls();
+    expectDisabled(true);
+    await act(async () => { list.reject(new Error('unavailable')); await loading; });
+    expectDisabled(true);
+    await act(async () => control('Quiet hours').click());
+    expect(save).not.toHaveBeenCalled();
+    expect(writes).toEqual([]);
+  });
+});
+
+it.each(['idle', 'now'] as const)('runs the pending-revoke Checks restart with server timing %s', async when => {
+  checks.rows = [{ id: 'allowlist.revoke-pending', state: 'warn', sentence: 'The gateway still needs to load a revoked answer.',
+    fix: { restart: { component: 'hermes', when } } }];
+  restartReply = { status: 'accepted', run: { ...run, when } };
+  await render(createElement(ChecksSettingsPage));
+  const label = when === 'idle' ? 'Restart when idle' : 'Restart now';
+  expect(container.textContent).not.toContain(when === 'idle' ? 'Restart now' : 'Restart when idle');
+  if (when === 'now') {
+    expect(container.textContent).toContain('WhatsApp turns, phone calls, jobs, background commands and delegated work');
+  }
+  await click(label);
+  if (when === 'now') {
+    expect(writes).toEqual([]);
+    expect(container.querySelector('[role="alertdialog"]')!.textContent).toContain('WhatsApp turns, phone calls, jobs, background commands and delegated work');
+    await click('Confirm');
+  }
+  expect(writes[0]!.body).toEqual({ component: 'hermes', when });
+  expect(container.textContent).not.toContain('not rolled out');
 });

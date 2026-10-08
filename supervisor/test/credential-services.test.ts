@@ -567,7 +567,7 @@ describe('stored credential probes', () => {
     const f = await fixture(); await writeFile(join(f.credentials, 'example'), 'fake-stored-key', { mode: 0o600 });
     const admin = vi.fn(async () => ({ ok: true, provider: 'example', backend: 'example' }));
     const verbs = new ConfigVerbs({ ...f.options, serviceAdmin: admin });
-    const http = createSupervisor({ config: configSchema.parse({ development: true, stateDir: f.stateDir, statusOnly: true }), registry: [], keys: [server],
+    const http = createSupervisor({ config: configSchema.parse({ development: true, stateDir: f.stateDir, statusOnly: true, restartWhenIdleCertified: true }), registry: [], keys: [server],
       exec: { async run() { return 0; } }, configVerbs: verbs,
       status: async () => ({ overall: 'ok', sentence: 'Everything is running.', components: [], busy: 'unknown', at: 1 }) });
     const call = async (path: string, body?: unknown, rescue = false) => {

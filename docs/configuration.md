@@ -61,7 +61,9 @@ are gone, the installer doesn't start the service.
 | `listen.host` | `127.0.0.1` | loopback: `localhost`, an address in `127.0.0.0/8`, or `::1` (never `0.0.0.0`) | Only cloudflared (same machine) should reach the app. |
 | `listen.port` | `19010` | 1–65535 | Local port for the app. `setup-tunnel.sh` points the tunnel at it. |
 | `publicOrigin` | `publicOrigin` or `origins` required | `https://` origin, no path, not a loopback host | The address you open on your phone: the main entry of `origins`, and the one pairing QR codes point to. |
-| `origins` | none | up to 16 bare origins: `https://` ones, plus local `http://127.0.0.1:<port>` (or `localhost`) ones | Every other address the app is opened from: a tailnet name, the relay, and the PC's own `https://127.0.0.1:8881`. Each one's `Host` is allowed, and its requests must carry its own `Origin`; two origins may not share a `Host` (say `http://` and `https://` on the same port), since the server tells sites apart by `Host`. A local origin (any loopback host, `http://` or `https://`: all of `127.0.0.0/8`, `::1` and IPv4-mapped forms, `localhost` with or without a trailing dot, `*.localhost`, and `0.0.0.0` or `[::]`) is reached on this machine only, and needs a paired device but no Access token; only the desktop app signs in there. |
+| `origins` | none | up to 16 bare origins: `https://` ones, plus local `http://127.0.0.1:<port>` (or `localhost`) ones | Every other address the app is opened from: a tailnet name, the relay, and the desktop's own `https://127.0.0.1:8883`. Each one's `Host` is allowed, and its requests must carry its own `Origin`; two origins may not share a `Host` (say `http://` and `https://` on the same port), since the server tells sites apart by `Host`. A local origin (any loopback host, `http://` or `https://`: all of `127.0.0.0/8`, `::1` and IPv4-mapped forms, `localhost` with or without a trailing dot, `*.localhost`, and `0.0.0.0` or `[::]`) is reached on this machine only, and needs a paired device but no Access token; only the desktop app signs in there. |
+| `localListener` | none | a separate loopback port and matching origin | The desktop's PC-only listener, normally `127.0.0.1:8883`. Keep `pcOnlyWrites: false` until its live Windows check passes. |
+| `rollout` | all false | `settingsPages`, `revokes`, `chatFirst`: booleans | Enable settings writes, revokes/staging, and the basic chat default separately. See [settings rollout](settings-rollout.md). |
 | `devices.enabled` | `true` | required in shadow | Device sign-in: every browser pairs once with a single-use code (see [SECURITY.md](../SECURITY.md#device-sign-in-pairing)). Turn it off only in primary mode with `access` configured; shadow refuses to start without pairing, including when an environment override selects shadow. |
 | `access` | none | | Cloudflare Access, an extra lock for public origins. When it's set, requests through a public origin need its token as well as a paired device; local origins need the device only. |
 | `access.teamDomain` | required in `access` | `https://<team>.cloudflareaccess.com` | Your Zero Trust team. Wayroost fetches signing keys from `<teamDomain>/cdn-cgi/access/certs`. |
@@ -105,8 +107,9 @@ sign-in off and no `access`, the server refuses to start.
 ## Loopback TLS
 
 Installed Wayroost listener configs include
-`"tls": { "certFile": "/etc/wayroost/server-tls-cert.pem" }` and the local origin
-`https://127.0.0.1:8881`. Supervisor config uses
+`"tls": { "certFile": "/etc/wayroost/server-tls-cert.pem" }` and the local origins
+`https://127.0.0.1:8881` and `https://127.0.0.1:8883`. The desktop uses the separate
+8883 listener; the tunnel targets the main 8881 listener. See [settings rollout](settings-rollout.md). Supervisor config uses
 `"tls": { "certFile": "/etc/wayroost/supervisor-tls-cert.pem" }` with
 `"development": false`. Both units load `loopback-tls-cert` and
 `loopback-tls-key` with systemd `LoadCredential`. Installed keys cannot use
@@ -187,7 +190,8 @@ To add the PC's own address for the Wayroost desktop app, list it in
 `origins`:
 
 ```json
-"origins": ["https://127.0.0.1:8881"]
+"localListener": { "host": "127.0.0.1", "port": 8883, "pcOnlyWrites": false },
+"origins": ["https://127.0.0.1:8881", "https://127.0.0.1:8883"]
 ```
 
 Only the desktop app can pair or sign in at a local address (any loopback

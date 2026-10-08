@@ -16,7 +16,7 @@ import { settingComparisonJson, type SettingValue } from '../../shared/settings.
 import type { ConfigUnitRunner } from '../src/config-unit.js';
 
 vi.mock('node:child_process', async original => ({ ...await original<typeof import('node:child_process')>(), execFile: vi.fn() }));
-vi.mock('../src/trust.js', async original => ({ ...await original<typeof import('../src/trust.js')>(), trustedExecutable: vi.fn(async (path: string) => path) }));
+vi.mock('../src/trust.js', async original => ({ ...await original<typeof import('../src/trust.js')>(), trustedExecutable: vi.fn(async (path: string) => path), trustedOwnerExecutable: vi.fn(async (path: string) => path) }));
 vi.mock('node:fs/promises', async original => ({ ...await original<typeof fs>(), lstat: vi.fn() }));
 const actual = await vi.importActual<typeof fs>('node:fs/promises');
 const actualProcess = await vi.importActual<typeof import('node:child_process')>('node:child_process');
@@ -744,6 +744,40 @@ it('routes effective reads through a bounded owner unit with no network or writa
   expect(runner).toHaveBeenCalledOnce();
 });
 
+it('checks root launchers before delegating resolver path trust to the owner unit', async () => {
+  const f = await fixture();
+  const resolver = f.site.targets['hermes-config']!.resolver!;
+  resolver.python = '/home/me/.hermes/installs/example/python';
+  resolver.modulePath = '/home/me/.hermes/installs/example';
+  const rootTrust = vi.fn(async (path: string) => {
+    if (path.startsWith('/home/me/')) throw new Error('owner-controlled');
+    return path;
+  });
+  const { trustedOwnerExecutable } = await import('../src/trust.js');
+  vi.mocked(trustedOwnerExecutable).mockClear();
+  const runner = vi.fn<ConfigUnitRunner>(async unit => ({ code: 0, stdout: JSON.stringify(await executeConfig(JSON.parse(unit.input),
+    { lock: async (_target, work) => work() })) + '\n' }));
+  const verbs = new ConfigVerbs({ stateDir: join(f.root, 'state'), site: async () => f.site, runner, trust: rootTrust,
+    executable: '/opt/example/node', entry: '/opt/example/config-entry.js' });
+  const key = { name: 'server', scope: 'server' as const, sha256: hashKey('fake-server-key') };
+  expect(await verbs.read({ view: 'hermes.safety' }, key)).toMatchObject({ ok: true, effective: true });
+  expect(rootTrust.mock.calls.map(([path]) => path)).toEqual(['systemd-run', '/opt/example/node', '/opt/example/config-entry.js']);
+  expect(runner.mock.calls[0]![0].argv).toContain('--uid=' + f.site.targets['hermes-config']!.runAs.uid);
+  expect(trustedOwnerExecutable).toHaveBeenCalledWith(resolver.python, f.site.targets['hermes-config']!.runAs.uid);
+  expect(trustedOwnerExecutable).toHaveBeenCalledWith(join(resolver.modulePath, 'hermes_cli/config.py'), f.site.targets['hermes-config']!.runAs.uid);
+});
+
+it.each(['systemd-run', '/opt/example/node', '/opt/example/config-entry.js'])('refuses an untrusted root launcher %s before the owner unit starts', async refused => {
+  const f = await fixture();
+  const runner = vi.fn<ConfigUnitRunner>();
+  const verbs = new ConfigVerbs({ stateDir: join(f.root, 'state'), site: async () => f.site, runner,
+    trust: async path => { if (path === refused) throw new Error('unsafe'); return path; },
+    executable: '/opt/example/node', entry: '/opt/example/config-entry.js' });
+  expect(await verbs.read({ view: 'hermes.safety' }, { name: 'server', scope: 'server', sha256: hashKey('fake-server-key') }))
+    .toEqual({ ok: false, code: 'unavailable' });
+  expect(runner).not.toHaveBeenCalled();
+});
+
 it('keeps persisted allowlist entries separate from loader output', async () => {
   const f = await fixture('command_allowlist: ["echo ${EXAMPLE_PATH}"]\n');
   output = '{"ok":true,"document":{"command_allowlist":["echo /tmp/example"]}}';
@@ -762,12 +796,13 @@ it('keeps the persisted owner view readable when a configured runtime is missing
   const f = await fixture('command_allowlist: ["echo example"]\n');
   const runner = vi.fn<ConfigUnitRunner>(async unit => ({ code: 0, stdout: JSON.stringify(await executeConfig(JSON.parse(unit.input),
     { lock: async (_target, work) => work() })) + '\n' }));
-  const unavailableRuntime = vi.fn(async (path: string) => { if (path.startsWith('/opt/example/hermes')) throw new Error('missing'); return path; });
-  const verbs = new ConfigVerbs({ stateDir: join(f.root, 'state'), site: async () => f.site, runner, trust: unavailableRuntime,
+  const { trustedOwnerExecutable } = await import('../src/trust.js');
+  vi.mocked(trustedOwnerExecutable).mockRejectedValueOnce(new Error('missing'));
+  const verbs = new ConfigVerbs({ stateDir: join(f.root, 'state'), site: async () => f.site, runner, trust,
     executable: '/opt/example/node', entry: '/opt/example/config-entry.js' });
   const key = { name: 'server', scope: 'server' as const, sha256: hashKey('fake-server-key') };
   expect(await verbs.read({ view: 'hermes.safety' }, key)).toEqual({ ok: false, code: 'unavailable' });
-  expect(runner).not.toHaveBeenCalled();
+  expect(runner).toHaveBeenCalledOnce();
   expect(await verbs.read({ view: 'hermes.allowlist' }, key)).toMatchObject({ ok: true, values: [
     { path: ['command_allowlist'], exists: true, value: ['echo example'] },
   ] });
@@ -796,4 +831,20 @@ it('confines startup variables to approved configuration data', async () => {
     f.site.targets['hermes-config']!.resolver!.environment = { [name]: 'obviously-fake' };
     expect(settingsTargetsSchema.safeParse(f.site).success).toBe(false);
   }
+});
+
+it('uses owner trust only when the resolver runs as its non-root target owner', async () => {
+  const f = await fixture();
+  f.site.targets['hermes-config']!.runAs.uid = 1234;
+  const { trustedOwnerExecutable, trustedExecutable } = await import('../src/trust.js');
+  vi.mocked(trustedOwnerExecutable).mockClear(); vi.mocked(trustedExecutable).mockClear();
+  const uid = vi.spyOn(process, 'getuid').mockReturnValue(1234);
+  await resolveHermesConfig(f.site, READ_VIEWS['hermes.safety']);
+  expect(trustedOwnerExecutable).toHaveBeenCalledTimes(2);
+  expect(trustedOwnerExecutable).toHaveBeenCalledWith(f.site.targets['hermes-config']!.resolver!.python, 1234);
+  expect(trustedExecutable).not.toHaveBeenCalled();
+  uid.mockReturnValue(0);
+  await resolveHermesConfig(f.site, READ_VIEWS['hermes.safety']);
+  expect(trustedExecutable).toHaveBeenCalledTimes(2);
+  expect(trustedOwnerExecutable).toHaveBeenCalledTimes(2);
 });

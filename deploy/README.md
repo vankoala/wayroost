@@ -105,9 +105,20 @@ Systemd supplies these credentials:
 | `config.json` | `/etc/wayroost/config.json` | `%d/config.json`, selected by `WAYROOST_CONFIG` and M1's `SIGNALBOX_CONFIG` fallback |
 | `paseo-password` (when its protected source exists) | `/etc/wayroost/paseo-password`, or `--paseo-password-file` | `$CREDENTIALS_DIRECTORY/paseo-password` |
 
-Generated config includes `https://127.0.0.1:8881` in `origins` and enables
-device pairing, while retaining the public HTTPS origin, Access and any other
-configured origins. Local pairing still requires the desktop app header.
+Generated config includes `https://127.0.0.1:8881` and `https://127.0.0.1:8883`
+in `origins` and enables device pairing, while retaining the public HTTPS origin,
+Access and any other configured origins. The main listener on 8881 serves the
+tunnel and phones; the desktop uses the local listener on 8883. Local pairing
+still requires the desktop app header.
+
+Re-installing an older config without `localListener` adds
+`{ host: "127.0.0.1", port: 8883, pcOnlyWrites: false }`. An existing local listener
+is preserved, including its port and write policy; the installer never enables
+PC-only writes. Older desktop pins without a local port default to 8883. After
+installing and starting the server with the local listener, obtain a fresh
+`sudo wayroost pair-desktop` token and pair again to save the port and pin its TLS.
+Keep production `pcOnlyWrites` false until the
+[live desktop check](../docs/settings-rollout.md#desktop-listener) passes.
 The password source must be root-owned, mode 0600, under a protected directory.
 Its contents are never copied into JSON or printed by the installer. A plain
 dry run does not examine host files; fake-root checks use invented fixtures.
@@ -179,10 +190,11 @@ files are public 0644 inside the protected config directory. The units supply
 enter installer output; only SHA-256 SPKI fingerprints may be printed. Reinstall
 retains pairs and refuses an incomplete pair. Dry runs generate no key material.
 
-Installed configs are TLS-only on the same 8881/8880 ports. Root's
-`sudo wayroost pair-desktop` prints a combined token with the pairing code and
-both fingerprints. Paste it into the desktop's bundled recovery form. Save the
-separate supervisor rescue key and fingerprint there for recovery.
+Installed configs use TLS on main port 8881, desktop local port 8883 and
+supervisor rescue port 8880. Both server listeners share the server certificate.
+Root's `sudo wayroost pair-desktop` prints a combined token with the pairing code and
+the local listener port and both fingerprints. Paste it into the desktop's bundled
+recovery form. Save the separate supervisor rescue key and fingerprint there for recovery.
 `sudo wayroost fingerprints` prints both public fingerprints from installed
 certificate files even when the server is down. Never take a fingerprint from
 the live listener.

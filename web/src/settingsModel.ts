@@ -4,6 +4,7 @@
 // value this device may not see arrives as a digest of itself; pages say the
 // value is shown on the PC, never the digest.
 import { z } from 'zod';
+import { rolloutSchema, type Rollout } from '../../shared/rollout.js';
 import { drainRestartRunSchema, settingsRestartResponseSchema, type CredentialTestResult, type UsageSummaryResult } from '../../shared/supervisor-config.js';
 import { READ_VIEW_IDS } from '../../shared/settings-ops.js';
 import { commandAllowlist } from '../../shared/command-allowlist.js';
@@ -46,6 +47,8 @@ export interface SettingsOperationInfo {
 /** GET /api/settings/sections/<section>. */
 export interface SettingsSectionPayload {
   section: SettingsSection;
+  rollout?: Rollout;
+  restartWhenIdleCertified?: boolean;
   legacyRoutesViaPipeline?: boolean;
   restartRuns?: z.infer<typeof drainRestartRunSchema>[];
   views?: SettingsViewResult[];
@@ -64,6 +67,8 @@ const rowAccessSchema = z.enum(['editable', 'confirm', 'read-only']);
 const countSchema = z.number().int().nonnegative();
 const sectionPayloadSchema = z.object({
   section: settingsSectionSchema,
+  rollout: rolloutSchema.optional(),
+  restartWhenIdleCertified: z.boolean().optional(),
   legacyRoutesViaPipeline: z.boolean().optional(),
   restartRuns: z.array(drainRestartRunSchema).optional(),
   views: z.array(z.discriminatedUnion('ok', [
@@ -283,6 +288,7 @@ export function changeToastText(change: { timing: Timing; effective: string; las
 
 /** What each fixed code means, in the words a page says. Upstream messages are never shown. */
 export const SETTINGS_ERROR_TEXT: Record<SettingsErrorCode, string> = {
+  not_rolled_out: 'Settings writes have not been enabled on this site.',
   shadow_read_only: 'This server is a shadow; it reads settings and changes nothing.',
   audit_unavailable: "The change journal can't be written, so settings changes are stopped. Chats keep working.",
   outcome_unknown: 'The outcome is unknown. Check Recent changes or use Checks on this PC to accept the current file as is.',

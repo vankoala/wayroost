@@ -37,6 +37,7 @@ try {
   if (!config.devices.enabled) throw new Error('Device sign-in is turned off in the config, so there is nothing to pair.');
   let pins: { server: string; rescue: string } | undefined;
   if (kind === 'desktop' && config.tls) {
+    if (!config.localListener) throw new Error('Desktop pairing requires a localListener and its HTTPS origin in the site config.');
     const server = spkiFingerprint(readFileSync(config.tls.certFile));
     let rescue: string;
     try { rescue = spkiFingerprint(readFileSync('/etc/wayroost/supervisor-tls-cert.pem')); }
@@ -62,7 +63,7 @@ try {
   }
   if (pins) {
     console.log(`Server fingerprint: ${pins.server}\nSupervisor rescue fingerprint: ${pins.rescue}`);
-    if (kind === 'desktop') console.log(`\nDesktop pairing token (paste into the recovery form):\n${JSON.stringify({ code: made.code, serverPin: pins.server, rescuePin: pins.rescue })}\n`);
+    if (kind === 'desktop') console.log(`\nDesktop pairing token (paste into the recovery form):\n${JSON.stringify({ code: made.code, serverPin: pins.server, rescuePin: pins.rescue, localPort: config.localListener?.port ?? 8883 })}\n`);
   }
   if (kind === 'desktop') console.log(pins ? 'Paste the whole token line into the Wayroost desktop recovery form (the bare code only works on an already-paired desktop’s pairing page).' : 'For the development desktop app, type the code into the app.');
 } catch (err) {

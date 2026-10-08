@@ -509,12 +509,7 @@ export class ConfigVerbs {
           await this.trust(unit.argv[separator + 2]!);
           if ('loader' in target) await this.trust(target.loader);
         } catch { throw new ConfigError('unsafe_target'); }
-        if ('view' in request && targetId === 'hermes-config' && !(READ_VIEWS[request.view] as ReadView).persisted && 'resolver' in target && target.resolver) {
-          try {
-            await this.trust(target.resolver.python);
-            await this.trust(join(target.resolver.modulePath, 'hermes_cli/config.py'));
-          } catch { throw new ConfigError('unavailable'); }
-        }
+        // The resolver checks its own code paths inside the target-owner unit.
         await this.audit.reconcile();
         await this.audit.save({ ...binding, row: { ...row, result: 'outcome_unknown' } });
         launched = true;

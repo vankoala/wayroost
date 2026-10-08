@@ -40,9 +40,10 @@ export function NewChatSheet({
   initialText?: string;
 }) {
   const enabled = useEnabledSources();
+  const chatFirst = useStore(s => s.rollout?.chatFirst ?? false);
   // Without Hermes there is no "just a chat" to offer, and a folder or a Paseo thread needs a sheet.
   const mustChoose = !enabled.includes('hermes') || initialSource === 'paseo' || initialCwd !== undefined;
-  const [advanced, setAdvanced] = useState(() => (mustChoose ? true : advancedWanted()));
+  const [advanced, setAdvanced] = useState(() => (mustChoose ? true : advancedWanted(chatFirst)));
   // What was already typed and attached, carried over when the view changes under you.
   const [carried, setCarried] = useState<{ text: string; files: PendingAttachment[] } | null>(null);
   if (advanced) {

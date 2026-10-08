@@ -15,6 +15,7 @@ import type {
   ComponentState,
   SupervisorStatus,
 } from '../shared/supervisor.js';
+import { currentConfigVerbs } from '../shared/supervisor-config.js';
 import type { BusyCounts, SupervisorApi, SupervisorStreamHandlers } from '../server/src/supervisor-client.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
@@ -206,10 +207,13 @@ export class DemoSupervisor implements SupervisorApi {
     this.rememberActions();
   }
 
+  restartWhenIdleCertified = true;
+
   /** The snapshot as the supervisor would send it now. */
   snapshot(): SupervisorStatus {
     return {
       overall: overallOf(this.components),
+      configVerbs: { ...currentConfigVerbs(true), restartWhenIdleCertified: this.restartWhenIdleCertified },
       sentence: sentenceFor(this.components, this.running ?? undefined),
       components: this.components,
       ...(this.running ? { running: summaryOf(this.running) } : {}),

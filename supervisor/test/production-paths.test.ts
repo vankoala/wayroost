@@ -74,7 +74,7 @@ async function fixture() {
   const admin = vi.fn(async () => ({ ok: true, provider: 'demo', backend: 'example' }));
   const options = { stateDir: audit.directory, site: async () => site, audit, runner, trust: async (path: string) => path, serviceCommand: command, serviceAdmin: admin };
   const verbs = new ConfigVerbs(options);
-  const supervisor = createSupervisor({ config: configSchema.parse({ development: true, statusOnly: true, stateDir: audit.directory }), registry: [], keys: [serverKey,
+  const supervisor = createSupervisor({ config: configSchema.parse({ development: true, statusOnly: true, restartWhenIdleCertified: true, stateDir: audit.directory }), registry: [], keys: [serverKey,
     { name: 'launcher', scope: 'server', sha256: hashKey('fake-launcher') }, { name: 'rescue', scope: 'rescue', sha256: hashKey('fake-rescue') }], exec: { async run() { return 0; } }, configVerbs: verbs,
     status: async () => ({ overall: 'ok', sentence: 'Ready', components: [], at: 1 }) });
   async function http(path: string, body: unknown = {}, method = 'POST', token = 'fake-server') {

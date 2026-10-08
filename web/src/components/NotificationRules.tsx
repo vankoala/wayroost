@@ -9,8 +9,8 @@ import type {
 } from '../../../shared/settings';
 import { SettingsTiming } from './SettingsTiming';
 import { api, serializeNotificationSettingsSave } from '../api.js';
-import { disablePush, enablePush, pushState, type PushState } from '../push';
-import { toast } from '../store';
+import { disablePush, enablePush, pushState, type PushState } from '../push.js';
+import { captureRollout, getRolloutGeneration, getState, toast, useStore } from '../store.js';
 
 /**
  * Settings → Notifications: which alerts reach the app on this PC, which reach the phone,
@@ -110,24 +110,30 @@ function refreshEditor(current: Editor, view: NotificationSettingsView): Editor 
 }
 
 export function NotificationRules() {
+  const rolledOut = useStore(s => s.rollout?.settingsPages === true);
   const [{ view, drafts }, setEditor] = useState<Editor>({ view: null, drafts: [] });
-  const [busy, setBusy] = useState(false);
+  const [saving, setBusy] = useState(false);
+  const [deviceBusy, setDeviceBusy] = useState(false);
+  const busy = saving || deviceBusy;
   const [push, setPush] = useState<PushState | null>(null);
   // Reads keep their generation; saves invalidate reads before and during the write.
   const settingsGeneration = useRef(0);
+  const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
+  useEffect(() => { setBusy(false); }, [rolloutGeneration]);
 
   useEffect(() => {
     let live = true;
     const generation = ++settingsGeneration.current;
+    const rollout = captureRollout(...(rolledOut ? ['settingsPages' as const] : []));
     void api.notificationSettings().then(
       (settings) => {
-        if (!live || generation !== settingsGeneration.current) return;
+        if (!live || !rollout.still() || generation !== settingsGeneration.current) return;
         setEditor((current) => refreshEditor(current, settings));
       },
       () => {}, // Notifications aren't set up here: no section
     );
     return () => { live = false; };
-  }, []);
+  }, [rolledOut, rolloutGeneration]);
 
   useEffect(() => {
     if (!view?.pushAvailable) return;
@@ -136,9 +142,13 @@ export function NotificationRules() {
       if (!live) return;
       setPush(state);
       if (state === 'on') {
+        const writable = getState().rollout?.settingsPages === true;
+        const rollout = captureRollout(...(writable ? ['settingsPages' as const] : []));
         const generation = ++settingsGeneration.current;
+        const closure = getRolloutGeneration('settingsPages');
         const settings = await api.notificationSettings();
-        if (live && generation === settingsGeneration.current) setEditor((current) => refreshEditor(current, settings));
+        if (live && rollout.still() && generation === settingsGeneration.current
+          && closure === getRolloutGeneration('settingsPages') && writable === (getState().rollout?.settingsPages === true)) setEditor((current) => refreshEditor(current, settings));
       }
     }).catch(() => { if (live) setPush('unsupported'); });
     return () => { live = false; };
@@ -164,62 +174,83 @@ export function NotificationRules() {
       }),
     }));
 
+  const requireWritable = (generation: ReturnType<typeof captureRollout>): void => {
+    if (!generation.still()) {
+      throw new Error('Settings writes have not been enabled on this site.');
+    }
+  };
+
   const save = async (): Promise<void> => {
+    if (getState().rollout?.settingsPages !== true) return;
+    const generation = captureRollout('settingsPages');
     setBusy(true);
     ++settingsGeneration.current;
     try {
-      const next = await serializeNotificationSettingsSave(() => api.setNotificationSettings({
-        rules,
-      }));
+      const next = await serializeNotificationSettingsSave(() => {
+        requireWritable(generation);
+        return api.setNotificationSettings({ rules });
+      });
+      if (!generation.still()) return;
       ++settingsGeneration.current;
       setEditor({ view: next, drafts: draftsFrom(next).map(asDraft) });
       toast('Saved.', 'info');
     } catch (err) {
-      toast((err as Error).message);
+      if (generation.still()) toast((err as Error).message);
     } finally {
-      setBusy(false);
+      if (generation.still()) setBusy(false);
     }
   };
 
   const saveShared = async (patch: { quietHours: Partial<NonNullable<NotificationSettingsView['quietHours']>> | null } | { push: Partial<NotificationSettingsView['push']> }): Promise<void> => {
+    if (getState().rollout?.settingsPages !== true) return;
+    const generation = captureRollout('settingsPages');
     setBusy(true);
     ++settingsGeneration.current;
     try {
       const next = await serializeNotificationSettingsSave(async () => {
+        requireWritable(generation);
+        const current = 'push' in patch || patch.quietHours ? await api.notificationSettings() : undefined;
+        requireWritable(generation);
         const body = 'push' in patch
-          ? { push: { ...(await api.notificationSettings()).push, ...patch.push } }
-          : { quietHours: patch.quietHours ? { ...((await api.notificationSettings()).quietHours ?? DEFAULT_QUIET), ...patch.quietHours } : null };
+          ? { push: { ...current!.push, ...patch.push } }
+          : { quietHours: patch.quietHours ? { ...(current!.quietHours ?? DEFAULT_QUIET), ...patch.quietHours } : null };
+        requireWritable(generation);
         return api.setNotificationSettings(body);
       });
+      if (!generation.still()) return;
       ++settingsGeneration.current;
       setEditor((current) => refreshEditor(current, next));
     } catch (err) {
-      toast((err as Error).message);
-    } finally { setBusy(false); }
+      if (generation.still()) toast((err as Error).message);
+    } finally { if (generation.still()) setBusy(false); }
   };
 
   const togglePhone = async (): Promise<void> => {
-    setBusy(true);
+    setDeviceBusy(true);
     try {
       const next = push === 'on' ? await disablePush() : await enablePush();
       setPush(next);
       if (next === 'denied') toast('Notifications are blocked for this site in the browser settings.');
-      const generation = ++settingsGeneration.current;
+      const writable = getState().rollout?.settingsPages === true;
+      const rollout = captureRollout(...(writable ? ['settingsPages' as const] : []));
+      const readGeneration = ++settingsGeneration.current;
+      const closure = getRolloutGeneration('settingsPages');
       const settings = await api.notificationSettings();
-      if (generation === settingsGeneration.current) setEditor((current) => refreshEditor(current, settings));
+      if (rollout.still() && readGeneration === settingsGeneration.current
+        && closure === getRolloutGeneration('settingsPages') && writable === (getState().rollout?.settingsPages === true)) setEditor((current) => refreshEditor(current, settings));
     } catch (err) {
       toast((err as Error).message);
-    } finally { setBusy(false); }
+    } finally { setDeviceBusy(false); }
   };
 
   const testPhone = async (): Promise<void> => {
-    setBusy(true);
+    setDeviceBusy(true);
     try {
       await api.pushTest();
       toast('Sent. It should show up in a few seconds.', 'info');
     } catch (err) {
       toast((err as Error).message);
-    } finally { setBusy(false); }
+    } finally { setDeviceBusy(false); }
   };
 
   const quiet = view.quietHours;
@@ -241,31 +272,33 @@ export function NotificationRules() {
             {view.timeZoneConfigured && <div className="muted">Quiet hours are read in the time zone this PC's settings name.</div>}
           </div>
         </div>
-        <div className="kv">
-          <Moon size={18} />
-          <div className="grow">
-            <div>Quiet hours</div>
-            <div className="muted">Card alerts wait during quiet hours. Approvals and questions always reach you.</div>
-            <SettingsTiming timing="next-alert" />
+        <fieldset disabled={!rolledOut} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+          <div className="kv">
+            <Moon size={18} />
+            <div className="grow">
+              <div>Quiet hours</div>
+              <div className="muted">Card alerts wait during quiet hours. Approvals and questions always reach you.</div>
+              <SettingsTiming timing="next-alert" />
+            </div>
+            <button type="button" role="switch" className="switch" aria-checked={Boolean(quiet)} aria-label="Quiet hours"
+              disabled={busy} onClick={() => void saveShared({ quietHours: quiet ? null : DEFAULT_QUIET })} />
           </div>
-          <button type="button" role="switch" className="switch" aria-checked={Boolean(quiet)} aria-label="Quiet hours"
-            disabled={busy} onClick={() => void saveShared({ quietHours: quiet ? null : DEFAULT_QUIET })} />
-        </div>
-        {quiet && (
-          <div className="kv quiet-times">
-            <SettingsTiming timing="next-alert" />
-            <span className="muted">From</span>
-            <select value={quiet.start} aria-label="Quiet hours start" disabled={busy}
-              onChange={(e) => void saveShared({ quietHours: { start: e.target.value } })}>
-              {times.map((time) => <option key={time} value={time}>{time}</option>)}
-            </select>
-            <span className="muted">to</span>
-            <select value={quiet.end} aria-label="Quiet hours end" disabled={busy}
-              onChange={(e) => void saveShared({ quietHours: { end: e.target.value } })}>
-              {times.map((time) => <option key={time} value={time}>{time}</option>)}
-            </select>
-          </div>
-        )}
+          {quiet && (
+            <div className="kv quiet-times">
+              <SettingsTiming timing="next-alert" />
+              <span className="muted">From</span>
+              <select value={quiet.start} aria-label="Quiet hours start" disabled={busy}
+                onChange={(e) => void saveShared({ quietHours: { start: e.target.value } })}>
+                {times.map((time) => <option key={time} value={time}>{time}</option>)}
+              </select>
+              <span className="muted">to</span>
+              <select value={quiet.end} aria-label="Quiet hours end" disabled={busy}
+                onChange={(e) => void saveShared({ quietHours: { end: e.target.value } })}>
+                {times.map((time) => <option key={time} value={time}>{time}</option>)}
+              </select>
+            </div>
+          )}
+        </fieldset>
         {view.pushAvailable && push && (
           <div className="kv">
             <Smartphone size={18} />
@@ -282,28 +315,30 @@ export function NotificationRules() {
         )}
         {view.pushAvailable && (
           <>
-            <div className="kv">
-              <ShieldAlert size={18} />
-              <div className="grow">
-                <div>Phone alerts when an agent needs you</div>
-                <div className="muted">Approvals and questions bypass quiet hours and always reach the app.</div>
-                <SettingsTiming timing="next-alert" />
+            <fieldset disabled={!rolledOut} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+              <div className="kv">
+                <ShieldAlert size={18} />
+                <div className="grow">
+                  <div>Phone alerts when an agent needs you</div>
+                  <div className="muted">Approvals and questions bypass quiet hours and always reach the app.</div>
+                  <SettingsTiming timing="next-alert" />
+                </div>
+                <button type="button" role="switch" className="switch" aria-checked={view.push.approvals}
+                  aria-label="Notify when an agent needs you" disabled={busy}
+                  onClick={() => void saveShared({ push: { approvals: !view.push.approvals } })} />
               </div>
-              <button type="button" role="switch" className="switch" aria-checked={view.push.approvals}
-                aria-label="Notify when an agent needs you" disabled={busy}
-                onClick={() => void saveShared({ push: { approvals: !view.push.approvals } })} />
-            </div>
-            <div className="kv">
-              <Sparkles size={18} />
-              <div className="grow">
-                <div>Phone alerts for new For-you cards</div>
-                <div className="muted">Cards follow their notification rule and quiet hours.</div>
-                <SettingsTiming timing="next-alert" />
+              <div className="kv">
+                <Sparkles size={18} />
+                <div className="grow">
+                  <div>Phone alerts for new For-you cards</div>
+                  <div className="muted">Cards follow their notification rule and quiet hours.</div>
+                  <SettingsTiming timing="next-alert" />
+                </div>
+                <button type="button" role="switch" className="switch" aria-checked={view.push.cards}
+                  aria-label="Notify about new For-you cards" disabled={busy}
+                  onClick={() => void saveShared({ push: { cards: !view.push.cards } })} />
               </div>
-              <button type="button" role="switch" className="switch" aria-checked={view.push.cards}
-                aria-label="Notify about new For-you cards" disabled={busy}
-                onClick={() => void saveShared({ push: { cards: !view.push.cards } })} />
-            </div>
+            </fieldset>
             {view.pushDevices > 0 && (
               <div className="kv">
                 <BellRing size={18} />
@@ -313,81 +348,83 @@ export function NotificationRules() {
             )}
           </>
         )}
-        {drafts.map((draft, index) => {
-          const needsYou = draft.event === 'agent-needs-you';
-          return (
-            <div className="kv" key={`${draft.event}-${draft.source}-${index}`}>
-              <div className="grow">
+        <fieldset disabled={!rolledOut} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+          {drafts.map((draft, index) => {
+            const needsYou = draft.event === 'agent-needs-you';
+            return (
+              <div className="kv" key={`${draft.event}-${draft.source}-${index}`}>
+                <div className="grow">
+                  <select
+                    value={draft.event}
+                    onChange={(e) => change(index, { event: e.target.value as NotificationEvent })}
+                    disabled={busy}
+                    aria-label={`Alert ${index + 1}`}
+                  >
+                    {EVENTS.map((item) => (
+                      <option key={item.id} value={item.id}>{item.label}</option>
+                    ))}
+                  </select>
+                  <div className="muted">{EVENTS.find((item) => item.id === draft.event)?.help}</div>
+                </div>
                 <select
-                  value={draft.event}
-                  onChange={(e) => change(index, { event: e.target.value as NotificationEvent })}
+                  value={draft.source}
+                  onChange={(e) => change(index, { source: e.target.value as NotificationSource | '*' })}
                   disabled={busy}
-                  aria-label={`Alert ${index + 1}`}
+                  aria-label={`Alert ${index + 1} source`}
                 >
-                  {EVENTS.map((item) => (
+                  {SOURCES.map((item) => (
                     <option key={item.id} value={item.id}>{item.label}</option>
                   ))}
                 </select>
-                <div className="muted">{EVENTS.find((item) => item.id === draft.event)?.help}</div>
+                <select
+                  value={draft.delivery}
+                  onChange={(e) => change(index, { delivery: e.target.value as NotificationDelivery })}
+                  disabled={busy}
+                  aria-label={`Alert ${index + 1} delivery`}
+                >
+                  {/* An answer can't be switched off, so the choices that would are gone. */}
+                  {DELIVERIES.filter((item) => !needsYou || item.id === 'toast' || item.id === 'both').map((item) => (
+                    <option key={item.id} value={item.id}>{item.label}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => setEditor((current) => ({ ...current, drafts: current.drafts.filter((_, at) => at !== index) }))}
+                  disabled={busy}
+                  aria-label={`Remove alert ${index + 1}`}
+                >
+                  <Trash2 size={16} />
+                </button>
+                <SettingsTiming timing="next-alert" />
               </div>
-              <select
-                value={draft.source}
-                onChange={(e) => change(index, { source: e.target.value as NotificationSource | '*' })}
-                disabled={busy}
-                aria-label={`Alert ${index + 1} source`}
-              >
-                {SOURCES.map((item) => (
-                  <option key={item.id} value={item.id}>{item.label}</option>
-                ))}
-              </select>
-              <select
-                value={draft.delivery}
-                onChange={(e) => change(index, { delivery: e.target.value as NotificationDelivery })}
-                disabled={busy}
-                aria-label={`Alert ${index + 1} delivery`}
-              >
-                {/* An answer can't be switched off, so the choices that would are gone. */}
-                {DELIVERIES.filter((item) => !needsYou || item.id === 'toast' || item.id === 'both').map((item) => (
-                  <option key={item.id} value={item.id}>{item.label}</option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                onClick={() => setEditor((current) => ({ ...current, drafts: current.drafts.filter((_, at) => at !== index) }))}
-                disabled={busy}
-                aria-label={`Remove alert ${index + 1}`}
-              >
-                <Trash2 size={16} />
-              </button>
-              <SettingsTiming timing="next-alert" />
+            );
+          })}
+          <div className="kv">
+            <div className="grow muted">
+              An agent waiting on you always reaches the app. Alerts the app would show go to the phone when nobody is at the keyboard.
             </div>
-          );
-        })}
-        <div className="kv">
-          <div className="grow muted">
-            An agent waiting on you always reaches the app. Alerts the app would show go to the phone when nobody is at the keyboard.
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => setEditor((current) => ({ ...current, drafts: [...current.drafts, { event: 'agent-finished', source: '*', delivery: 'toast', saved: null }] }))}
+              disabled={busy}
+              aria-label="Add a rule"
+            >
+              <Plus size={16} />
+            </button>
+            {busy && <LoaderCircle size={16} className="spin" />}
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => void save()}
+              disabled={busy || !dirty || duplicated}
+              aria-label="Save notification rules"
+            >
+              {duplicated ? 'Same rule twice' : 'Save'}
+            </button>
           </div>
-          <button
-            type="button"
-            className="btn btn-secondary"
-            onClick={() => setEditor((current) => ({ ...current, drafts: [...current.drafts, { event: 'agent-finished', source: '*', delivery: 'toast', saved: null }] }))}
-            disabled={busy}
-            aria-label="Add a rule"
-          >
-            <Plus size={16} />
-          </button>
-          {busy && <LoaderCircle size={16} className="spin" />}
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={() => void save()}
-            disabled={busy || !dirty || duplicated}
-            aria-label="Save notification rules"
-          >
-            {duplicated ? 'Same rule twice' : 'Save'}
-          </button>
-        </div>
+        </fieldset>
       </div>
     </>
   );

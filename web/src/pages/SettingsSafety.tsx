@@ -8,6 +8,7 @@ import { Page } from '../components/common.js';
 import { SettingsRestart } from '../components/SettingsRestart.js';
 import { HiddenNote, LevelChip, NoDataLine, SettingsReadNotice, SettingsSectionSource, SettingsSectionGuard, useSettingsReadOnly, useSettingsRefreshing, useSettingsStatus, viewReady, SettingRow, SettingsConfirmPrompt, TimingNotes, accessForValue, useSettingsChange, useSettingsSection, type SettingsStatusState } from '../components/SettingsRows.js';
 import { entrySha256, hermesSetting, rowValue, settingAsStringList, settingAsText, settingsErrorText, type RowValue, type SettingsSectionPayload } from '../settingsModel.js';
+import { captureRollout } from '../store.js';
 import { opTiming } from './SettingsAgents.js';
 
 /**
@@ -112,7 +113,7 @@ function ApprovalMode() {
 
 /** The “always allowed” list: entries as texts, each with a revoke. */
 function AlwaysAllowed() {
-  const readOnly = useSettingsReadOnly();
+  const readOnly = useSettingsReadOnly('hermes.revoke-always');
   const refreshing = useSettingsRefreshing();
   const section = useSettingsSection('safety');
   const { payload } = section;
@@ -122,16 +123,24 @@ function AlwaysAllowed() {
   const [revoking, setRevoking] = useState<string | null>(null);
   if (section.status !== 'ready' || !payload) return <SettingsReadNotice state={section} />;
   if (!viewReady(payload, 'hermes.safety')) return <SettingsReadNotice state={section} view="hermes.safety" />;
+  const idleRestartCertified = payload.restartWhenIdleCertified === true;
   const restartRun = payload.restartRuns?.at(-1);
   const allowlist = safetySetting(payload, 'command_allowlist');
   const access = allowlist.pinned || allowlist.overlayUnavailable || allowlist.value.kind === 'no-data' ? 'read-only' : accessForValue(payload, 'hermes.revoke-always', 'any');
   const list = settingAsStringList(allowlist.value);
   const revoke = async (entry: string, digest?: string) => {
+    const rollout = captureRollout('settingsPages', 'revokes');
+    if (!rollout.still()) return;
     setRevoking(entry);
-    digest ??= await entrySha256(entry);
-    const outcome = await change.run(`revoke-${digest}`, { operation: 'hermes.revoke-always', params: { entrySha256: digest } }, 'hermes.safety', () => setRevoked(true));
-    if (outcome.kind === 'applied') setRestartError(outcome.change.restartRequired?.code ? settingsErrorText(outcome.change.restartRequired.code) : undefined);
-    setRevoking(null);
+    try {
+      digest ??= await entrySha256(entry);
+      if (!rollout.still()) return;
+      const outcome = await change.run(`revoke-${digest}`, { operation: 'hermes.revoke-always', params: { entrySha256: digest } }, 'hermes.safety', () => setRevoked(true));
+      if (!rollout.still()) return;
+      if (outcome.kind === 'applied') setRestartError(outcome.change.restartRequired?.code ? settingsErrorText(outcome.change.restartRequired.code) : undefined);
+    } finally {
+      setRevoking(null);
+    }
   };
   return (
     <>
@@ -179,14 +188,15 @@ function AlwaysAllowed() {
         <div className="kv">
           <Info size={18} />
           <div className="grow muted">
-            Revoking removes the entry from your file. WhatsApp and phone calls need a Hermes gateway restart to reload the saved list. Wayroost schedules a tracked restart when idle after saving the revocation.
-            <TimingNotes timing={opTiming('hermes.revoke-always')} />
+            Revoking removes the entry from your file. WhatsApp and phone calls need a Hermes gateway restart to reload the saved list. {idleRestartCertified ? 'Wayroost schedules a tracked restart when idle after saving the revocation.' : 'Choose Restart now after saving the revocation. It can cut active WhatsApp turns, phone calls, jobs, background commands and delegated work.'}
+            <TimingNotes timing={opTiming('hermes.revoke-always').map(note => !idleRestartCertified && note.label === 'restart-when-idle:hermes'
+              ? { ...note, label: 'restart-now:hermes' } : note)} />
           </div>
         </div>
         {(revoked || restartRun) && <div className="kv"><div className="grow">
           {restartError && <div role="status">The idle restart could not be scheduled. {restartError}</div>}
           <div className="muted">Hermes’ gateway may keep honouring the revoked entry until its tracked restart finishes.</div>
-          <SettingsRestart component="hermes" initialRun={restartRun} when={restartRun ? "now" : undefined} disableWhileRunning disabled={readOnly && !refreshing} refreshing={refreshing} />
+          <SettingsRestart component="hermes" initialRun={restartRun} when={restartRun || !idleRestartCertified ? "now" : undefined} disableWhileRunning requiresRevokes disabled={readOnly && !refreshing} refreshing={refreshing} />
         </div></div>}
       </div>
       <SettingsConfirmPrompt pending={change.pending} busy={change.busy !== null} disabled={readOnly} onConfirm={() => void change.confirmNow()} onCancel={change.dismiss} />
@@ -195,7 +205,7 @@ function AlwaysAllowed() {
 }
 
 function SkillStaging() {
-  const readOnly = useSettingsReadOnly();
+  const readOnly = useSettingsReadOnly('hermes.skill-staging');
   const section = useSettingsSection('safety');
   const { payload } = section;
   const change = useSettingsChange(payload);

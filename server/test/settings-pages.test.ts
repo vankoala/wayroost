@@ -26,7 +26,7 @@ async function fixture(settings: SettingsOptions = {}, local = false) {
   const root = mkdtempSync(resolve('.tmp/settings-data-'));
   roots.push(root);
   seedDevices(root);
-  const config = parseConfig({ stateDir: root, publicOrigin: 'https://wayroost.example.com',
+  const config = parseConfig({ rollout: { settingsPages: true, revokes: true, chatFirst: true }, stateDir: root, publicOrigin: 'https://wayroost.example.com',
     access: { teamDomain: 'https://testteam.cloudflareaccess.com', aud: 'test-aud-0123456789abcdef', allowedEmails: ['you@example.com'] },
     settings: { legacyRoutesViaPipeline: true }, localListener: { port: 8892, pcOnlyWrites: true }, origins: ['https://127.0.0.1:8892'] });
   const supervisor = new FakeSettingsSupervisor();

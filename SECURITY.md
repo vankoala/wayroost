@@ -25,16 +25,20 @@ reproduce and the version or commit.
 
 ## Authenticated desktop loopback listeners
 
-Installed Wayroost uses HTTPS/WSS on `127.0.0.1:8881` and HTTPS for supervisor
-rescue on `127.0.0.1:8880`. Each installer creates an independent self-signed
-ECDSA P-256 certificate, valid for ten years, with SANs `127.0.0.1` and
+Installed Wayroost uses HTTPS/WSS on the main listener `127.0.0.1:8881` for
+the tunnel and phones, and the local listener `127.0.0.1:8883` for the desktop.
+Supervisor rescue uses HTTPS on `127.0.0.1:8880`. The tunnel targets only 8881;
+the local listener alone can allow PC-only writes after its live check. Each
+installer creates an independent self-signed ECDSA P-256 certificate, valid for ten years, with SANs `127.0.0.1` and
 `localhost`. Private keys remain root:root, 0600; systemd `LoadCredential`
 provides private copies to the services, including the server's DynamicUser.
 Private keys are never printed or logged. Public fingerprints are SHA-256 over
 the certificate's DER SubjectPublicKeyInfo, written as `sha256/<base64>`.
 
 Run `sudo wayroost pair-desktop` on the PC. Paste its combined token into the
-bundled desktop recovery form. It carries the single-use code and both pins.
+bundled desktop recovery form. It carries the single-use code, local port and
+both pins. The main and local listeners share the server certificate; pairing
+pins the local listener before sending credentials.
 The desktop checks the pasted server pin during TLS before sending the code,
 then verifies the paired identity before saving the pins with Electron
 `safeStorage`. The rescue key is separately checked using the supervisor pin
@@ -50,6 +54,13 @@ the peer SPKI, hostname and certificate dates on each socket before writing any
 HTTP bytes. A mismatch displays “This is not your Wayroost server” and sends no
 cookie, pairing code, desktop marker or bearer key. No trust on first use is used.
 Pin changes restart the desktop so Chromium cannot reuse cached trust decisions.
+
+For upgrades without `localListener`, re-run the server installer as root. It adds
+the local listener on 8883 and its allowed HTTPS origin without overwriting an
+existing listener or enabling `pcOnlyWrites`. Older saved pins without a port use
+8883. Once that listener is running, pair again with a fresh token to save its
+port and TLS pin. Keep `pcOnlyWrites: false` until the live desktop check passes;
+see [settings rollout](docs/settings-rollout.md#desktop-listener).
 
 Root can explicitly rotate either certificate:
 

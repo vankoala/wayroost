@@ -7,8 +7,13 @@ import type { SettingsTargets } from '../../shared/settings-targets.js';
 import { readViewKeys, type ReadView } from '../../shared/settings-ops.js';
 import { settingComparisonJson, settingValueSchema, type SettingValue } from '../../shared/settings.js';
 import { ConfigError } from './config-paths.js';
-import { trustedExecutable, type Trust } from './trust.js';
+import { trustedExecutable, trustedOwnerExecutable, type Trust } from './trust.js';
 
+// The resolver runs as the target owner. Owner-owned interpreter and source paths require a
+// private ancestor, without symlinks or foreign owners; writable directories below it are allowed.
+// Code files cannot be world-writable; group writes require the owner's private group.
+// Any group access also requires a successful check that the file has no access ACL.
+// A root-run resolver keeps the root-only trust walk. This owner rule claims no isolation.
 // The effective view is Hermes' own loader output. It fails closed when that loader raises or
 // returns its failed-read marker; when the guard denied a write, connection or process during the
 // read; on any stat or open error other than not-found (ENOENT, or ENOTDIR: a path through a file
@@ -197,14 +202,16 @@ const command: HermesResolverCommand = (python, args, hermesHome, environment, s
 });
 
 /** Called inside the owner's read-only, network-isolated config unit. */
-export async function resolveHermesConfig(site: SettingsTargets, view: ReadView, run: HermesResolverCommand = command, trust: Trust = trustedExecutable): Promise<unknown> {
+export async function resolveHermesConfig(site: SettingsTargets, view: ReadView, run: HermesResolverCommand = command, trust?: Trust): Promise<unknown> {
   const target = site.targets['hermes-config'];
   if (!target) throw new ConfigError('not_configured');
   const resolver = target.resolver;
   if (!resolver) throw new ConfigError('unavailable');
   try {
-    const python = await trust(resolver.python);
-    await trust(join(resolver.modulePath, 'hermes_cli/config.py'));
+    const check = trust ?? (process.getuid?.() === target.runAs.uid && target.runAs.uid !== 0
+      ? (path: string) => trustedOwnerExecutable(path, target.runAs.uid) : trustedExecutable);
+    const python = await check(resolver.python);
+    await check(join(resolver.modulePath, 'hermes_cli/config.py'));
     const output = await run(python, ['-c', resolverScript, resolver.modulePath, target.path, JSON.stringify(view.keys), JSON.stringify(!!view.comparisonDigests)], dirname(target.path), { ...resolver.environment,
       ...(site.targets['hermes-managed'] ? { HERMES_MANAGED_DIR: dirname(site.targets['hermes-managed'].path) } : {}) }, resolver.home);
     if (Buffer.byteLength(output) > 1024 * 1024 || output.trim().split('\n').length !== 1) throw new Error();

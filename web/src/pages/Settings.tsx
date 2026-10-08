@@ -54,7 +54,7 @@ import {
 } from '../../../shared/protocol';
 import type { WorkerApprovalsStatus } from '../../../shared/safety';
 import { api, refreshList, reportTidy } from '../api';
-import { setState, toast, useStore } from '../store';
+import { captureRollout, getRolloutGeneration, getState, setState, toast, useStore } from '../store.js';
 import { readMessage, setVoiceSettings, setVoiceStatus, SPEEDS, useVoiceSettings, useVoiceStatus } from '../voice';
 import { navigate, settingsPath } from '../router';
 import { ConfirmDialog, Page, SOURCE_NAMES, SourceAvatar, statusLabel, statusTone, useEnabledSources } from '../components/common';
@@ -69,26 +69,31 @@ function applyStatus(status: SourceStatus) {
 }
 
 function HermesSignIn() {
+  const writable = useStore(s => s.rollout?.settingsPages === true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
+  useEffect(() => { setBusy(false); setError(null); }, [rolloutGeneration]);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!username.trim() || !password || busy) return;
+    const rollout = captureRollout('settingsPages');
+    if (!rollout.still() || !username.trim() || !password || busy) return;
     setBusy(true);
     setError(null);
     try {
       const { status } = await api.setHermesCredentials(username.trim(), password);
+      if (!rollout.still()) return;
       applyStatus(status);
       setPassword('');
       toast('Hermes connected', 'info');
-      setTimeout(() => refreshList().catch(() => {}), 1500);
+      setTimeout(() => { if (rollout.still()) void refreshList(rollout).catch(() => {}); }, 1500);
     } catch (err) {
-      setError((err as Error).message);
+      if (rollout.still()) setError((err as Error).message);
     } finally {
-      setBusy(false);
+      if (rollout.still()) setBusy(false);
     }
   };
 
@@ -98,6 +103,7 @@ function HermesSignIn() {
         <span>Hermes dashboard username</span>
         <SettingsTiming timing="now" />
         <input
+          disabled={!writable || busy}
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           autoComplete="username"
@@ -110,6 +116,7 @@ function HermesSignIn() {
         <span>Password</span>
         <SettingsTiming timing="now" />
         <input
+          disabled={!writable || busy}
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
@@ -118,7 +125,7 @@ function HermesSignIn() {
         <small>Checked with Hermes, then kept only on your PC. It is never sent to your phone again.</small>
       </label>
       {error && <p className="error-text">{error}</p>}
-      <button type="submit" className="btn btn-primary" disabled={busy || !username.trim() || !password}>
+      <button type="submit" className="btn btn-primary" disabled={!writable || busy || !username.trim() || !password}>
         {busy ? <LoaderCircle size={18} className="spin" /> : <KeyRound size={16} />}
         Connect Hermes
       </button>
@@ -331,34 +338,40 @@ const CLOUD_STATE: Record<CloudAgent['state'], string> = {
  * so it holds everywhere. Hidden where the server can't switch them.
  */
 function CloudAgentsSettings() {
+  const writable = useStore(s => s.rollout?.settingsPages === true);
+  const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
   const desktop = useStore((s) => s.device?.kind === 'desktop');
   const [agents, setAgents] = useState<CloudAgent[] | null>(null);
   const [busy, setBusy] = useState<CloudAgentId | null>(null);
+  useEffect(() => { setBusy(null); }, [rolloutGeneration]);
 
   useEffect(() => {
     let live = true;
+    const rollout = captureRollout(...(writable ? ['settingsPages' as const] : []));
     api.cloudAgents().then(
       (status) => {
-        if (live) setAgents(status.agents);
+        if (live && rollout.still()) setAgents(status.agents);
       },
       () => {}, // Paseo is off or reconnecting, or an older server: no section
     );
     return () => {
       live = false;
     };
-  }, []);
+  }, [writable, rolloutGeneration]);
 
   if (!agents?.length) return null;
 
   const toggle = async (agent: CloudAgent) => {
-    if (!desktop) return;
+    const rollout = captureRollout('settingsPages');
+    if (!rollout.still() || !desktop) return;
     setBusy(agent.id);
     try {
-      setAgents((await api.setCloudAgent(agent.id, !agent.enabled)).agents);
+      const next = await api.setCloudAgent(agent.id, !agent.enabled);
+      if (rollout.still()) setAgents(next.agents);
     } catch (err) {
-      toast((err as Error).message);
+      if (rollout.still()) toast((err as Error).message);
     } finally {
-      setBusy(null);
+      if (rollout.still()) setBusy(null);
     }
   };
 
@@ -386,7 +399,7 @@ function CloudAgentsSettings() {
               aria-checked={agent.enabled}
               aria-label={agent.label}
               onClick={() => toggle(agent)}
-              disabled={busy !== null || !desktop}
+              disabled={busy !== null || !desktop || !writable}
             />
           </div>
         ))}
@@ -408,36 +421,43 @@ function CloudAgentsSettings() {
  * turning it off doesn't. Hidden where the server has no Hermes.
  */
 function SafetyCommandsSettings() {
+  const writable = useStore(s => s.rollout?.settingsPages === true);
+  const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
   const desktop = useStore((s) => s.device?.kind === 'desktop');
   const [status, setStatus] = useState<SafetyCommandsStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const [confirming, setConfirming] = useState(false);
+  const [confirming, setConfirming] = useState<ReturnType<typeof captureRollout> | null>(null);
 
-  useEffect(() => { if (!desktop) setConfirming(false); }, [desktop]);
+  useEffect(() => { if (!desktop) setConfirming(null); }, [desktop]);
 
   useEffect(() => {
     let live = true;
+    const rollout = captureRollout(...(writable ? ['settingsPages' as const] : []));
     api.safetyCommands().then(
       (s) => {
-        if (live) setStatus(s);
+        if (live && rollout.still()) setStatus(s);
       },
       () => {}, // Hermes is off, or an older server: no row
     );
     return () => {
       live = false;
     };
-  }, []);
+  }, [writable, rolloutGeneration]);
 
-  const save = async (enabled: boolean) => {
-    if (!desktop) return;
+  useEffect(() => { setConfirming(null); setBusy(false); }, [rolloutGeneration]);
+
+  const save = async (enabled: boolean, rollout = captureRollout('settingsPages')) => {
+    if (!rollout.still() || !desktop) { setConfirming(null); return; }
     setBusy(true);
     try {
-      setStatus(await api.setSafetyCommands(enabled));
-      setConfirming(false);
+      const next = await api.setSafetyCommands(enabled);
+      if (!rollout.still()) return;
+      setStatus(next);
+      setConfirming(null);
     } catch (err) {
-      toast((err as Error).message);
+      if (rollout.still()) toast((err as Error).message);
     } finally {
-      setBusy(false);
+      if (rollout.still()) setBusy(false);
     }
   };
 
@@ -474,19 +494,19 @@ function SafetyCommandsSettings() {
           className="switch"
           aria-checked={status.enabled}
           aria-label="Hermes safety commands"
-          onClick={() => (status.enabled ? save(false) : setConfirming(true))}
-          disabled={busy || !desktop}
+          onClick={() => (status.enabled ? save(false) : setConfirming(captureRollout('settingsPages')))}
+          disabled={busy || !desktop || !writable}
         />
       </div>
-      {confirming && desktop && (
+      {confirming?.still() && desktop && (
         <ConfirmDialog
           title="Allow Hermes safety commands?"
           message={`${status.commands.join(', ')} will run from Wayroost, including from your phone. Anyone who can send a message here could then switch off Hermes' approval prompts or upload its logs. You can switch this off again at any time.`}
           confirmLabel="Allow"
           busy={busy}
           danger
-          onConfirm={() => save(true)}
-          onCancel={() => setConfirming(false)}
+          onConfirm={() => { if (confirming) void save(true, confirming); }}
+          onCancel={() => setConfirming(null)}
         />
       )}
     </>
@@ -507,10 +527,12 @@ function workerApprovalsState(status: WorkerApprovalsStatus): string {
  * from Hermes safety commands. Only a paired desktop can change it.
  */
 function WorkerApprovalsSettings() {
+  const writable = useStore(s => s.rollout?.settingsPages === true);
+  const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
   const device = useStore((s) => s.device);
   const [status, setStatus] = useState<WorkerApprovalsStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const [confirming, setConfirming] = useState(false);
+  const [confirming, setConfirming] = useState<ReturnType<typeof captureRollout> | null>(null);
   const [confirmed, setConfirmed] = useState(false);
   const [choiceRead, setChoiceRead] = useState(false);
   const live = useRef(false);
@@ -521,28 +543,31 @@ function WorkerApprovalsSettings() {
 
   const refresh = useCallback(async (force = false) => {
     if (!live.current || saving.current || (!force && reading.current !== null)) return;
+    const generation = getRolloutGeneration('settingsPages');
+    const rollout = captureRollout(...(getState().rollout?.settingsPages === true ? ['settingsPages' as const] : []));
     const request = ++version.current;
     reading.current = request;
     try {
       const next = await api.workerApprovals();
-      if (live.current && version.current === request) {
+      if (live.current && version.current === request && rollout.still() && generation === getRolloutGeneration('settingsPages')) {
         setStatus(next);
         setConfirmed(next.config === 'written');
         setChoiceRead(next.choiceConfirmed === true);
       }
     } catch {
-      if (live.current && version.current === request) {
+      if (live.current && version.current === request && rollout.still() && generation === getRolloutGeneration('settingsPages')) {
         setConfirmed(false);
         setChoiceRead(false);
-        setConfirming(false);
+        setConfirming(null);
       }
     } finally {
       if (reading.current === request) reading.current = null;
     }
-  }, []);
+  }, [writable, rolloutGeneration]);
 
   useEffect(() => {
     live.current = true;
+    saving.current = false;
     void refresh();
     const timer = window.setInterval(() => void refresh(), 15_000);
     const focus = () => void refresh();
@@ -559,8 +584,11 @@ function WorkerApprovalsSettings() {
     };
   }, [refresh]);
 
-  const save = async (enabled: boolean) => {
-    if (!desktop || saving.current) return;
+  useEffect(() => { setConfirming(null); setBusy(false); }, [rolloutGeneration]);
+
+  const save = async (enabled: boolean, rollout = captureRollout('settingsPages')) => {
+    if (!rollout.still() || !desktop || saving.current) { setConfirming(null); return; }
+    const generation = getRolloutGeneration('settingsPages');
     saving.current = true;
     const request = ++version.current;
     setBusy(true);
@@ -568,23 +596,25 @@ function WorkerApprovalsSettings() {
     setChoiceRead(false);
     try {
       const next = await api.setWorkerApprovals(enabled);
-      if (live.current && version.current === request) {
+      if (live.current && version.current === request && rollout.still() && generation === getRolloutGeneration('settingsPages')) {
         setStatus(next);
         setConfirmed(next.config === 'written');
         setChoiceRead(next.choiceConfirmed === true);
-        setConfirming(false);
+        setConfirming(null);
       }
     } catch (err) {
-      if (live.current) {
+      if (live.current && rollout.still()) {
         toast((err as Error).message);
-        setConfirming(false);
+        setConfirming(null);
         // A failed response may follow a committed write. Verify the saved choice.
         saving.current = false;
         await refresh(true);
       }
     } finally {
-      saving.current = false;
-      if (live.current) setBusy(false);
+      if (rollout.still()) {
+        saving.current = false;
+        if (live.current) setBusy(false);
+      }
     }
   };
 
@@ -618,7 +648,7 @@ function WorkerApprovalsSettings() {
           <SettingsTiming timing="next-chat" />
         </div>
         {busy && <LoaderCircle size={16} className="spin" />}
-        {pendingChoice && <button type="button" className="btn btn-secondary" onClick={() => void save(pendingChoice.enabled)} disabled={busy || !desktop}>
+        {pendingChoice && <button type="button" className="btn btn-secondary" onClick={() => void save(pendingChoice.enabled)} disabled={busy || !desktop || !writable}>
           Apply saved setting
         </button>}
         {verified ? <button
@@ -627,21 +657,21 @@ function WorkerApprovalsSettings() {
           className="switch"
           aria-checked={verified.enabled}
           aria-label="Workers' approvals come to me"
-          onClick={() => (verified.enabled ? setConfirming(true) : save(true))}
-          disabled={busy || !desktop}
+          onClick={() => (verified.enabled ? setConfirming(captureRollout('settingsPages')) : save(true))}
+          disabled={busy || !desktop || !writable}
         /> : <button type="button" className="btn btn-secondary" onClick={() => void refresh(true)} disabled={busy}>
           Check again
         </button>}
       </div>
-      {confirming && (
+      {confirming?.still() && (
         <ConfirmDialog
           title="Let agents answer each other?"
           message="Agents that start other agents could then answer their permission requests and switch their modes, without asking you. You can switch this back on at any time."
           confirmLabel="Turn off"
           busy={busy}
           danger
-          onConfirm={() => save(false)}
-          onCancel={() => setConfirming(false)}
+          onConfirm={() => { if (confirming) void save(false, confirming); }}
+          onCancel={() => setConfirming(null)}
         />
       )}
     </>
@@ -1330,6 +1360,7 @@ function ThemeSetting() {
  * are pages under /settings now.
  */
 export function SettingsPage() {
+  const writable = useStore(s => s.rollout?.settingsPages === true);
   const email = useStore((s) => s.email);
   const device = useStore((s) => s.device);
   const statuses = useStore((s) => s.statuses);
@@ -1345,19 +1376,24 @@ export function SettingsPage() {
     });
   }, []);
   const [disconnecting, setDisconnecting] = useState(false);
+  const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
+  useEffect(() => { setDisconnecting(false); }, [rolloutGeneration]);
   const enabled = useEnabledSources();
   const hermes = statuses.hermes;
 
   const disconnectHermes = async () => {
+    const rollout = captureRollout('settingsPages');
+    if (!rollout.still()) return;
     setDisconnecting(true);
     try {
       const { status } = await api.clearHermesCredentials();
+      if (!rollout.still()) return;
       applyStatus(status);
-      refreshList().catch(() => {});
+      refreshList(rollout).catch(() => {});
     } catch (err) {
-      toast((err as Error).message);
+      if (rollout.still()) toast((err as Error).message);
     } finally {
-      setDisconnecting(false);
+      if (rollout.still()) setDisconnecting(false);
     }
   };
 
@@ -1408,7 +1444,7 @@ export function SettingsPage() {
                 <div className="muted">Stored privately on your PC</div>
                 <SettingsTiming timing="now" />
               </div>
-              <button type="button" className="btn btn-secondary" onClick={disconnectHermes} disabled={disconnecting}>
+              <button type="button" className="btn btn-secondary" onClick={disconnectHermes} disabled={disconnecting || !writable}>
                 {disconnecting && <LoaderCircle size={16} className="spin" />}
                 Sign out
               </button>
