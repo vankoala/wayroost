@@ -70,6 +70,8 @@ const storageApart = (target: { path: string; backupDir: string; auditDir: strin
 const hermesConfigTarget = z.object({ ...ownerFileFields, format: z.literal('yaml'), lock: fileLock,
   /** The installed Hermes interpreter and import root used to resolve effective config. */
   resolver: z.object({ python: absolutePathSchema, modulePath: absolutePathSchema,
+    /** Optional dependency environment; python remains the real interpreter, not the venv symlink. */
+    venv: absolutePathSchema.optional(),
     /** Startup HOME, independent of the profile's HERMES_HOME; defaults to the owner process's home. */
     home: absolutePathSchema.optional(),
     /** Approved non-secret startup variables, passed to Hermes' own environment loader. */

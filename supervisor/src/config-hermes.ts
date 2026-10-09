@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
@@ -7,7 +9,7 @@ import type { SettingsTargets } from '../../shared/settings-targets.js';
 import { readViewKeys, type ReadView } from '../../shared/settings-ops.js';
 import { settingComparisonJson, settingValueSchema, type SettingValue } from '../../shared/settings.js';
 import { ConfigError } from './config-paths.js';
-import { trustedExecutable, trustedOwnerExecutable, type Trust } from './trust.js';
+import { trustedDirectory, trustedExecutable, trustedOwnerDirectory, trustedOwnerExecutable, type Trust } from './trust.js';
 
 // The resolver runs as the target owner. Owner-owned interpreter and source paths require a
 // private ancestor, without symlinks or foreign owners; writable directories below it are allowed.
@@ -23,9 +25,11 @@ import { trustedExecutable, trustedOwnerExecutable, type Trust } from './trust.j
 // threads) and a file vanishing between Hermes' own existence check and its read are Hermes'
 // fail-open behaviour: the view then shows what Hermes computes, as a reload of Hermes would.
 const resolverScript = `
-import builtins, contextlib, io, json, os, re, stat, sys
+import builtins, contextlib, io, json, os, re, stat, sys, unicodedata
 from pathlib import Path
-module_path, config_path, templates_json, comparisons_json = sys.argv[1:]
+module_path, config_path, templates_json, comparisons_json = sys.argv[1:5]
+venv_path, python_path, walked_site_packages = sys.argv[5:] if len(sys.argv) > 5 else ("", "", "")
+sys.dont_write_bytecode = True
 sys.path.insert(0, module_path)
 blocked = False
 loader_failed = False
@@ -49,6 +53,16 @@ builtins.open = io.open = observed(io.open)
 # Observe reader boundaries even when a caller catches their failures.
 reader_names = {"load_hermes_dotenv", "_sanitize_env_file_if_needed", "load_env_file", "load_config", "load_config_readonly", "read_raw_config", "load_managed_config", "load_managed_env", "_cached_read", "safe_load", "fast_safe_load", "load_yaml_file_readonly", "_get_model_config", "_get_approval_mode", "_get_cron_approval_mode"}
 reader_codes = set()
+def existing_mkdir(value):
+    if not issubclass(value[0], FileExistsError):
+        return False
+    trace = value[2]
+    while trace is not None:
+        frame = trace.tb_frame
+        if frame.f_code is Path.mkdir.__code__ and frame.f_locals.get("exist_ok") is True:
+            return frame.f_locals["self"].is_dir()
+        trace = trace.tb_next
+    return False
 def observe_reader(frame, event, value):
     global loader_failed
     if event == "call" and frame.f_code.co_name == "_cached_read":
@@ -57,6 +71,10 @@ def observe_reader(frame, event, value):
             reader_codes.add(code)
     if frame.f_code.co_name not in reader_names and frame.f_code not in reader_codes:
         return None
+    # pathlib catches EEXIST for exist_ok mkdir calls. Even a traced reader callback may
+    # re-ensure an initialized directory; that exception is not a failed config read.
+    if event == "exception" and existing_mkdir(value):
+        return observe_reader
     # Not-found is absence where Hermes probes for an optional file: its .env tokenizer (except in the
     # key scan Hermes runs only after finding the file) and the first stat of a managed file. Any other
     # error, or a file vanishing after it was found, is a failed read Hermes swallows.
@@ -115,7 +133,7 @@ def readonly(event, args):
         if isinstance(args[0], (str, bytes)) and Path(os.fsdecode(args[0])).name in {".env", "config.yaml"} and os.stat(args[0]).st_size > 1024 * 1024:
             blocked = True
             raise PermissionError("unavailable")
-    if event in {"os.mkdir", "os.remove", "os.rename", "os.rmdir", "os.chmod", "os.chown", "os.link", "os.symlink", "os.truncate", "os.utime", "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "socket.connect"}:
+    if event in {"os.mkdir", "os.remove", "os.rename", "os.rmdir", "os.chmod", "os.chown", "os.link", "os.symlink", "os.truncate", "os.utime", "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "socket.connect", "fcntl.flock", "fcntl.lockf"}:
         blocked = True
         raise PermissionError("unavailable")
 sys.addaudithook(readonly)
@@ -125,6 +143,72 @@ class Quiet:
     def flush(self):
         pass
 with contextlib.redirect_stdout(Quiet()):
+    if venv_path:
+        # Read only the specified environment. Never use Hermes' dependency activation:
+        # it takes runtime locks, recovers publications and acquires a generation lease.
+        def read_dependency(path, limit):
+            global loader_failed
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+                        raise RuntimeError("unavailable")
+                    data = stream.read(limit + 1)
+                if len(data) > limit:
+                    raise RuntimeError("unavailable")
+                return data
+            except Exception:
+                loader_failed = True
+                raise
+        data = read_dependency(Path(venv_path) / "pyvenv.cfg", 16384)
+        fields = {}
+        for line in data.decode("utf-8").split("\\n"):
+            if any(unicodedata.category(char) in {"Cc", "Cf"} for char in line):
+                raise RuntimeError("unavailable")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            key, separator, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if not separator or key in fields:
+                raise RuntimeError("unavailable")
+            fields[key] = value
+        version = re.fullmatch(r"([0-9]+)\\.([0-9]+)(?:\\.[0-9]+[a-zA-Z0-9.+-]*)?", fields.get("version_info", ""))
+        if fields.get("home") != os.path.dirname(python_path) or version is None or tuple(map(int, version.group(1, 2))) != sys.version_info[:2]:
+            raise RuntimeError("unavailable")
+        site_packages = Path(venv_path) / "lib" / ("python%d.%d" % sys.version_info[:2]) / "site-packages"
+        if str(site_packages) != walked_site_packages:
+            raise RuntimeError("unavailable")
+        for directory in (Path(venv_path), site_packages.parent.parent, site_packages.parent, site_packages):
+            if not stat.S_ISDIR(os.lstat(directory).st_mode):
+                raise RuntimeError("unavailable")
+        import site
+        # Retain optional interpreter packages after the venv and its .pth additions.
+        interpreter_packages = [entry for entry in sys.path if Path(entry).name in {"site-packages", "dist-packages"}] if fields.get("include-system-site-packages", "false").lower() == "true" else []
+        sys.path[:] = [entry for entry in sys.path if Path(entry).name not in {"site-packages", "dist-packages"}]
+        # addsitedir executes owner .pth code. Python reports and swallows .pth errors;
+        # those must still fail closed. The audit guard also covers dependency imports.
+        reader_names.update({"addpackage", "addsitedir"})
+        site_io = site.io
+        class SiteIO:
+            # Python 3.13+ site uses _io as io; replace only site's own reference.
+            def __getattr__(self, name):
+                return getattr(site_io, name)
+            @staticmethod
+            def open_code(path):
+                return io.BytesIO(read_dependency(path, 1024 * 1024))
+        # site reads through open_code rather than open. Supply a bounded in-memory
+        # stream so its swallowed open and stream errors cannot hide an incomplete load.
+        site.io = SiteIO()
+        errors = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(errors):
+                site.addsitedir(str(site_packages))
+        finally:
+            site.io = site_io
+        if errors.getvalue() or blocked or loader_failed:
+            raise RuntimeError("unavailable")
+        sys.path[:] = [module_path, str(site_packages), *[entry for entry in sys.path if entry not in (module_path, str(site_packages))], *interpreter_packages]
     # Suppress housekeeping only in this disposable read-only process. Hermes' config module
     # loads the config while it is imported, so the backup is replaced before that import.
     from hermes_cli import config_backups as backups
@@ -201,6 +285,34 @@ const command: HermesResolverCommand = (python, args, hermesHome, environment, s
   (error, stdout) => error ? reject(new ConfigError('unavailable')) : resolve(stdout));
 });
 
+/** Bounded, no-follow preflight supplies only the versioned directory for the trust walk. */
+async function venvSitePackages(venv: string, python: string): Promise<string> {
+  const file = await open(join(venv, 'pyvenv.cfg'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let text: string;
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size > 16_384) throw new Error();
+    const buffer = Buffer.alloc(16_385);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > 16_384) throw new Error();
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, bytesRead));
+  } finally { await file.close(); }
+  const fields = new Map<string, string>();
+  for (const line of text.split('\n')) {
+    if (/[\p{Cc}\p{Cf}]/u.test(line)) throw new Error();
+    if (!line.trim() || line.trimStart().startsWith('#')) continue;
+    const separator = line.indexOf('=');
+    const key = line.slice(0, separator).trim();
+    if (separator < 0 || fields.has(key)) throw new Error();
+    fields.set(key, line.slice(separator + 1).trim());
+  }
+  const version = /^([0-9]+)\.([0-9]+)(?:\.[0-9]+[a-zA-Z0-9.+-]*)?$/.exec(fields.get('version_info') ?? '');
+  if (fields.get('home') !== dirname(python) || !version) throw new Error();
+  const [major, minor] = [Number(version[1]), Number(version[2])];
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor)) throw new Error();
+  return join(venv, 'lib', `python${major}.${minor}`, 'site-packages');
+}
+
 /** Called inside the owner's read-only, network-isolated config unit. */
 export async function resolveHermesConfig(site: SettingsTargets, view: ReadView, run: HermesResolverCommand = command, trust?: Trust): Promise<unknown> {
   const target = site.targets['hermes-config'];
@@ -208,11 +320,21 @@ export async function resolveHermesConfig(site: SettingsTargets, view: ReadView,
   const resolver = target.resolver;
   if (!resolver) throw new ConfigError('unavailable');
   try {
-    const check = trust ?? (process.getuid?.() === target.runAs.uid && target.runAs.uid !== 0
+    const ownerRun = process.getuid?.() === target.runAs.uid && target.runAs.uid !== 0;
+    const check = trust ?? (ownerRun
       ? (path: string) => trustedOwnerExecutable(path, target.runAs.uid) : trustedExecutable);
     const python = await check(resolver.python);
     await check(join(resolver.modulePath, 'hermes_cli/config.py'));
-    const output = await run(python, ['-c', resolverScript, resolver.modulePath, target.path, JSON.stringify(view.keys), JSON.stringify(!!view.comparisonDigests)], dirname(target.path), { ...resolver.environment,
+    let sitePackages = '';
+    if (resolver.venv) {
+      await check(join(resolver.venv, 'pyvenv.cfg'));
+      sitePackages = await venvSitePackages(resolver.venv, resolver.python);
+      const checkDirectory = trust ?? (ownerRun
+        ? (path: string) => trustedOwnerDirectory(path, target.runAs.uid) : trustedDirectory);
+      await checkDirectory(sitePackages);
+    }
+    const output = await run(python, ['-c', resolverScript, resolver.modulePath, target.path, JSON.stringify(view.keys), JSON.stringify(!!view.comparisonDigests),
+      ...(resolver.venv ? [resolver.venv, resolver.python, sitePackages] : [])], dirname(target.path), { ...resolver.environment,
       ...(site.targets['hermes-managed'] ? { HERMES_MANAGED_DIR: dirname(site.targets['hermes-managed'].path) } : {}) }, resolver.home);
     if (Buffer.byteLength(output) > 1024 * 1024 || output.trim().split('\n').length !== 1) throw new Error();
     const response = z.discriminatedUnion('ok', [

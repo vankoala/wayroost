@@ -58,6 +58,22 @@ let folder: string | undefined;
 afterEach(() => { if (folder) rmSync(folder, { recursive: true, force: true }); folder = undefined; });
 
 describe('settings-targets.json', () => {
+  it('keeps venv optional and accepts a canonical absolute dependency directory', () => {
+    const file = siteFile();
+    const resolver = { python: '/opt/example/python/bin/python3', modulePath: '/home/me/.hermes/installs/example' };
+    file.targets['hermes-config'].resolver = resolver;
+    expect(settingsTargetsSchema.parse(file).targets['hermes-config']!.resolver).toEqual(resolver);
+    file.targets['hermes-config'].resolver = { ...resolver, venv: '/home/me/.hermes/installs/example/environments/example-hash/venv' };
+    expect(settingsTargetsSchema.parse(file).targets['hermes-config']!.resolver).toEqual(file.targets['hermes-config'].resolver);
+  });
+
+  it.each(['venv', '../venv', '/example/../venv', '/example//venv', '/example/venv/', '/example/venv\n', '', null, 42])
+  ('refuses an invalid resolver venv: %s', venv => {
+    const file = siteFile();
+    file.targets['hermes-config'].resolver = { python: '/opt/example/python/bin/python3', modulePath: '/home/me/.hermes/installs/example', venv };
+    expect(parses(file)).toBe(false);
+  });
+
   it('parses a complete site file written as JSON', () => {
     folder = mkdtempSync(join(tmpdir(), 'wayroost-targets-'));
     const path = join(folder, 'settings-targets.json');

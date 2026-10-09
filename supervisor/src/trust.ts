@@ -30,7 +30,14 @@ export const trustedExecutable: Trust = async command => {
   return command;
 };
 
-async function requireRootOnly(path: string): Promise<void> {
+/** The same root-only walk, for a dependency directory rather than an executable file. */
+export const trustedDirectory: Trust = async path => {
+  if (!path.startsWith('/')) throw new Error('The dependency directory must be an absolute path.');
+  await requireRootOnly(path, 'directory');
+  return path;
+};
+
+async function requireRootOnly(path: string, kind: 'file' | 'directory' = 'file'): Promise<void> {
   const refuse = (at: string) => new Error(`The command for this action can be changed by someone other than root (${at}). Move it to a root-owned folder.`);
   const check = async (at: string): Promise<Stats> => {
     let info: Stats;
@@ -58,7 +65,8 @@ async function requireRootOnly(path: string): Promise<void> {
     }
     current = next;
   }
-  if (!info.isFile()) throw new Error(`The command for this action is not a regular file (${current}).`);
+  if (kind === 'file' && !info.isFile()) throw new Error(`The command for this action is not a regular file (${current}).`);
+  if (kind === 'directory' && !info.isDirectory()) throw new Error(`The dependency path is not a directory (${current}).`);
 }
 
 export type OwnerGroupLookup = (gid: number, ownerUid: number) => Promise<boolean>;
@@ -102,6 +110,17 @@ const privateOwnerGroup: OwnerGroupLookup = async (gid, ownerUid) => {
  */
 export async function trustedOwnerExecutable(path: string, ownerUid: number, groupLookup: OwnerGroupLookup = privateOwnerGroup,
   aclCheck: OwnerAclCheck = noAccessAcl): Promise<string> {
+  return requireOwnerPath(path, ownerUid, 'file', groupLookup, aclCheck);
+}
+
+/** Site-packages is a directory with the same leaf writability and ACL rules as code files. */
+export async function trustedOwnerDirectory(path: string, ownerUid: number, groupLookup: OwnerGroupLookup = privateOwnerGroup,
+  aclCheck: OwnerAclCheck = noAccessAcl): Promise<string> {
+  return requireOwnerPath(path, ownerUid, 'directory', groupLookup, aclCheck);
+}
+
+async function requireOwnerPath(path: string, ownerUid: number, kind: 'file' | 'directory', groupLookup: OwnerGroupLookup,
+  aclCheck: OwnerAclCheck): Promise<string> {
   const refuse = () => new Error('The resolver path is not protected for its owner.');
   if (ownerUid === 0 || process.getuid?.() !== ownerUid || !path.startsWith('/') || path.split('/').includes('..')) throw refuse();
   let current = '/';
@@ -111,8 +130,9 @@ export async function trustedOwnerExecutable(path: string, ownerUid: number, gro
     if (index >= 0) current = join(current, parts[index]!);
     const info = await lstat(current);
     if (info.isSymbolicLink() || ![0, ownerUid].includes(info.uid)) throw refuse();
+    if (kind === 'directory' && index === parts.length - 1 && (info.mode & 0o077) === 0) closed = true;
     if (index === parts.length - 1) {
-      if (!closed || !info.isFile() || (info.mode & 0o002) !== 0) throw refuse();
+      if (!closed || (kind === 'file' ? !info.isFile() : !info.isDirectory()) || (info.mode & 0o002) !== 0) throw refuse();
       if ((info.mode & 0o020) !== 0 && !await groupLookup(info.gid, ownerUid)) throw refuse();
       if ((info.mode & 0o070) !== 0) {
         try { if (!await aclCheck(current)) throw refuse(); } catch { throw refuse(); }

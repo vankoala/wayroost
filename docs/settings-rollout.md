@@ -47,7 +47,7 @@ Enable this capability only as a separate step after the production executor's d
 
 ## Owner-run Hermes resolver
 
-The effective resolver runs as the target's owner. Its interpreter and source paths may be owned by that owner or root behind a directory owned by either with no group or other access (`mode & 0077 == 0`). Ancestors above that private directory must also be owned by that owner or root and must not be group- or world-writable. Directories below it may be writable by group or others. Every symlink and foreign owner is refused.
+The effective resolver runs as the target's owner. Its trust walk covers `resolver.python`, `hermes_cli/config.py` under `resolver.modulePath`, and the dependency paths listed below when `venv` is set. These paths may be owned by that owner or root behind a directory owned by either with no group or other access (`mode & 0077 == 0`). Ancestors above that private directory must also be owned by that owner or root and must not be group- or world-writable. Directories below it may be writable by group or others. Symlinks and foreign owners on the walked paths are refused.
 
 For example, `/home/me` at 0750, `.hermes` at 0700 and install directories at 0775 satisfy the owner rule. Configure real interpreter and source files without symlinks. Both paths need a private ancestor. This rule is used only for the owner-run resolver; root-run executable trust remains strict. It provides no isolation from programs running as the same owner.
 
@@ -58,3 +58,60 @@ When a code file has any group access bits, the resolver also refuses access ACL
 attributes without following symlinks; errors, timeouts and unexpected output
 refuse the path. Directory ACL masks are already covered by the ancestor mode
 checks. Root-run trust is unchanged.
+
+Set the optional `resolver.venv` in `settings-targets.json` when Hermes' dependencies
+live in a separate uv-managed environment. Point it at the absolute venv directory,
+for example `/home/me/.hermes/installs/example/environments/example-hash/venv`.
+Keep `resolver.python` pointed at the real interpreter file: the venv's `bin/python`
+symlink is refused by owner trust. Omitting `venv` keeps the existing import behavior.
+
+The resolver reads `pyvenv.cfg` with a 16 KiB limit and without following symlinks.
+Both metadata readers reject control and format characters, including a BOM;
+newlines separate the fields.
+Its `home` must equal the directory containing `resolver.python`, and the major/minor
+of `version_info` must match the running interpreter. Python also requires the
+dependency directory to equal the exact path checked by the Node trust walk. It adds exactly
+`<venv>/lib/python<major>.<minor>/site-packages` with `site.addsitedir`, including `.pth`
+files and their owner code. Unless `include-system-site-packages` is `true`, it first
+removes the interpreter's `site-packages` and `dist-packages` entries. The Hermes
+module path and venv dependencies come first; when system packages are enabled,
+the interpreter's entries remain after them and the paths added by `.pth` files.
+Errors and mismatches return `unavailable`.
+
+The resolver script does not import `pm` or call its dependency activation. Hermes
+may import pm helper modules such as `pm.environments`, `pm.paths` and `pm.extras`
+(definitions only).
+The resolver never activates dependencies, takes a Hermes runtime lock or generation
+lease, runs publication recovery, or writes files; the audit guard refuses lock opens
+and other writes.
+
+Each `.pth` file must be a regular file, read without following symlinks and with
+a 1 MiB limit checked both before and during the read. The guard replaces only
+`site.io` during dependency loading, including Python versions where `site` uses `_io`,
+and leaves import readers unchanged. Open, stat and stream errors
+return `unavailable` even when Python's `site` module catches them.
+
+The owner trust walk covers the venv directory, `pyvenv.cfg`, `lib`, the Python version
+directory and `site-packages` under the same private ancestor rule. Symlinks
+and foreign owners on those paths are refused. `pyvenv.cfg` and the `site-packages` directory also
+follow the code-file writability and access ACL rules above; intermediate directories
+below the private ancestor may still be writable. Root-run trust remains strict.
+Package files, `.pth` files and paths they add are not separately trust-walked.
+They are owner code and must stay behind the same private ancestor. This claims no
+isolation from that code, including symlinks within packages or paths added by `.pth`.
+
+`HERMES_HOME` must be an initialized Hermes home.
+Hermes re-ensures directories during import. A fixture must pre-create the pinned
+directory skeleton: `cron`, `sessions`, `logs`, `logs/curator`, `memories`, `pairing`,
+`hooks`, `image_cache`, `audio_cache` and `skills` (from `_HERMES_HOME_SUBDIRS`).
+`HERMES_HOME` itself and every listed directory must already have mode 0700, or the
+mode specified by `HERMES_HOME_MODE` when that startup variable is configured.
+`SOUL.md` must already exist and must not contain Hermes' legacy template, which
+Hermes would replace during initialization.
+An `exist_ok` mkdir of an existing directory is tolerated; creating a missing
+directory or changing permissions is still refused.
+
+A Hermes dependency update changes the environment hash. Re-point `venv` after
+every dependency update: one line in `settings-targets.json`. While the old environment
+still exists, the resolver may keep resolving against its previous dependencies and
+workspace. Once Hermes removes it, the stale path fails closed with `unavailable`.
