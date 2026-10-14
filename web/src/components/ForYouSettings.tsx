@@ -1,10 +1,11 @@
 import { BellRing, Gauge, Info, LoaderCircle, Moon, ShieldAlert, Smartphone, Sparkles, ThumbsDown, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import type { FeedSettings, ProactivityLevel } from '../../../shared/protocol.js';
-import { api, serializeNotificationSettingsSave } from '../api.js';
+import { api, ApiError, serializeNotificationSettingsSave } from '../api.js';
 import { disablePush, enablePush, pushState, type PushState } from '../push.js';
 import { captureRollout, getRolloutGeneration, getState, toast, useStore } from '../store.js';
 import { SettingsTiming } from './SettingsTiming.js';
+import { settingsErrorText } from '../settingsModel.js';
 
 const LEVELS: Array<{ id: ProactivityLevel; label: string; help: string }> = [
   { id: 'off', label: 'Off', help: 'No brief and no daytime checks' },
@@ -34,6 +35,7 @@ const PUSH_HELP: Record<PushState, string> = {
 export function ForYouSettings() {
   const writable = useStore(s => s.rollout?.settingsPages === true);
   const [settings, setSettings] = useState<FeedSettings | null>(null);
+  const [unavailable, setUnavailable] = useState<string | null>(null);
   const [push, setPush] = useState<PushState | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [deviceBusy, setDeviceBusy] = useState<string | null>(null);
@@ -45,9 +47,14 @@ export function ForYouSettings() {
     const rollout = captureRollout(...(writable ? ['settingsPages' as const] : []));
     api.feed().then(
       (list) => {
-        if (live && rollout.still()) setSettings(list.settings);
+        if (live && rollout.still()) {
+          setSettings(list.settings.settingsUnavailable ? null : list.settings);
+          setUnavailable(list.settings.settingsUnavailable ? settingsErrorText(list.settings.settingsUnavailable) : null);
+        }
       },
-      () => {}, // For you is off here: no section
+      (error: unknown) => {
+        if (live && rollout.still() && error instanceof ApiError && error.status !== 404) { setUnavailable(error.message); setSettings(null); }
+      },
     );
     return () => { live = false; };
   }, [writable, rolloutGeneration]);
@@ -61,7 +68,7 @@ export function ForYouSettings() {
     return () => { live = false; };
   }, []);
 
-  if (!settings) return null;
+  if (!settings) return unavailable ? <><div className="group-title">For you unavailable</div><div className="group"><p role="status" className="muted">{unavailable}</p></div></> : null;
 
   const requireWritable = (generation: ReturnType<typeof captureRollout>): void => {
     if (!generation.still()) {

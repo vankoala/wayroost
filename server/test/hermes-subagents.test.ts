@@ -2,7 +2,7 @@ import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ConversationSummary, ServerEvent } from '../../shared/protocol.js';
 import { HermesAdapter } from '../src/hermes/adapter.js';
 import { sessionSummary, type HermesSessionRow } from '../src/hermes/normalize.js';
@@ -168,6 +168,8 @@ describe('hermes sub-agents against the fake dashboard', () => {
   let adapter: HermesAdapter;
 
   beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(AT * 1000);
     fake = new FakeHermes();
     await fake.start();
     const hub = new EventHub();
@@ -189,6 +191,8 @@ describe('hermes sub-agents against the fake dashboard', () => {
   afterEach(async () => {
     adapter.stop();
     await fake.stop();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   async function connect(): Promise<void> {
@@ -215,7 +219,8 @@ describe('hermes sub-agents against the fake dashboard', () => {
     expect(byId(list)['20260928_100500_run002']).toMatchObject({ subagent: true, parent: { source: 'hermes', id: UUID }, status: 'idle' });
     expect(byId(list)[STORED]).not.toHaveProperty('subagent');
     // The main list keeps its own query; runs come from a second one.
-    expect(fake.listQueries.map((q) => q.limit)).toEqual(['60', '100']);
+    expect(new Set(fake.listQueries.map((q) => q.limit))).toEqual(new Set(['60', '100']));
+    expect(runQueries()).toHaveLength(1);
     expect(acpQueries()).toEqual([]); // nobody needed the ACP list
   });
 
@@ -229,7 +234,7 @@ describe('hermes sub-agents against the fake dashboard', () => {
     fake.supportsSubagents = false;
     await connect();
     await adapter.listConversations();
-    await new Promise((resolve) => setTimeout(resolve, 3_100)); // past the main list's cache
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 3_100); // past the main list's cache
     expect((await adapter.listConversations()).map((c) => c.id)).toEqual([STORED]);
     expect(runQueries()).toEqual([]);
     expect(fake.defaultsRequests).toBe(1);
@@ -267,12 +272,14 @@ describe('hermes sub-agents against the fake dashboard', () => {
     await connect();
     const list = await adapter.listConversations();
     expect(byId(list)['20260928_103000_run005']).toMatchObject({ parent: { source: 'hermes', id: UUID } });
-    expect(acpQueries()).toHaveLength(1);
+    await expect.poll(() => published.some((e) => e.type === 'conversation_upsert' && e.conversation.id === '20260928_103000_run005')).toBe(true);
+    const acpFetches = acpQueries().length;
+    expect(acpFetches).toBe(1);
 
     fake.event('sessions.changed', {}, '');
     await expect.poll(() => runQueries().length).toBe(2);
     await adapter.listConversations();
-    expect(acpQueries()).toHaveLength(1); // still fresh
+    expect(acpQueries()).toHaveLength(acpFetches); // still fresh
   });
 
   it('opens a run read-only: history over REST, never attached, every action refused', async () => {

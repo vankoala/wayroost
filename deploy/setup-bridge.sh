@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Register the Signalbox project bridge with the agents <user> runs, so an
+# Register the Wayroost project bridge with the agents <user> runs, so an
 # agent can list, read, message and start the other chats in its project:
 # Hermes, pi, Claude Code and OpenCode each get the stdio MCP server
-#   node /opt/signalbox/bin/signalbox-bridge.mjs
-# and <user> gets a copy of the bridge token in ~/.config/signalbox/. Hermes
-# also gets the signalbox-identity plugin, so its chats are identified. Run as
+#   env WAYROOST_BRIDGE_NAME=wayroost node /opt/signalbox/bin/signalbox-bridge.mjs
+# and <user> gets a copy of the bridge token in ~/.config/wayroost/. Hermes
+# also gets the wayroost-identity plugin, so its chats are identified. Run as
 # root after enabling the bridge in /etc/signalbox/config.json
 # ("bridge": {"enabled": true}), restarting Signalbox and running install.sh:
 #
@@ -15,8 +15,8 @@
 #
 # Everything in the user's home is done as that user (runuser), never as root,
 # so a symlink there can't redirect a root write. Each file is backed up to
-# <file>.bak-signalbox-<timestamp> first and restored if the edit fails. Only
-# the "signalbox" entry changes; a file that can't be edited safely is left
+# <file>.bak-wayroost-<timestamp> first and restored if the edit fails. Only
+# the "wayroost" entry changes; a file that can't be edited safely is left
 # alone and the snippet to add by hand is printed instead.
 set -euo pipefail
 
@@ -51,12 +51,13 @@ done
 #   token <install|remove> <file> <stamp> <dry 0|1>     (install reads the token on stdin)
 #   bridge-url <add|remove> <file> <url> <stamp> <dry 0|1> (launch reporters' loopback address)
 #   plugin <source dir> <plugin dir> <stamp> <dry 0|1>  (copy the Hermes plugin in)
-#   plugin-state <config.yaml> <name>                   (prints on, off or unknown)
-#   backup <file> <stamp>                               (before running a Hermes command that edits it)
+#   plugin-state <config.yaml> <name>                   (prints on, off, absent or unknown)
+#   backup <file> <stamp>                               (before editing plugin lists)
+#   restore <file> <backup> <stamp>                     (roll back a failed plugin switch)
 #   claude-hook <add|remove> <settings.json> <command> <stamp> <dry 0|1>  (Signalbox's Claude Code launch hook)
 # Exit status: 0 changed (or would), 3 nothing to do, 4 left for the user (snippet printed), 1 failed.
 IFS= read -r -d '' HELPER <<'PY' || true
-import copy, difflib, json, os, re, shutil, sys, tempfile
+import copy, difflib, json, os, re, shutil, stat, sys, tempfile
 
 os.umask(0o077)
 CHANGED, NOTHING, MANUAL = 0, 3, 4
@@ -70,7 +71,7 @@ def say(line=""):
 
 def manual(reason, snippet):
     say(f"Not changed: {reason}.")
-    say("Add this yourself:" if snippet else "Remove the signalbox entry yourself.")
+    say("Add this yourself:" if snippet else "Remove the wayroost entry yourself.")
     for line in snippet.rstrip("\n").split("\n") if snippet else []:
         say(f"  {line}")
     sys.exit(MANUAL)
@@ -89,7 +90,7 @@ def write_text(path, text, stamp, new_mode=0o600):
         raise SystemExit(f"{path} belongs to another user; fix its owner or edit it yourself.")
     backup = None
     if st is not None:
-        backup = f"{real}.bak-signalbox-{stamp}"
+        backup = f"{real}.bak-wayroost-{stamp}"
         shutil.copy2(real, backup)
     try:
         if text is None:
@@ -147,6 +148,16 @@ def runs_wrapper(kind, e):
     return is_node(e.get("command")) and e.get("args") == [WRAPPER_PATH]
 
 
+def runs_legacy_wrapper(kind, entry):
+    if not isinstance(entry, dict):
+        return False
+    command = entry.get("command")
+    args = command[1:] if kind == "opencode" and isinstance(command, list) else entry.get("args")
+    node = command[0] if kind == "opencode" and isinstance(command, list) and command else command
+    return is_node(node) and isinstance(args, list) and any(
+        isinstance(arg, str) and arg.endswith("/signalbox-bridge.mjs") for arg in args)
+
+
 def current(kind, have, want):
     """Set up already: runs our wrapper with the environment we need. Other keys are the user's business."""
     if not runs_wrapper(kind, have):
@@ -154,7 +165,7 @@ def current(kind, have, want):
     env_have, env_want = have.get(ENV_KEY[kind]) or {}, want.get(ENV_KEY[kind]) or {}
     if not isinstance(env_have, dict) or any(env_have.get(k) != v for k, v in env_want.items()):
         return False
-    return "SIGNALBOX_BRIDGE_URL" in env_want or "SIGNALBOX_BRIDGE_URL" not in env_have
+    return "WAYROOST_BRIDGE_URL" in env_want or not any(k in env_have for k in ("WAYROOST_BRIDGE_URL", "SIGNALBOX_BRIDGE_URL"))
 
 
 def merged(kind, have, want):
@@ -173,7 +184,7 @@ def merged(kind, have, want):
     elif is_node(have.get("command")):
         out["command"] = have["command"]
     env = have.get(key) if isinstance(have.get(key), dict) else {}
-    env = {k: v for k, v in env.items() if k != "SIGNALBOX_BRIDGE_URL"}
+    env = {k: v for k, v in env.items() if k not in ("WAYROOST_BRIDGE_URL", "SIGNALBOX_BRIDGE_URL")}
     env.update(want.get(key) or {})
     if env:
         out[key] = env
@@ -207,7 +218,7 @@ def yaml_scalar(v):
 
 
 def yaml_entry(entry, col, step):
-    lines = [" " * col + "signalbox:"]
+    lines = [" " * col + "wayroost:"]
     def emit(d, depth):
         pad = " " * (col + step * depth)
         for k, v in d.items():
@@ -235,7 +246,7 @@ def last_line_within(lines, start, end, col):
     return found
 
 
-def hermes(mode, path, entry, stamp, dry):
+def hermes(mode, path, entry, stamp, dry, name="wayroost"):
     snippet = "\n".join(["mcp_servers:"] + yaml_entry(entry, 2, 2)) + "\n"
     if not os.path.exists(path):
         say(f"{path} doesn't exist; skipped.")
@@ -252,6 +263,11 @@ def hermes(mode, path, entry, stamp, dry):
     except Exception as err:
         manual(f"it doesn't parse as YAML ({type(err).__name__})", snippet)
     old = {} if old is None else old
+    if mode == "add" and isinstance(old, dict) and isinstance(old.get("mcp_servers"), dict) and runs_legacy_wrapper(
+        "hermes", old["mcp_servers"].get("signalbox")
+    ):
+        say("Legacy bridge registration found; use deploy/bridge-names.py forward before setup.")
+        return MANUAL
     if not isinstance(old, dict) or (root is not None and (root.id != "mapping" or root.flow_style)):
         manual("its top level isn't a plain YAML mapping", snippet)
     servers = old.get("mcp_servers")
@@ -268,9 +284,9 @@ def hermes(mode, path, entry, stamp, dry):
         end = pairs[i + 1][0].start_mark.line if i + 1 < len(pairs) else len(lines)
         return k, v, end
 
-    def our_lines(v, end):  # (first, last) line of mcp_servers.signalbox, and its key node
+    def our_lines(v, end):  # (first, last) line of the selected registration, and its key node
         children = [ck.value if ck.id == "scalar" else None for ck, _ in v.value]
-        i = children.index("signalbox")
+        i = children.index(name)
         sk, sv = v.value[i]
         stop = v.value[i + 1][0].start_mark.line if i + 1 < len(v.value) else end
         last = last_line_within(lines, sk.start_mark.line + 1, stop, sk.start_mark.column)
@@ -280,18 +296,18 @@ def hermes(mode, path, entry, stamp, dry):
         if k.start_mark.column != 0 or v.id != "mapping" or v.flow_style:
             manual("mcp_servers isn't a plain block mapping", snippet if mode == "add" else None)
 
-    have = servers.get("signalbox") if isinstance(servers, dict) else None
+    have = servers.get(name) if isinstance(servers, dict) else None
     # The edit: lines[a:b] become block.
     if mode == "add":
         if current("hermes", have, entry):
-            say(f"{path}: mcp_servers.signalbox is already set up.")
+            say(f"{path}: mcp_servers.wayroost is already set up.")
             return NOTHING
         if "mcp_servers" not in old:
             block = snippet.rstrip("\n").split("\n")
             a = b = len(lines) - 1 if text.endswith("\n") else len(lines)
             if text == "":
                 a = b = 0
-            expected["mcp_servers"] = {"signalbox": entry}
+            expected["mcp_servers"] = {"wayroost": entry}
         elif isinstance(servers, dict) and servers:
             k, v, end = block_of("mcp_servers")
             plain_block(k, v)
@@ -313,20 +329,20 @@ def hermes(mode, path, entry, stamp, dry):
                 a, b = first, last + 1
                 new_entry = merged("hermes", have, entry)
             block = yaml_entry(new_entry, col, step)
-            expected["mcp_servers"]["signalbox"] = new_entry
+            expected["mcp_servers"]["wayroost"] = new_entry
         else:
             manual("mcp_servers is empty or isn't a plain list of servers", snippet)
     else:
-        if not (isinstance(servers, dict) and "signalbox" in servers):
-            say(f"{path}: no signalbox entry.")
+        if not (isinstance(servers, dict) and name in servers):
+            say(f"{path}: no wayroost entry.")
             return NOTHING
         if not runs_wrapper("hermes", have):
-            say(f"{path}: mcp_servers.signalbox doesn't run {WRAPPER_PATH}; left alone.")
+            say(f"{path}: mcp_servers.wayroost doesn't run {WRAPPER_PATH}; left alone.")
             return NOTHING
         k, v, end = block_of("mcp_servers")
         plain_block(k, v)
         first, last, _, _ = our_lines(v, end)
-        del expected["mcp_servers"]["signalbox"]
+        del expected["mcp_servers"][name]
         if not expected["mcp_servers"]:
             rest = last_line_within(lines, k.start_mark.line + 1, end, 0)
             if lines[k.start_mark.line].rstrip() == "mcp_servers:" and rest == last and k.start_mark.line == first - 1:
@@ -360,7 +376,7 @@ def json_config(kind, mode, path, entry, stamp, dry):
         data = json.loads(text) if text.strip() else ({"$schema": OPENCODE_SCHEMA} if kind == "opencode" else {})
     except ValueError:
         data = None
-    snippet = json.dumps({key: {"signalbox": entry}}, indent=2)
+    snippet = json.dumps({key: {"wayroost": entry}}, indent=2)
     if not isinstance(data, dict):
         manual("it isn't a plain JSON object (comments?)", snippet if mode == "add" else None)
     if kind == "pi" and key not in data and isinstance(data.get("mcp-servers"), dict):
@@ -369,30 +385,35 @@ def json_config(kind, mode, path, entry, stamp, dry):
     if servers is not None and not isinstance(servers, dict):
         manual(f"{key} isn't an object", snippet if mode == "add" else None)
     new_data = copy.deepcopy(data)
+    map_keys = ("mcpServers", "mcp-servers") if kind == "pi" else (key,)
     if mode == "add":
-        have = (servers or {}).get("signalbox")
+        if any(isinstance(data.get(map_key), dict) and runs_legacy_wrapper(kind, data[map_key].get("signalbox"))
+               for map_key in map_keys):
+            say("Legacy bridge registration found; use deploy/bridge-names.py forward before setup.")
+            return MANUAL
+        have = (servers or {}).get("wayroost")
         if current(kind, have, entry):
-            say(f"{path}: {key}.signalbox is already set up.")
+            say(f"{path}: {key}.wayroost is already set up.")
             return NOTHING
         entry = entry if have is None else merged(kind, have, entry)
-        new_data.setdefault(key, {})["signalbox"] = entry
+        new_data.setdefault(key, {})["wayroost"] = entry
     else:
-        if not servers or "signalbox" not in servers:
-            say(f"{path}: no signalbox entry.")
+        selected = [(map_key, name) for map_key in map_keys if isinstance(data.get(map_key), dict)
+                    for name in ("wayroost", "signalbox") if runs_wrapper(kind, data[map_key].get(name))]
+        if not selected:
+            say(f"{path}: no bridge wrapper entry.")
             return NOTHING
-        if not runs_wrapper(kind, servers["signalbox"]):
-            say(f"{path}: {key}.signalbox doesn't run {WRAPPER_PATH}; left alone.")
-            return NOTHING
-        del new_data[key]["signalbox"]
-        if not new_data[key]:
-            del new_data[key]
+        for map_key, name in selected:
+            del new_data[map_key][name]
+            if not new_data[map_key]:
+                del new_data[map_key]
     canonical = lambda d: json.dumps(d, indent=2, ensure_ascii=False) + "\n"
     if mode == "remove" and new_data in ({}, {"$schema": OPENCODE_SCHEMA}):
         new = None  # only our entry was left: remove the file
     else:
         new = canonical(new_data)
     # Show only our entry: other values in these files can be secrets.
-    say(f"{path}: {'add' if mode == 'add' else 'remove'} {key}.signalbox" + (f" = {json.dumps(entry)}" if mode == "add" else ""))
+    say(f"{path}: {'add' if mode == 'add' else 'remove'} {key}.wayroost" + (f" = {json.dumps(entry)}" if mode == "add" else ""))
     if exists and text and canonical(data) != text and new is not None:
         say("(the file is rewritten as 2-space JSON; its other settings keep their values)")
     if new is None:
@@ -414,16 +435,18 @@ def commit(path, old, new, stamp, dry, diff=True):
 def entry_for(kind, wrapper, url):
     if kind == "hermes":
         # Hermes gives stdio servers a clean environment and fills in ${VAR} when it connects.
-        env = {"PASEO_AGENT_ID": "${PASEO_AGENT_ID}", "PASEO_AGENT_CWD": "${PASEO_AGENT_CWD}"}
+        env = {"PASEO_AGENT_ID": "${PASEO_AGENT_ID}", "PASEO_AGENT_CWD": "${PASEO_AGENT_CWD}",
+               "WAYROOST_BRIDGE_NAME": "wayroost"}
         if url:
-            env["SIGNALBOX_BRIDGE_URL"] = url
+            env["WAYROOST_BRIDGE_URL"] = url
         return {"command": "node", "args": [wrapper], "env": env}
     if kind == "pi":
-        # directTools puts the bridge's tools in pi's own tool list (as signalbox_list_chats and so on).
-        return {"command": "node", "args": [wrapper], **({"env": {"SIGNALBOX_BRIDGE_URL": url}} if url else {}),
+        # directTools puts the bridge's tools in pi's own tool list (as wayroost_list_chats and so on).
+        return {"command": "node", "args": [wrapper],
+                "env": {"WAYROOST_BRIDGE_NAME": "wayroost", **({"WAYROOST_BRIDGE_URL": url} if url else {})},
                 "directTools": True, "toolPrefix": "server"}
     return {"type": "local", "command": ["node", wrapper], "enabled": True,
-            **({"environment": {"SIGNALBOX_BRIDGE_URL": url}} if url else {})}
+            "environment": {"WAYROOST_BRIDGE_NAME": "wayroost", **({"WAYROOST_BRIDGE_URL": url} if url else {})}}
 
 
 def token(mode, path, stamp, dry):
@@ -488,6 +511,37 @@ def bridge_url(mode, path, url, stamp, dry):
     return commit(path, old, new, stamp, dry, diff=False)
 
 
+def remove_legacy_files(folder, dry):
+    """Remove only owned regular fallback files, without following directory symlinks."""
+    absolute = os.path.abspath(folder)
+    for parent in [absolute, os.path.dirname(absolute)]:
+        if os.path.islink(parent):
+            say("Legacy bridge directory is a symlink; remove fallback files manually.")
+            return MANUAL
+    result = NOTHING
+    for name in ("bridge-token", "bridge-url"):
+        path = os.path.join(folder, name)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            say(f"{path} isn't an owned regular file; left alone.")
+            result = MANUAL
+            continue
+        if not dry:
+            os.unlink(path)
+        say(f"{'Would remove' if dry else 'Removed'} {path}.")
+        if result != MANUAL:
+            result = CHANGED
+    if not dry:
+        try:
+            os.rmdir(folder)
+        except OSError:
+            pass
+    return result
+
+
 # ---- the Hermes plugin -----------------------------------------------------------------
 
 def files_in(root):
@@ -513,6 +567,12 @@ def plugin(src, dest, stamp, dry):
     role_config = os.path.join(os.path.dirname(os.path.dirname(src)), "deploy", "primary-role.json")
     with open(role_config, "rb") as f:
         wanted["wayroost-role.json"] = f.read()
+    # Updating code must not reopen the completed transition. `bridge-names.py cutoff` mirrors
+    # bridge.legacyNames here; fresh installs use the transition default (true).
+    names_config = os.path.join(dest, "wayroost-bridge.json")
+    names_bytes = (read_text(names_config).encode("utf-8") if os.path.isfile(names_config)
+                   else b'{"bridge":{"legacyNames":true}}\n')
+    wanted["wayroost-bridge.json"] = names_bytes
     if os.path.isdir(dest) and not os.path.islink(dest) and files_in(dest) == wanted:
         say(f"{dest} is up to date.")
         return NOTHING
@@ -523,7 +583,7 @@ def plugin(src, dest, stamp, dry):
     backups = os.path.join(os.path.dirname(os.path.dirname(dest)), "plugins-backup")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     os.makedirs(backups, mode=0o700, exist_ok=True)
-    staging = tempfile.mkdtemp(dir=backups, prefix=".signalbox-")
+    staging = tempfile.mkdtemp(dir=backups, prefix=".wayroost-")
     backup = None
     try:
         staged = os.path.join(staging, os.path.basename(dest))
@@ -531,8 +591,10 @@ def plugin(src, dest, stamp, dry):
         if os.path.isfile(runtime):
             shutil.copy2(runtime, os.path.join(staged, "wayroost_runtime.py"))
         shutil.copy2(role_config, os.path.join(staged, "wayroost-role.json"))
+        with open(os.path.join(staged, "wayroost-bridge.json"), "wb") as f:
+            f.write(names_bytes)
         if os.path.lexists(dest):
-            backup = os.path.join(backups, f"{os.path.basename(dest)}.bak-signalbox-{stamp}")
+            backup = os.path.join(backups, f"{os.path.basename(dest)}.bak-wayroost-{stamp}")
             os.rename(dest, backup)
         try:
             os.rename(staged, dest)
@@ -551,13 +613,170 @@ def plugin_state(config, name):
     try:
         data = tools[0](read_text(config)) if tools else None
     except Exception:
-        data = None
+        return "unknown"
     if not isinstance(data, dict):
-        return "unknown" if tools is None or data is not None else "off"
-    plugins = data.get("plugins") if isinstance(data.get("plugins"), dict) else {}
-    enabled, disabled = plugins.get("enabled"), plugins.get("disabled")
-    on = isinstance(enabled, list) and name in enabled and not (isinstance(disabled, list) and name in disabled)
-    return "on" if on else "off"
+        return "unknown"
+    plugins = data.get("plugins", {})
+    if not isinstance(plugins, dict):
+        return "unknown"
+    enabled, disabled = plugins.get("enabled", []), plugins.get("disabled", [])
+    if not all(isinstance(items, list) and all(isinstance(item, str) for item in items) for items in (enabled, disabled)):
+        return "unknown"
+    if enabled.count(name) + disabled.count(name) > 1:
+        return "unknown"
+    if name in enabled:
+        return "on"
+    return "off" if name in disabled else "absent"
+
+
+def plugin_lists_text(text, expected, tools, name):
+    root = tools[1](text)
+    edits, seen, inserted = [], set(), {}
+    newline = "\r\n" if "\r\n" in text else "\n"
+
+    def validate(node):
+        if id(node) in seen:
+            raise RuntimeError("YAML aliases are not supported for plugin edits")
+        seen.add(id(node))
+        if node.id == "mapping":
+            keys = [key.value for key, _ in node.value if key.id == "scalar"]
+            if len(keys) != len(node.value) or len(keys) != len(set(keys)) or "<<" in keys:
+                raise RuntimeError("Ambiguous plugin configuration")
+            for _, value in node.value:
+                validate(value)
+        elif node.id == "sequence":
+            for value in node.value:
+                validate(value)
+
+    def edit(start, end, replacement):
+        if start == end:
+            for index, (prior_start, prior_end, prior) in enumerate(edits):
+                if prior_start == prior_end == start:
+                    edits[index] = (start, end, prior + replacement)
+                    return
+        edits.append((start, end, replacement))
+
+    def line_end(index):
+        end = text.find("\n", index)
+        return len(text) if end == -1 else end + 1
+
+    def leaf_end(node):
+        if node.id == "mapping":
+            return max((leaf_end(value) for _, value in node.value), default=node.end_mark.index)
+        if node.id == "sequence":
+            return max((leaf_end(value) for value in node.value), default=node.end_mark.index)
+        return node.end_mark.index
+
+    def add_field(parent, key, value):
+        content = json.dumps(key) + ": " + json.dumps(value)
+        if parent.flow_style:
+            index = parent.end_mark.index - 1
+            prefix = ""
+            if id(parent) in inserted:
+                prefix = ", "
+            elif parent.value:
+                trailing = comma_between(parent.value[-1][1].end_mark.index, index, False)
+                prefix = ", " if trailing is None else " "
+            edit(index, index, prefix + content)
+        else:
+            index = line_end(leaf_end(parent))
+            column = parent.value[0][0].start_mark.column if parent.value else parent.start_mark.column
+            prefix = "" if index and text[index - 1] == "\n" else newline
+            edit(index, index, prefix + " " * column + key + ": " + json.dumps(value) + newline)
+        inserted[id(parent)] = True
+
+    def comma_between(start, end, required=True):
+        comment = False
+        for index in range(start, end):
+            char = text[index]
+            if char == "\n":
+                comment = False
+            elif char == "#":
+                comment = True
+            elif char == "," and not comment:
+                return index
+        if required:
+            raise RuntimeError("Plugin list separator not found")
+        return None
+
+    validate(root)
+    nodes = {key.value: value for key, value in root.value}
+    plugins = nodes.get("plugins")
+    if plugins is None:
+        add_field(root, "plugins", expected["plugins"])
+    else:
+        states = {key.value: value for key, value in plugins.value}
+        for state in ("enabled", "disabled"):
+            wanted = expected["plugins"][state]
+            node = states.get(state)
+            if node is None:
+                add_field(plugins, state, wanted)
+                continue
+            removed = {index for index, item in enumerate(node.value) if item.value == name}
+            separators = set()
+            trailing = comma_between(node.value[-1].end_mark.index, node.end_mark.index - 1, False) if (
+                node.flow_style and node.value) else None
+            for index in removed:
+                item = node.value[index]
+                start, end = item.start_mark.index, item.end_mark.index
+                if node.flow_style:
+                    edit(start, end, "")
+                    if index < len(node.value) - 1:
+                        separators.add(comma_between(end, node.value[index + 1].start_mark.index))
+                    elif index:
+                        separators.add(comma_between(node.value[index - 1].end_mark.index, start))
+                else:
+                    line_start = text.rfind("\n", 0, start) + 1
+                    dash = text.find("-", line_start, start)
+                    if dash == -1:
+                        raise RuntimeError("Plugin list member is not a plain scalar")
+                    empty = len(removed) == len(node.value) and name not in wanted
+                    edit(dash, end, "[]" if empty and index == min(removed) else "")
+            if trailing is not None and len(removed) == len(node.value):
+                separators.add(trailing)
+                trailing = None
+            for index in separators:
+                edit(index, index + 1, "")
+            if name in wanted:
+                if node.flow_style:
+                    index = node.end_mark.index - 1
+                    prefix = ", " if len(node.value) > len(removed) and trailing is None else " " if trailing is not None else ""
+                    edit(index, index, prefix + json.dumps(name))
+                else:
+                    index = line_end(leaf_end(node))
+                    column = node.value[0].start_mark.column - 2
+                    prefix = "" if index and text[index - 1] == "\n" else newline
+                    edit(index, index, prefix + " " * column + "- " + json.dumps(name) + newline)
+    new = text
+    for start, end, replacement in sorted(edits, reverse=True):
+        new = new[:start] + replacement + new[end:]
+    if tools[0](new) != expected:
+        raise RuntimeError("Plugin list edit did not verify")
+    return new
+
+
+def plugin_toggle(config, action, name, stamp, dry):
+    """Edit plugin lists directly, without starting the application launcher."""
+    tools = yaml_tools()
+    if tools is None:
+        return MANUAL
+    text = read_text(config)
+    data, root = tools[0](text), tools[1](text)
+    if not isinstance(data, dict) or root.id != "mapping":
+        return MANUAL
+    expected = copy.deepcopy(data)
+    plugins = expected.setdefault("plugins", {})
+    if not isinstance(plugins, dict):
+        return MANUAL
+    for state in ("enabled", "disabled"):
+        entries = plugins.setdefault(state, [])
+        if not isinstance(entries, list) or not all(isinstance(item, str) for item in entries):
+            return MANUAL
+        plugins[state] = [item for item in entries if item != name]
+    if action != "remove":
+        plugins["enabled" if action == "enable" else "disabled"].append(name)
+    new = plugin_lists_text(text, expected, tools, name)
+    return commit(config, text, new, stamp, dry, diff=False)
 
 
 CLAUDE_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")
@@ -614,7 +833,7 @@ def claude_hook(mode, path, command, stamp, dry):
 
 def backup_file(path, stamp):
     real = os.path.realpath(path)
-    target = f"{real}.bak-signalbox-{stamp}"
+    target = f"{real}.bak-wayroost-{stamp}"
     if os.path.exists(target):
         target += "-plugin"
     shutil.copy2(real, target)
@@ -633,13 +852,32 @@ try:
     if cmd == "plugin-state":
         print(plugin_state(sys.argv[2], sys.argv[3]))
         sys.exit(0)
+    if cmd == "plugin-toggle":
+        sys.exit(plugin_toggle(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6] == "1"))
+    if cmd == "legacy-files":
+        sys.exit(remove_legacy_files(sys.argv[2], sys.argv[3] == "1"))
     if cmd == "backup":
         sys.exit(backup_file(sys.argv[2], sys.argv[3]))
+    if cmd == "restore":
+        saved = read_text(sys.argv[3])
+        states = [plugin_state(sys.argv[3], name) for name in ("signalbox-identity", "wayroost-identity")]
+        if "unknown" in states or (states.count("on") != 1 and states != ["absent", "absent"]):
+            say("Snapshot must enable exactly one identity plugin or list neither; restore it manually.")
+            sys.exit(MANUAL)
+        write_text(sys.argv[2], saved, sys.argv[4])
+        if read_text(sys.argv[2]) != saved:
+            raise RuntimeError("Plugin snapshot restoration did not verify")
+        say("Restored the previous plugin configuration.")
+        sys.exit(0)
     if cmd == "claude-hook":
         sys.exit(claude_hook(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6] == "1"))
     kind, mode, path, WRAPPER_PATH, url, stamp, dry = sys.argv[2:9]
     entry = entry_for(kind, WRAPPER_PATH, url)
     if kind == "hermes":
+        if mode == "remove":
+            results = [hermes(mode, path, entry, stamp + "-" + name, dry == "1", name)
+                       for name in ("wayroost", "signalbox")]
+            sys.exit(1 if 1 in results else MANUAL if MANUAL in results else CHANGED if CHANGED in results else NOTHING)
         sys.exit(hermes(mode, path, entry, stamp, dry == "1"))
     sys.exit(json_config(kind, mode, path, entry, stamp, dry == "1"))
 except (OSError, RuntimeError) as err:
@@ -747,12 +985,13 @@ run_step() {  # run_step <label> <command...>
 (( DRY_RUN )) && echo "Dry run: showing what would change for $TARGET; nothing is written."
 echo "==> Bridge token"
 if (( REMOVE )); then
-  run_step "token" helper token remove "$UHOME/.config/signalbox/bridge-token" "$STAMP" "$DRY_RUN"
+  run_step "token" helper token remove "$UHOME/.config/wayroost/bridge-token" "$STAMP" "$DRY_RUN"
+  run_step "legacy bridge files" helper legacy-files "$UHOME/.config/signalbox" "$DRY_RUN"
 else
-  run_step "token" helper token install "$UHOME/.config/signalbox/bridge-token" "$STAMP" "$DRY_RUN" <"$TOKEN_SRC"
+  run_step "token" helper token install "$UHOME/.config/wayroost/bridge-token" "$STAMP" "$DRY_RUN" <"$TOKEN_SRC"
 fi
 
-run_step "bridge URL" helper bridge-url "$MODE" "$UHOME/.config/signalbox/bridge-url" "http://127.0.0.1:$PORT" "$STAMP" "$DRY_RUN"
+run_step "bridge URL" helper bridge-url "$MODE" "$UHOME/.config/wayroost/bridge-url" "http://127.0.0.1:$PORT" "$STAMP" "$DRY_RUN"
 
 echo "==> Hermes"
 if user_has "$UHOME/.hermes/config.yaml"; then
@@ -761,15 +1000,12 @@ else
   echo "    Not set up for $TARGET (no ~/.hermes/config.yaml); skipped."
 fi
 
-# The optional Hermes plugin (hermes-plugin/<name>/ in this checkout): it tells Signalbox which Hermes
-# chat is calling. Installed the way Hermes installs directory plugins: files in ~/.hermes/plugins/<name>,
-# then `hermes plugins enable <name>` (plugins are opt-in); --remove runs `hermes plugins remove <name>`.
+# The optional Hermes plugin identifies the calling chat. Stage its files in
+# ~/.hermes/plugins/<name>, then edit the enabled/disabled lists in config.yaml.
 PLUGIN_SRC="" PLUGIN_NAME=""
-manifests=("$REPO"/hermes-plugin/*/plugin.yaml)
-if [[ -f "${manifests[0]}" && ${#manifests[@]} -eq 1 ]]; then
-  PLUGIN_SRC="$(dirname "${manifests[0]}")"
-  PLUGIN_NAME="$(basename "$PLUGIN_SRC")"
-  [[ "$PLUGIN_NAME" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || { echo "Odd Hermes plugin folder name: $PLUGIN_NAME" >&2; exit 1; }
+if [[ -f "$REPO/hermes-plugin/wayroost-identity/plugin.yaml" ]]; then
+  PLUGIN_SRC="$REPO/hermes-plugin/wayroost-identity"
+  PLUGIN_NAME=wayroost-identity
 fi
 echo "==> Hermes plugin"
 if (( ! PLUGIN )); then
@@ -779,47 +1015,78 @@ elif [[ -z "$PLUGIN_NAME" ]]; then
 elif ! user_has "$UHOME/.hermes/config.yaml"; then
   echo "    Hermes isn't set up for $TARGET; skipped."
 else
-  HERMES="$(find_tool hermes)"
   label="Hermes plugin ($PLUGIN_NAME)"
   pdest="$UHOME/.hermes/plugins/$PLUGIN_NAME"
-  # hermes_cmd <enable|remove>: run it as the user after backing up config.yaml (Hermes edits it).
-  hermes_cmd() {
-    echo "    hermes plugins $1 $PLUGIN_NAME"
+  # plugin_cmd <enable|disable|remove> [name]: edit lists without launching Hermes.
+  plugin_cmd() {
+    local name="${2:-$PLUGIN_NAME}"
+    echo "    Plugin lists: $1 $name"
     (( DRY_RUN )) && return 0
     local saved
     saved="$(helper backup "$UHOME/.hermes/config.yaml" "$STAMP")" || return 1
-    if as_user timeout 120 "$HERMES" plugins "$1" "$PLUGIN_NAME" </dev/null >/dev/null 2>&1; then return 0; fi
-    echo "    Failed; run it yourself as $TARGET (config.yaml was backed up to $saved)."
+    if helper plugin-toggle "$UHOME/.hermes/config.yaml" "$1" "$name" "$STAMP-$1-$name" 0; then return 0; fi
+    echo "    Failed (config.yaml was backed up to $saved)."
     return 1
   }
   if (( REMOVE )); then
-    if ! user_has "$pdest"; then
-      echo "    Not installed."
-      record "$label" 3
-    elif [[ -z "$HERMES" ]]; then
-      echo "    hermes isn't on $TARGET's PATH; remove it with: hermes plugins remove $PLUGIN_NAME"
-      record "$label" 4
-    else
-      rc=0; hermes_cmd remove || rc=$?
-      record "$label" "$rc"
-    fi
+    rc=0
+    for name in wayroost-identity signalbox-identity; do
+      plugin_cmd remove "$name" || rc=$?
+    done
+    record "$label" "$rc"
   else
     copied=0; helper plugin "$PLUGIN_SRC" "$pdest" "$STAMP" "$DRY_RUN" || copied=$?
-    state="$(helper plugin-state "$UHOME/.hermes/config.yaml" "$PLUGIN_NAME" 2>/dev/null || echo unknown)"
-    if (( copied == 1 )); then
-      enabled=1
-    elif [[ "$state" == on ]]; then
-      echo "    Enabled already."
-      enabled=3
-    elif [[ -z "$HERMES" ]]; then
-      echo "    hermes isn't on $TARGET's PATH; enable it with: hermes plugins enable $PLUGIN_NAME"
-      enabled=4
+    enabled=1
+    if (( copied != 0 && copied != 3 )); then
+      copied=1
+      echo "    Plugin staging failed; plugin enablement was left unchanged."
     else
-      enabled=0; hermes_cmd enable || enabled=$?
+      state="$(helper plugin-state "$UHOME/.hermes/config.yaml" "$PLUGIN_NAME" 2>/dev/null || echo unknown)"
+      legacy_state="$(helper plugin-state "$UHOME/.hermes/config.yaml" signalbox-identity 2>/dev/null || echo unknown)"
+      if [[ "$state" == unknown || "$legacy_state" == unknown ||
+            ( "$state" == on && "$legacy_state" == on ) ||
+            ( "$state" != on && "$legacy_state" != on && ( "$state" != absent || "$legacy_state" != absent ) ) ]]; then
+        echo "    Identity plugin enablement is ambiguous or explicitly disabled; switch identity plugins manually."
+        enabled=4
+      elif [[ "$state" == on ]]; then
+        echo "    Enabled already."
+        enabled=3
+      else
+        # Keep a separate snapshot before either plugin list changes.
+        saved="" enabled=0
+        if (( ! DRY_RUN )); then
+          saved="$(helper backup "$UHOME/.hermes/config.yaml" "$STAMP-identity-switch")" || enabled=1
+        fi
+        if (( enabled == 0 )); then
+          if [[ "$state" != on ]]; then
+            plugin_cmd enable || enabled=1
+          fi
+          if (( enabled == 0 && ! DRY_RUN )); then
+            state="$(helper plugin-state "$UHOME/.hermes/config.yaml" "$PLUGIN_NAME" 2>/dev/null || echo unknown)"
+            [[ "$state" == on ]] || enabled=1
+          fi
+          if (( enabled == 0 )) && [[ "$legacy_state" == on ]]; then
+            plugin_cmd disable signalbox-identity || enabled=1
+          fi
+          if (( enabled == 0 && ! DRY_RUN )); then
+            state="$(helper plugin-state "$UHOME/.hermes/config.yaml" "$PLUGIN_NAME" 2>/dev/null || echo unknown)"
+            legacy_state="$(helper plugin-state "$UHOME/.hermes/config.yaml" signalbox-identity 2>/dev/null || echo unknown)"
+            if [[ "$state" != on || ( "$legacy_state" != off && "$legacy_state" != absent ) ]]; then
+              echo "    Hermes did not leave exactly one identity plugin enabled."
+              enabled=1
+            fi
+          fi
+          if (( enabled == 1 && ! DRY_RUN )); then
+            if ! helper restore "$UHOME/.hermes/config.yaml" "$saved" "$STAMP-identity-failed"; then
+              echo "    Rollback failed; restore config.yaml from $saved before using the bridge."
+            fi
+          fi
+        fi
+      fi
     fi
     if (( copied == 1 || enabled == 1 )); then record "$label" 1
-    elif (( copied == 0 || enabled == 0 )); then record "$label" 0
     elif (( enabled == 4 )); then record "$label" 4
+    elif (( copied == 0 || enabled == 0 )); then record "$label" 0
     else record "$label" 3; fi
   fi
 fi
@@ -844,33 +1111,47 @@ CLAUDE="$(find_tool claude)"
 if [[ -z "$CLAUDE" ]]; then
   echo "    Not installed; skipped."
 else
-  current="$(as_user timeout 60 "$CLAUDE" mcp get signalbox </dev/null 2>&1)" && have=1 || have=0
+  current="$(as_user timeout 60 "$CLAUDE" mcp get wayroost </dev/null 2>&1)" && have=1 || have=0
+  legacy="$(as_user timeout 60 "$CLAUDE" mcp get signalbox </dev/null 2>&1)" || legacy=""
+  legacy_ours=0
+  if [[ "$legacy" =~ (^|[[:space:]])([^[:space:]]*/)?node([[:space:]]|$) && "$legacy" == *"/signalbox-bridge.mjs"* ]]; then
+    legacy_ours=1
+  fi
   ours=0
   if (( have )) && [[ "$current" == *"$WRAPPER"* ]]; then
     ours=1
-    if [[ -n "$URL" && "$current" != *"SIGNALBOX_BRIDGE_URL=$URL"* ]] || [[ -z "$URL" && "$current" == *SIGNALBOX_BRIDGE_URL* ]]; then
+    if [[ "$current" != *"WAYROOST_BRIDGE_NAME=wayroost"* ]] ||
+       [[ -n "$URL" && "$current" != *"WAYROOST_BRIDGE_URL=$URL"* ]] || [[ -z "$URL" && "$current" == *WAYROOST_BRIDGE_URL* ]]; then
       ours=2  # ours, but for another port
     fi
   fi
-  add=(mcp add --scope user signalbox)
-  [[ -z "$URL" ]] || add+=(-e "SIGNALBOX_BRIDGE_URL=$URL")
+  add=(mcp add --scope user wayroost)
+  add+=(-e "WAYROOST_BRIDGE_NAME=wayroost")
+  [[ -z "$URL" ]] || add+=(-e "WAYROOST_BRIDGE_URL=$URL")
   add+=(-- node "$WRAPPER")
   if (( REMOVE )); then
-    if (( ours )); then
-      echo "    claude mcp remove --scope user signalbox"
-      if (( DRY_RUN )); then record "Claude Code" 0
-      elif as_user timeout 60 "$CLAUDE" mcp remove --scope user signalbox </dev/null >/dev/null 2>&1; then record "Claude Code" 0
-      else echo "    Failed; run it yourself as $TARGET."; record "Claude Code" 1; fi
-    else
-      echo "    No signalbox server registered."
-      record "Claude Code" 3
+    rc=3
+    for name in wayroost signalbox; do
+      if [[ "$name" == wayroost && "$ours" != 0 || "$name" == signalbox && "$legacy_ours" == 1 ]]; then
+        echo "    claude mcp remove --scope user $name"
+        if (( DRY_RUN )) || as_user timeout 60 "$CLAUDE" mcp remove --scope user "$name" </dev/null >/dev/null 2>&1; then
+          (( rc == 1 )) || rc=0
+        else rc=1; fi
+      fi
+    done
+    if (( rc == 3 )); then
+      echo "    No wayroost server registered."
     fi
+    record "Claude Code" "$rc"
+  elif (( legacy_ours )); then
+    echo "    Legacy bridge registration found; use deploy/bridge-names.py forward before setup."
+    record "Claude Code" 4
   elif (( ours == 1 )); then
-    echo "    Already registered (claude mcp get signalbox)."
+    echo "    Already registered (claude mcp get wayroost)."
     record "Claude Code" 3
   elif (( have && ! ours )); then
-    echo "    A different \"signalbox\" MCP server is registered; left alone. To replace it, as $TARGET:"
-    echo "      claude mcp remove signalbox && claude ${add[*]}"
+    echo "    A different \"wayroost\" MCP server is registered; left alone. To replace it, as $TARGET:"
+    echo "      claude mcp remove wayroost && claude ${add[*]}"
     record "Claude Code" 4
   else
     echo "    claude ${add[*]}"
@@ -878,7 +1159,7 @@ else
       record "Claude Code" 0
     else
       rc=0
-      if (( ours == 2 )); then as_user timeout 60 "$CLAUDE" mcp remove --scope user signalbox </dev/null >/dev/null 2>&1 || rc=$?; fi
+      if (( ours == 2 )); then as_user timeout 60 "$CLAUDE" mcp remove --scope user wayroost </dev/null >/dev/null 2>&1 || rc=$?; fi
       if (( rc == 0 )) && out="$(as_user timeout 60 "$CLAUDE" "${add[@]}" </dev/null 2>&1)"; then
         record "Claude Code" 0
       else
@@ -898,8 +1179,8 @@ fi
 
 if user_has "$UHOME/.copilot" || [[ -n "$(find_tool copilot)" ]]; then
   echo "==> Copilot CLI"
-  echo "    Skipped: its MCP config format isn't verified here. Add a local server named signalbox that runs:"
-  echo "      node $WRAPPER"
+  echo "    Skipped: its MCP config format isn't verified here. Add a local server named wayroost that runs:"
+  echo "      env WAYROOST_BRIDGE_NAME=wayroost${URL:+ WAYROOST_BRIDGE_URL=$URL} node \"$WRAPPER\""
   MANUAL+=("Copilot CLI")
 fi
 
@@ -912,7 +1193,7 @@ if (( ${#FAILED[@]} )); then echo "    Failed: $(IFS=,; echo "${FAILED[*]}" | se
 if (( ! DRY_RUN && ! REMOVE )); then
   echo
   echo "To load it:"
-  echo "  - Hermes: restart the Hermes dashboard and the gateway (hermes gateway restart), so both load the plugin"
+  echo "  - Hermes: restart the dashboard and gateway through their service manager, so both load the plugin"
   echo "    and the new bridge. Without the plugin (--no-hermes-plugin), /reload-mcp in a chat is enough."
   echo "  - Paseo: new agents pick it up; restart running ones to give them the tools."
   echo "  - Claude Code, pi, OpenCode: start a new session (running ones keep their old tools and hooks)."

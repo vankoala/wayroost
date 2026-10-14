@@ -6,6 +6,7 @@ import { READ_VIEWS, operationKeys, parseOperation, readViewKeys, type ReadView 
 import { formatKeyPath, settingValuesEqual, type SettingValue, type KeyPath, type TargetId, type UndoToken } from '../../shared/settings.js';
 import type { SupervisorApi } from '../src/supervisor-client.js';
 import { workerApprovalTools } from '../../shared/safety.js';
+import { mergeWayroostSettingsPatch, wayroostSettingsSchema } from '../../shared/wayroost-settings.js';
 
 export class FakeSettingsSupervisor implements SupervisorApi {
   documents: Partial<Record<TargetId, Record<string, unknown>>> = {
@@ -13,7 +14,7 @@ export class FakeSettingsSupervisor implements SupervisorApi {
       agent: { reasoning_effort: 'medium' }, display: { personality: '' }, approvals: { mode: 'smart' },
       skills: { write_approval: false }, command_allowlist: ['echo example'] },
     'paseo-config': { agents: { providers: { codex: { enabled: true, paseoTools: { enabled: true } } } }, daemon: {} },
-    'wayroost-settings': { safetyCommandsEnabled: false, push: { approvals: true, cards: true }, quietHours: null, rules: [] },
+    'wayroost-settings': { version: 1, safetyCommandsEnabled: false, push: { approvals: true, cards: true }, quietHours: null, rules: [] },
     'gateway-role-map': { roles: { main: 'demo' } },
     'gateway-state': {}, 'pi-settings': {}, 'pi-models': {},
   };
@@ -35,6 +36,7 @@ export class FakeSettingsSupervisor implements SupervisorApi {
     const effective = spec.target === 'hermes-config' && !spec.persisted;
     const document = (effective ? this.effectiveDocuments[spec.target] : undefined) ?? this.documents[spec.target];
     if (!document) return { ok: true as const, view, present: false, values: [] };
+    if (view === 'wayroost.settings' && !wayroostSettingsSchema.safeParse(document).success) return { ok: false as const, code: 'parse_failed' as const };
     const values = readViewKeys(READ_VIEWS[view], document).map(path => {
       const value = get(document, path);
       return value === undefined ? { path: [...path], exists: false as const } : { path: [...path], exists: true as const, value: value as never };
@@ -59,6 +61,7 @@ export class FakeSettingsSupervisor implements SupervisorApi {
       return 'exists' in entry ? value !== undefined : value === undefined || !settingValuesEqual(value, entry.value);
     })) return { ok: false, code: 'precondition_changed' };
     this.documents[target] = document;
+    const preferences = mergeWayroostSettingsPatch(document, params);
     const values: Record<string, unknown[]> = {
       'hermes.reasoning-effort': [params.effort], 'hermes.personality': [params.personality],
       'hermes.approval-mode': [params.mode], 'hermes.skill-staging': [params.enabled],
@@ -71,6 +74,7 @@ export class FakeSettingsSupervisor implements SupervisorApi {
       createHash('sha256').update(entry).digest('hex') !== params.entrySha256);
     else paths.forEach((path, index) => set(document, path, request.operation === 'paseo.worker-approvals'
       ? workerApprovalTools(get(document, path), params.enabled as boolean)
+      : ['wayroost.notifications', 'wayroost.preferences', 'wayroost.worker-updates', 'wayroost.voice'].includes(request.operation) ? preferences[String(path[0])]
       : values[request.operation] ? values[request.operation]![index] : params.enabled));
     return this.written(request.operation, target, before, paths.map(formatKeyPath));
   });

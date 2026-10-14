@@ -118,7 +118,8 @@ export async function request<T>(method: string, path: string, body?: unknown, v
   const data = (raw ?? {}) as { error?: string; code?: string };
   checkAuthenticationGeneration(generation);
   if (!res.ok) {
-    throw new ApiError(data.error ?? (data.code ? `Settings change refused: ${data.code.replaceAll('_', ' ')}.` : `Request failed (${res.status})`), 'http', res.status);
+    throw new ApiError(data.error ?? (data.code === 'target_missing' ? 'The settings file for this target is missing; nothing was written.'
+      : data.code ? `Settings change refused: ${data.code.replaceAll('_', ' ')}.` : `Request failed (${res.status})`), 'http', res.status);
   }
   if (!parsed && authenticationEndpoint(path)) reportAuthenticationAnomaly(generation);
   if (!parsed) throw new ApiError("Can't reach Wayroost. Check your connection.", 'network');

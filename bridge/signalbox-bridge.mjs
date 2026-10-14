@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Signalbox project bridge: the stdio MCP server an agent starts so it can see,
+// Wayroost project bridge: the stdio MCP server an agent starts so it can see,
 // read, message and start the other chats in its project, across Hermes and
 // Paseo. deploy/setup-bridge.sh registers it with each agent as
 //   node /opt/signalbox/bin/signalbox-bridge.mjs
@@ -10,15 +10,15 @@
 // only; diagnostics go to stderr. The token is never printed.
 //
 // Environment:
-//   SIGNALBOX_BRIDGE_URL         bridge listener, default http://127.0.0.1:19012 (loopback only)
-//   SIGNALBOX_BRIDGE_TOKEN_FILE  default ~/.config/signalbox/bridge-token
+//   WAYROOST_BRIDGE_URL         bridge listener, default http://127.0.0.1:19012 (loopback only)
+//   WAYROOST_BRIDGE_TOKEN_FILE  default ~/.config/wayroost/bridge-token (legacy fallback)
 //   PASEO_AGENT_ID               set by Paseo in the agents it runs: who is calling
 //   PASEO_AGENT_CWD              set by Paseo: the agent's folder (else the process's cwd)
 //
 // Under Hermes, a Hermes plugin adds the calling chat's session id to each call as the hidden
-// argument _signalbox_caller; it goes to Signalbox as X-Bridge-Hermes-Session, never as an argument.
+// argument _wayroost_caller (legacy: _signalbox_caller); it goes to Wayroost as X-Bridge-Hermes-Session, never as an argument.
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -35,7 +35,11 @@ const WAIT_MAX_SECONDS = 120;
 /** wait_for_reply's HTTP timeout is its own timeout plus this much. */
 const WAIT_MARGIN_MS = 15_000;
 /** Added by the Hermes plugin; never advertised in a schema. */
-const HIDDEN_CALLER = '_signalbox_caller';
+const HIDDEN_CALLER = '_wayroost_caller';
+const LEGACY_CALLER = '_signalbox_caller';
+// The server remains authoritative even if an old wrapper has no local setting.
+const LEGACY_NAMES = process.env.WAYROOST_BRIDGE_LEGACY_NAMES === undefined || process.env.WAYROOST_BRIDGE_LEGACY_NAMES === 'true';
+const BRIDGE_NAME = process.env.WAYROOST_BRIDGE_NAME ?? 'signalbox';
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const TOKEN = /^[A-Za-z0-9_-]{32,512}$/;
 const SETUP_HINT = 'Ask the user to run deploy/setup-bridge.sh from the Wayroost checkout (as root, with their user name).';
@@ -218,17 +222,17 @@ const INSTRUCTIONS =
 // ---- configuration -----------------------------------------------------------------
 
 function log(message) {
-  process.stderr.write(`signalbox-bridge: ${message}\n`);
+  process.stderr.write(`wayroost-bridge: ${message}\n`);
 }
 
 /** A variable's value, unless it's unset, empty or a "${VAR}" placeholder (Hermes leaves unset ones as-is). */
 const warnedEnv = new Set();
 function envValue(name) {
-  if (!name.startsWith('SIGNALBOX_')) {
+  if (!/^(WAYROOST|SIGNALBOX)_/.test(name)) {
     const value = process.env[name]?.trim();
     return !value || /^\$\{[^}]*\}$/.test(value) ? undefined : value;
   }
-  const suffix = name.replace(/^SIGNALBOX_/, '');
+  const suffix = name.replace(/^(WAYROOST|SIGNALBOX)_/, '');
   const current = `WAYROOST_${suffix}`;
   const legacy = `SIGNALBOX_${suffix}`;
   if (process.env[current] === undefined && process.env[legacy] !== undefined && !warnedEnv.has(legacy)) {
@@ -247,18 +251,18 @@ function isLoopback(hostname) {
 }
 
 function resolveEndpoint() {
-  const raw = envValue('SIGNALBOX_BRIDGE_URL') || DEFAULT_URL;
+  const raw = envValue('WAYROOST_BRIDGE_URL') || DEFAULT_URL;
   let url;
   try {
     url = new URL(raw);
   } catch {
-    return { error: "SIGNALBOX_BRIDGE_URL isn't a valid URL." };
+    return { error: "WAYROOST_BRIDGE_URL isn't a valid URL." };
   }
-  if (url.protocol !== 'http:') return { error: 'SIGNALBOX_BRIDGE_URL must be an http:// address on this machine.' };
-  if (url.username || url.password) return { error: "SIGNALBOX_BRIDGE_URL can't carry a user name or password." };
+  if (url.protocol !== 'http:') return { error: 'WAYROOST_BRIDGE_URL must be an http:// address on this machine.' };
+  if (url.username || url.password) return { error: "WAYROOST_BRIDGE_URL can't carry a user name or password." };
   if (!isLoopback(url.hostname)) {
     return {
-      error: `SIGNALBOX_BRIDGE_URL must point at this machine (127.0.0.1 or localhost), not ${url.hostname}; refusing to send the bridge token there.`,
+      error: `WAYROOST_BRIDGE_URL must point at this machine (127.0.0.1 or localhost), not ${url.hostname}; refusing to send the bridge token there.`,
     };
   }
   const port = Number(url.port || 80);
@@ -270,8 +274,10 @@ function resolveEndpoint() {
   };
 }
 
-const TOKEN_FILE = envValue('SIGNALBOX_BRIDGE_TOKEN_FILE') ?? join(homedir(), '.config', 'signalbox', 'bridge-token');
-const TOKEN_LABEL = envValue('SIGNALBOX_BRIDGE_TOKEN_FILE') ?? '~/.config/signalbox/bridge-token';
+const CURRENT_TOKEN = join(homedir(), '.config', 'wayroost', 'bridge-token');
+const OLD_TOKEN = join(homedir(), '.config', 'signalbox', 'bridge-token');
+const TOKEN_FILE = envValue('WAYROOST_BRIDGE_TOKEN_FILE') ?? (!existsSync(CURRENT_TOKEN) && existsSync(OLD_TOKEN) ? OLD_TOKEN : CURRENT_TOKEN);
+const TOKEN_LABEL = envValue('WAYROOST_BRIDGE_TOKEN_FILE') ?? (TOKEN_FILE === OLD_TOKEN ? '~/.config/signalbox/bridge-token' : '~/.config/wayroost/bridge-token');
 
 /** { token } or { error }: the message a tool call returns when there's no usable token. */
 function readToken() {
@@ -386,7 +392,7 @@ function networkError(err, timedOutAfterMs) {
   if (err?.code === 'ECONNREFUSED') {
     return (
       `Wayroost isn't answering at ${endpoint.origin}. It may be stopped, or its bridge may be turned off ` +
-      '("bridge": {"enabled": true} in /etc/signalbox/config.json). Tell the user.'
+      '("bridge": {"enabled": true} in /etc/wayroost/config.json). Tell the user.'
     );
   }
   return `Couldn't reach Wayroost at ${endpoint.origin} (${err?.code ?? err?.message ?? 'error'}).`;
@@ -405,13 +411,23 @@ async function callTool(tool, args, cancel, client) {
   if (tokenState.error) return failure(tokenState.error);
 
   const payload = { ...args };
-  const caller = payload[HIDDEN_CALLER];
+  const legacyCaller = payload[LEGACY_CALLER];
+  const canonicalCaller = payload[HIDDEN_CALLER];
+  if (BRIDGE_NAME !== 'wayroost' && BRIDGE_NAME !== 'signalbox') return failure('Unknown bridge name.');
+  const legacy = BRIDGE_NAME === 'signalbox' || Object.hasOwn(payload, LEGACY_CALLER);
+  if (legacy && !LEGACY_NAMES) return failure('The signalbox bridge name is disabled; use wayroost.');
+  if (canonicalCaller !== undefined && legacyCaller !== undefined && canonicalCaller !== legacyCaller) {
+    return failure('Conflicting bridge caller identities.');
+  }
+  const caller = canonicalCaller ?? legacyCaller;
   delete payload[HIDDEN_CALLER];
+  delete payload[LEGACY_CALLER];
   delete payload.backend_hint;
   if (client.hermes) payload.backend_hint = 'hermes';
   // Only a wrapper Hermes started passes the plugin's session id on; anywhere else it's a model's claim.
   const headers =
     HERMES_ENV && typeof caller === 'string' && /^[\x21-\x7e]{1,200}$/.test(caller) ? { 'X-Bridge-Hermes-Session': caller } : {};
+  headers['X-Bridge-Name'] = legacy ? 'signalbox' : 'wayroost';
   const timeoutMs = tool === 'wait_for_reply' ? waitSeconds(payload.timeout_seconds) * 1000 + WAIT_MARGIN_MS : TIMEOUT_MS;
 
   for (let attempt = 0; ; attempt++) {
@@ -471,7 +487,7 @@ function initialize(params) {
   return {
     protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : FALLBACK_PROTOCOL,
     capabilities: { tools: { listChanged: false } },
-    serverInfo: { name: 'signalbox', title: 'Wayroost', version: VERSION },
+    serverInfo: { name: BRIDGE_NAME, title: 'Wayroost', version: VERSION },
     instructions: INSTRUCTIONS,
   };
 }

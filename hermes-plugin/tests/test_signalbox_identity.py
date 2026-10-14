@@ -1,9 +1,8 @@
-"""Tests for the signalbox-identity Hermes plugin.
+"""Tests for the Wayroost identity Hermes plugin.
 
-Plain unittest, so they run on Hermes' own interpreter (which has no pytest). Run them as the user
-Hermes runs as, through Hermes' launcher so its dependencies are on the path:
+Run with an explicit interpreter that has Hermes' dependencies and an isolated home:
 
-    hermes --run-module unittest discover -s <signalbox>/hermes-plugin/tests -v
+    HERMES_HOME="$(mktemp -d)" "$HERMES_PLUGIN_TEST_PYTHON" -B -m unittest discover -s hermes-plugin/tests -v
 
 Without Hermes on the path only the hook tests run; the ones that load the plugin through Hermes'
 plugin manager and dispatch a real ``pre_tool_call`` are skipped. pytest can collect them too.
@@ -22,8 +21,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent / "signalbox-identity"
-PLUGIN_KEY = "signalbox-identity"
+PLUGIN_DIR = Path(__file__).resolve().parent.parent / "wayroost-identity"
+PLUGIN_KEY = "wayroost-identity"
 DASHBOARD_ID = "20260927_101500_ab12cd"  # tui_gateway: new_session_id(), 6 hex
 GATEWAY_ID = "20260927_101500_ab12cd34"  # messaging gateway: 8 hex
 
@@ -66,6 +65,54 @@ class HookTests(unittest.TestCase):
 
     def test_gateway_session_ids_count_too(self):
         self.assertEqual(self.call(session_id=GATEWAY_ID)["args"], {"_signalbox_caller": GATEWAY_ID})
+
+    def test_both_prefixes_always_use_the_same_stored_identity(self):
+        for prefix, key in (("wayroost", "_wayroost_caller"), ("signalbox", "_signalbox_caller")):
+            for tool in ("list_chats", "read_chat", "send_message", "start_chat", "wait_for_reply"):
+                directive = self.call(tool_name=f"mcp__{prefix}__{tool}", args={key: "forged"})
+                self.assertEqual(directive, {"action": "modify", "args": {key: DASHBOARD_ID}})
+
+    def test_legacy_prefix_is_blocked_when_disabled_including_under_paseo(self):
+        with mock.patch.dict(os.environ, {"WAYROOST_BRIDGE_LEGACY_NAMES": "false"}):
+            self.assertEqual(self.call()["action"], "block")
+            self.assertIn("use wayroost", self.call()["message"])
+            self.assertEqual(self.call(tool_name="mcp__wayroost__list_chats")["args"], {"_wayroost_caller": DASHBOARD_ID})
+            with mock.patch.dict(os.environ, {"PASEO_AGENT_ID": "demo-paseo-agent"}):
+                self.assertEqual(self.call()["action"], "block")
+                self.assertIsNone(self.call(tool_name="mcp__wayroost__list_chats"))
+
+    def test_settings_file_controls_transition_and_malformed_settings_fail_closed(self):
+        with mock.patch.object(Path, "read_text", return_value='{"bridge":{"legacyNames":false}}'):
+            self.assertEqual(self.call()["action"], "block")
+        with mock.patch.object(Path, "read_text", return_value='{"bridge":{"legacyNames":true}}'):
+            self.assertEqual(self.call()["args"], {"_signalbox_caller": DASHBOARD_ID})
+        for value in ('{broken', '{"bridge":{"legacyNames":"true"}}'):
+            with mock.patch.object(Path, "read_text", return_value=value):
+                self.assertEqual(self.call()["action"], "block")
+
+    def test_legacy_plugin_name_uses_the_exact_same_mapping(self):
+        path = PLUGIN_DIR.parent / "signalbox-identity" / "__init__.py"
+        spec = importlib.util.spec_from_file_location("legacy_identity_under_test", path)
+        alias = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(alias)
+        for name in ("mcp__wayroost__list_chats", "mcp__signalbox__list_chats"):
+            self.assertEqual(alias.caller_directive(name, DASHBOARD_ID), plugin.caller_directive(name, DASHBOARD_ID))
+        with mock.patch.dict(os.environ, {"WAYROOST_BRIDGE_LEGACY_NAMES": "false"}):
+            for name in ("mcp__wayroost__list_chats", "mcp__signalbox__list_chats"):
+                self.assertEqual(alias.caller_directive(name, DASHBOARD_ID)["action"], "block")
+            self.assertEqual(plugin.caller_directive("mcp__wayroost__list_chats", DASHBOARD_ID)["args"],
+                             {"_wayroost_caller": DASHBOARD_ID})
+
+    def test_cutoff_mirror_on_disk_blocks_the_old_prefix_and_preserves_new_identity(self):
+        with tempfile.TemporaryDirectory(prefix="wayroost-mirror-test-") as folder:
+            settings = Path(folder) / "wayroost-bridge.json"
+            settings.write_text('{"bridge":{"legacyNames":true}}')
+            with mock.patch.object(plugin, "_settings_file", settings), mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(self.call()["args"], {"_signalbox_caller": DASHBOARD_ID})
+                settings.write_text('{"bridge":{"legacyNames":false}}')
+                self.assertEqual(self.call()["action"], "block")
+                self.assertEqual(self.call(tool_name="mcp__wayroost__list_chats")["args"],
+                                 {"_wayroost_caller": DASHBOARD_ID})
 
     def test_other_tools_are_left_alone(self):
         for tool in ("terminal", "write_file", "tool_call", "mcp__other__list_chats", "mcp__signalboxx__list_chats",
@@ -143,7 +190,7 @@ class _ThrowawayHermesHome:
             api_request_id="req", middleware_trace=[])
 
 
-_NEEDS_HERMES = unittest.skipUnless(_hermes_available(), "Hermes isn't importable: run through `hermes --run-module`")
+_NEEDS_HERMES = unittest.skipUnless(_hermes_available(), "Hermes isn't importable: set HERMES_PLUGIN_TEST_PYTHON to its environment's python")
 
 
 @_NEEDS_HERMES
@@ -160,6 +207,14 @@ class HermesRuntimeTests(_ThrowawayHermesHome, unittest.TestCase):
         block, args = self.dispatch("mcp__signalbox__send_message", {"chat": "hermes:x", "text": "hi"})
         self.assertIsNone(block)
         self.assertEqual(args, {"chat": "hermes:x", "text": "hi", "_signalbox_caller": DASHBOARD_ID})
+
+    def test_wayroost_calls_get_the_same_stored_identity_and_disabled_alias_is_vetoed(self):
+        block, args = self.dispatch("mcp__wayroost__list_chats", {"_wayroost_caller": "forged"})
+        self.assertIsNone(block)
+        self.assertEqual(args, {"_wayroost_caller": DASHBOARD_ID})
+        with mock.patch.dict(os.environ, {"WAYROOST_BRIDGE_LEGACY_NAMES": "false"}):
+            block, _ = self.dispatch("mcp__signalbox__list_chats", {})
+            self.assertIn("use wayroost", block)
 
     def test_a_value_the_model_made_up_is_replaced(self):
         _, args = self.dispatch("mcp__signalbox__list_chats", {"_signalbox_caller": "20200101_000000_ffffff"})
@@ -261,7 +316,7 @@ class LaunchReportTests(unittest.TestCase):
 class IsolatedInstallTests(unittest.TestCase):
     def test_folder_only_copy_keeps_identity_without_runtime_and_never_reports(self):
         with tempfile.TemporaryDirectory(prefix="wayroost-plugin-test-") as folder:
-            target = Path(folder) / "signalbox-identity"
+            target = Path(folder) / "wayroost-identity"
             shutil.copytree(PLUGIN_DIR, target, ignore=shutil.ignore_patterns("__pycache__"))
             code = """
 import importlib.util, sys

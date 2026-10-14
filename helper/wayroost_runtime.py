@@ -26,7 +26,9 @@ def bridge_url() -> str:
     """The installed bridge address, with environment overrides and loopback-only validation."""
     url = env("BRIDGE_URL")
     if url is None:
-        path = Path.home() / ".config" / "signalbox" / "bridge-url"
+        path = Path.home() / ".config" / "wayroost" / "bridge-url"
+        if not path.exists():
+            path = Path.home() / ".config" / "signalbox" / "bridge-url"
         try:
             url = path.read_text(encoding="ascii").strip()
         except FileNotFoundError:
@@ -68,3 +70,12 @@ class BackgroundGate:
         if self.role == "primary":
             return work()
         return None
+
+
+def bridge_token_file() -> str:
+    """One owner credential path shared by the bridge launch reporters."""
+    override = env("BRIDGE_TOKEN_FILE")
+    if override is not None:
+        return override
+    current = Path.home() / ".config" / "wayroost" / "bridge-token"
+    return str(current if current.exists() else Path.home() / ".config" / "signalbox" / "bridge-token")

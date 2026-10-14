@@ -392,13 +392,14 @@ class RoleSafetyTests(unittest.TestCase):
         start = script.index("def files_in(root):")
         end = script.index("\n\ndef ", script.index("def plugin(src, dest, stamp, dry):"))
         namespace = {"os": os, "shutil": shutil, "tempfile": tempfile, "say": lambda _: None,
+                     "read_text": lambda path: Path(path).read_text(),
                      "CHANGED": 1, "NOTHING": 0}
         exec(compile(ast.parse(script[start:end]), "installer-functions", "exec"), namespace)
         repo = self.root / "repo"
-        source = repo / "hermes-plugin" / "signalbox-identity"
-        shutil.copytree(SOURCE.parent / "hermes-plugin" / "signalbox-identity", source,
+        source = repo / "hermes-plugin" / "wayroost-identity"
+        shutil.copytree(SOURCE.parent / "hermes-plugin" / "wayroost-identity", source,
                         ignore=shutil.ignore_patterns("__pycache__"))
-        dest = self.root / "fake-hermes" / "plugins" / "signalbox-identity"
+        dest = self.root / "fake-hermes" / "plugins" / "wayroost-identity"
         with self.assertRaisesRegex(RuntimeError, "runtime"):
             namespace["plugin"](str(source), str(dest), "fake-stamp", False)
         self.assertFalse(dest.exists())
@@ -409,6 +410,12 @@ class RoleSafetyTests(unittest.TestCase):
         namespace["plugin"](str(source), str(dest), "fake-stamp", False)
         self.assertEqual((dest / "wayroost_runtime.py").read_bytes(), (SOURCE / "wayroost_runtime.py").read_bytes())
         self.assertEqual(json.loads((dest / "wayroost-role.json").read_text()), {"role": "primary"})
+        self.assertEqual(json.loads((dest / "wayroost-bridge.json").read_text()), {"bridge": {"legacyNames": True}})
+        (dest / "wayroost-bridge.json").write_text('{"bridge":{"legacyNames":false}}\n')
+        with (source / "__init__.py").open("a") as f:
+            f.write("\n# invented upgrade fixture\n")
+        namespace["plugin"](str(source), str(dest), "upgrade-fixture", False)
+        self.assertEqual(json.loads((dest / "wayroost-bridge.json").read_text()), {"bridge": {"legacyNames": False}})
         code = """
 import importlib.util, sys
 from unittest.mock import patch

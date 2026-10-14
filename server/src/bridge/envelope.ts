@@ -3,11 +3,11 @@ import { parseBridgeEnvelope } from '../../../shared/protocol.js';
 // Messages that arrive through the bridge carry an envelope (see bridgeEnvelope
 // in shared/protocol.ts). Hermes builds a chat's preview, and sometimes its
 // title, from the first message, cut short, so those would all read
-// "[Message from … via Signalbox — another AI agent…". These helpers make them
+// "[Message from … via Wayroost — another AI agent…". These helpers make them
 // readable again.
 
 const HEAD = '[Message from ';
-const VIA = ' via Signalbox';
+const VIAS = [' via Wayroost', ' via Signalbox'];
 
 /**
  * A preview or title that starts with a bridge envelope, made readable:
@@ -24,8 +24,8 @@ export function readableBridgeText(text: string): string {
   // can't contain "]", so the first "]" closes the bracketed header.
   const flat = text.replace(/\s+/g, ' ');
   const close = flat.indexOf(']', HEAD.length);
-  const via = flat.indexOf(VIA, HEAD.length);
-  const senderEnd = via >= 0 && (close < 0 || via < close) ? via : close >= 0 ? close : flat.length;
+  const via = Math.min(...VIAS.map((v) => flat.indexOf(v, HEAD.length)).filter((i) => i >= 0), Infinity);
+  const senderEnd = Number.isFinite(via) && (close < 0 || via < close) ? via : close >= 0 ? close : flat.length;
   const sender = flat.slice(HEAD.length, senderEnd).trim();
   if (!sender) return text;
   const body = close >= 0 ? flat.slice(close + 1).trim() : '';

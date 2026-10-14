@@ -86,7 +86,7 @@ const hub = new EventHub();
 // Who started what, for runs agents start from a shell: kept in the state directory.
 const lineage = new Lineage(config.stateDir, log, Date.now, background);
 // Settings → Security → "Hermes safety commands" (off unless switched on).
-const safetyCommands = config.hermes.enabled ? new SafetyCommandsSetting(config.stateDir) : undefined;
+const safetyCommands = config.hermes.enabled ? new SafetyCommandsSetting(config.stateDir, config.settings.legacyRoutesViaPipeline) : undefined;
 const hermes = config.hermes.enabled
   ? new HermesAdapter(config.hermes.url, hub, new SecretStore(config.stateDir), log, {
       background,
@@ -142,6 +142,7 @@ const push = config.publicOrigin.startsWith('https://')
 // Settings → Notifications: where each alert goes. The rules, the quiet hours and the
 // phone's switches are Wayroost's own settings, written through the write-through core.
 const { notifications, feed } = await createNotificationServices({
+  pipeline: config.settings.legacyRoutesViaPipeline,
   background,
   stateDir: config.stateDir,
   feedEnabled: config.feed.enabled,
@@ -163,7 +164,7 @@ await background.run(async () => {
     let server: FastifyInstance | undefined;
     try {
       const token = readOrCreateBridgeToken(config.stateDir, background);
-      server = await buildBridgeServer({ bridge: candidate, token, port: config.bridge.port, log, background, ...(feed ? { feed } : {}) });
+      server = await buildBridgeServer({ bridge: candidate, token, port: config.bridge.port, legacyNames: config.bridge.legacyNames, log, background, ...(feed ? { feed } : {}) });
       await server.listen({ host: BRIDGE_HOST, port: config.bridge.port });
       bridge = candidate;
       bridgeServer = server;
@@ -177,7 +178,7 @@ await background.run(async () => {
 // Worker updates: the task log tells a Hermes chat when a Paseo worker it started
 // stops, waits on you or runs late (Settings → Project bridge). Needs the bridge,
 // which only a primary runs: in shadow there is no completion relay at all.
-const workerUpdates = bridge ? new WorkerUpdatesSetting(config.stateDir) : undefined;
+const workerUpdates = bridge ? new WorkerUpdatesSetting(config.stateDir, config.settings.legacyRoutesViaPipeline) : undefined;
 let taskRelay: TaskRelay | undefined;
 if (bridge && workerUpdates && hermes instanceof HermesAdapter && paseo instanceof PaseoAdapter) {
   taskRelay = createTaskRelay({

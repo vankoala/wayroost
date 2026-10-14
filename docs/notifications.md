@@ -23,7 +23,7 @@ of you, and the PC's own desktop app is what reports whether anyone is at it.
   still yours.
 - The page starts by naming where the next alert would go (*"You are at this PC,
   so an alert the app can show stops there"*), how many devices can be pushed to,
-  and whether quiet hours are read in a time zone the site file names.
+  and whether quiet hours have an explicit time zone.
 - A change takes effect on the next alert. Nothing restarts.
 
 Every install starts like this:
@@ -60,22 +60,25 @@ The three inputs are applied in this order.
 Reading the route changes nothing: the settings page can ask where an alert would
 go without sending it.
 
-Quiet hours are read in **your** time zone, not the server's. `notifications.timeZone`
-in [the site file](configuration.md#fields) names it (an IANA name this PC knows,
-like `Europe/Berlin`); unset means the zone this PC is set to. A span that runs
+Quiet hours use `timeZone` in the [owner-held settings document](wayroost-settings.md)
+in pipeline mode. In legacy mode, `notifications.timeZone` in
+[the site file](configuration.md#fields) names it. Both accept an IANA name this
+PC knows, like `Europe/Berlin`; unset means the zone this PC is set to. A span that runs
 past midnight holds the evening and the early morning; one whose ends are the same
 time holds nothing.
 
 ## Where the settings live
 
-Wayroost's own settings file, `wayroost-settings.json` in the state folder (mode
-600), holds the rules, the quiet hours, and the phone's switches over approvals
-and cards. Every change goes through the write-through core, which keeps a backup
-of the bytes it replaced, replaces the file atomically, and appends one line per
-change to `settings-audit/settings.jsonl` naming the target, the keys, the device
-that asked, and whether it worked. A file that can't be read or understood routes
-alerts as the defaults would and is never replaced by one of these writes; a write
-that changes nothing writes nothing.
+In pipeline mode, the [owner-held settings document](wayroost-settings.md) is
+Wayroost's source for rules, quiet hours and push switches. Reads, changes and
+undo use the supervisor's target, lock, backups and audit. Startup never seeds
+or reconciles preferences. Missing or unavailable settings hold all outbound
+pushes while preserving in-app needs-you toasts.
+
+Legacy mode uses `wayroost-settings.json` in the state folder (mode 600), with
+backups in `settings-backups/` and audit in `settings-audit/settings.jsonl`.
+A file that cannot be read or understood is never replaced by a settings save;
+a write that changes nothing writes nothing.
 
 The same hours and the same card switch appear on Settings → For you, and it's the
 same setting whichever page wrote it. Alerts are routed by this file, so the

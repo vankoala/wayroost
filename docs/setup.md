@@ -182,12 +182,12 @@ on `127.0.0.1` only.
    sudo /opt/src/signalbox/deploy/setup-bridge.sh you
    ```
 
-   For Hermes, the script also installs and enables the `signalbox-identity`
+   For Hermes, the script also installs and enables the `wayroost-identity`
    plugin, which tells the bridge which Hermes chat is calling.
    `--no-hermes-plugin` leaves it out.
 
-3. Reload the agents: restart the Hermes dashboard and the gateway
-   (`hermes gateway restart`), so both load the plugin (without it,
+3. Reload the agents: restart the Hermes dashboard and gateway through
+   their service manager, so both load the plugin (without it,
    `/reload-mcp` in a Hermes chat is enough), and start new sessions of Claude
    Code, OpenCode and pi. New Paseo agents get the tools; restart running ones.
 
@@ -232,13 +232,14 @@ sudo deploy/setup-tunnel.sh wayroost.example.com
 
 If you use the project bridge, run `setup-bridge.sh` again after `install.sh`,
 never before: it updates the Hermes plugin, which needs the new agents' side
-that `install.sh` installs. Then restart the Hermes dashboard and the gateway,
-so each loads the plugin and starts the new agents' side:
+that `install.sh` installs:
 
 ```bash
 sudo deploy/setup-bridge.sh you
-hermes gateway restart    # as you; restart the Hermes dashboard too
 ```
+
+Then restart the Hermes dashboard and gateway through their service manager,
+so each loads the plugin and starts the new agents' side.
 
 In the other order, Hermes' calls to the bridge fail with HTTP 400 until the
 new agents' side is installed and Hermes restarts (see
@@ -319,4 +320,4 @@ journalctl -u signalbox | grep 'request denied'
 | An agent says "The Wayroost bridge isn't set up on this machine" | Its user has no copy of the bridge token | Run `setup-bridge.sh` for that user (step 7). |
 | An agent says "Wayroost isn't answering at http://127.0.0.1:19012" | Wayroost is stopped, or the bridge is off in the config | Turn it on (step 7) and restart Wayroost. If it still fails, look for "the project bridge could not start" in `journalctl -u signalbox`. |
 | `setup-bridge.sh` says "Wayroost hasn't created the bridge token yet" | Wayroost hasn't restarted since the bridge was turned on | `sudo systemctl restart signalbox`, then run it again. |
-| An agent under Hermes says `Invalid arguments. arguments: Unrecognized key: "_signalbox_caller"` | Hermes loaded the `signalbox-identity` plugin while it still ran an older bridge | Run `install.sh`, then restart the Hermes dashboard and gateway (see [Updating](#updating)). |
+| An agent under Hermes says `Invalid arguments. arguments: Unrecognized key: "_wayroost_caller"` | Hermes loaded the `wayroost-identity` plugin while it still ran an older bridge | Run `install.sh`, then restart the Hermes dashboard and gateway (see [Updating](#updating)). |

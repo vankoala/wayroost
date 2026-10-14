@@ -65,7 +65,7 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const MAX_LISTED = 50;
 const MAX_WAITING_PER_CHAT = 5;
-/** Signalbox's own messages waiting for one chat (the task log keeps the rest until there's room). */
+/** Wayroost's own messages waiting for one chat (the task log keeps the rest until there's room). */
 const MAX_SYSTEM_WAITING_PER_CHAT = 10;
 const QUEUE_TTL_MS = HOUR;
 const POLL_MS = 3_000;
@@ -80,7 +80,7 @@ const STARTED_MEMORY_MS = 24 * HOUR;
 const MAX_STARTED_REMEMBERED = 200;
 const SLASH = /^\s*\//;
 
-/** Who is calling, from the wrapper's headers. Each id is only a claim, checked against the chats Signalbox knows. */
+/** Who is calling, from the wrapper's headers. Each id is only a claim, checked against the chats Wayroost knows. */
 export interface BridgeIdentity {
   /** X-Bridge-Paseo-Agent: the caller's Paseo agent id, when Paseo runs it. */
   paseoAgent?: string;
@@ -133,7 +133,7 @@ interface Queued {
   attempts: number;
   /** Reserved by an adapter; it cannot also become a wait's reply. */
   sending?: boolean;
-  /** Set for a message from Signalbox itself (see deliverSystem). */
+  /** Set for a message from Wayroost itself (see deliverSystem). */
   system?: SystemMessage;
 }
 
@@ -143,12 +143,12 @@ function queueOrder(a: Queued, b: Queued): number {
 }
 
 /**
- * Who queues Signalbox's own messages. Not a chat key ("hermes:…" or "paseo:…"),
+ * Who queues Wayroost's own messages. Not a chat key ("hermes:…" or "paseo:…"),
  * so no chat's wait_for_reply, loop breaker or rate limit ever matches it.
  */
-export const SYSTEM_CALLER = 'signalbox:system';
+export const SYSTEM_CALLER = 'wayroost:system';
 
-/** A message from Signalbox itself (the task log), not from an agent. */
+/** A message from Wayroost itself (the task log), not from an agent. */
 export interface SystemMessage {
   /** One per message: queuing the same key again while it waits changes nothing. */
   key: string;
@@ -350,10 +350,10 @@ export class Bridge {
     }
   }
 
-  // ---- Signalbox's own messages --------------------------------------------------
+  // ---- Wayroost's own messages --------------------------------------------------
 
   /**
-   * Queue a message from Signalbox itself. It goes out like any waiting message:
+   * Queue a message from Wayroost itself. It goes out like any waiting message:
    * oldest first, once the chat is idle with nothing waiting on the user and has
    * settled, never while the bridge is paused. Agents' rate limits and the loop
    * breaker are about agents, so they don't apply (the caller keeps its own).
@@ -365,7 +365,7 @@ export class Bridge {
     const key = chatKey(message.target);
     const queue = this.queues.get(key) ?? [];
     if (queue.some((m) => m.system?.key === message.key)) return 'already queued';
-    // A chat that stays busy mustn't pile up Signalbox's messages: the caller keeps them for later.
+    // A chat that stays busy mustn't pile up Wayroost's messages: the caller keeps them for later.
     if (queue.filter((m) => m.system).length >= MAX_SYSTEM_WAITING_PER_CHAT) return 'full';
     const now = this.now();
     queue.push({
@@ -373,7 +373,7 @@ export class Bridge {
       envelope: bridgeEnvelope(message.sender, message.text),
       text: message.text,
       callerKey: SYSTEM_CALLER,
-      callerLog: 'signalbox',
+      callerLog: 'wayroost',
       at: now,
       attempts: 0,
       system: message,
@@ -386,7 +386,7 @@ export class Bridge {
     return 'queued';
   }
 
-  /** Take back a waiting message from Signalbox itself (its news went stale). True if it was still waiting. */
+  /** Take back a waiting message from Wayroost itself (its news went stale). True if it was still waiting. */
   withdrawSystem(key: string): boolean {
     for (const [chat, queue] of [...this.queues]) {
       const index = queue.findIndex((m) => m.system?.key === key);
@@ -599,7 +599,7 @@ export class Bridge {
 
     const envelope = bridgeEnvelope(caller.label, args.text, caller.chat ? chatKey(caller.chat) : undefined);
     const waiting = this.queues.get(key);
-    // Only agents' messages count here: Signalbox's own never hold one back or use up the limit.
+    // Only agents' messages count here: Wayroost's own never hold one back or use up the limit.
     const agentsWaiting = waiting?.filter((m) => !m.system).length ?? 0;
     if (!agentsWaiting && fresh && this.ready(key, fresh, now)) {
       this.limits.record(caller.key, key, now);
@@ -899,7 +899,7 @@ export class Bridge {
 
   private identify(identity: BridgeIdentity, args: CommonArgs, conversations: ConversationSummary[]): Caller {
     const cwd = canonicalFolder(identity.cwd) ?? undefined;
-    // A claimed id counts only if it's a chat Signalbox knows; the Paseo one is checked first.
+    // A claimed id counts only if it's a chat Wayroost knows; the Paseo one is checked first.
     // A sub-agent (a Claude Code Task, a Hermes delegate_task run) acts as the chat that runs it.
     const claimed = (source: Source, id: string | undefined) => {
       const chat = id ? findChat(conversations, { source, id }) : undefined;
@@ -1081,7 +1081,7 @@ export class Bridge {
           if (!(await this.retargetQueued(key, queue, head))) continue;
           const source = this.options.sources[head.target.source];
           if (head.system && source.status().state !== 'connected') continue;
-          // Signalbox's own messages also reach an older chat the recent list leaves out.
+          // Wayroost's own messages also reach an older chat the recent list leaves out.
           const summary = await this.queuedSummary(key, queue, head);
           let now = this.now();
           // The queue may have changed while we looked (the loop breaker, a wait, a pause).
@@ -1141,7 +1141,7 @@ export class Bridge {
                 if (!queue.length) this.queues.delete(key);
               }
             }
-            // Signalbox's own messages aren't agents' activity, and nobody waits on their answer.
+            // Wayroost's own messages aren't agents' activity, and nobody waits on their answer.
             if (!head.system) this.delivered(head.callerKey, key, reservation.at);
             this.options.log.info({ caller: head.callerLog, target: key, waitedMs: now - head.at }, 'bridge delivered a waiting message');
             if (head.system) {
@@ -1200,7 +1200,7 @@ export class Bridge {
     this.tidy(now);
   }
 
-  /** Forget old bookkeeping, so memory stays bounded however long Signalbox runs. */
+  /** Forget old bookkeeping, so memory stays bounded however long Wayroost runs. */
   private tidy(now: number): void {
     for (const [key, last] of [...this.deliveries]) if (now - last.at > HOUR) this.deliveries.delete(key);
     for (const [key, at] of [...this.lastDelivered]) if (now - at > HOUR) this.lastDelivered.delete(key);

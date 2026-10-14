@@ -291,7 +291,7 @@ together, across Hermes and Paseo. It's off unless you turn it on.
 
 ```
  agent (Claude Code, OpenCode, pi, Hermes, a Paseo agent…)
-   └─ node /opt/signalbox/bin/signalbox-bridge.mjs     stdio MCP server, token from ~/.config/signalbox
+   └─ env WAYROOST_BRIDGE_NAME=wayroost node /opt/signalbox/bin/signalbox-bridge.mjs     stdio MCP server, token from ~/.config/wayroost
         └─ HTTP, Bearer token ──▶ bridge listener 127.0.0.1:19012 (inside the Wayroost server)
                                     └─ the same Hermes and Paseo adapters the app uses
 ```
@@ -300,7 +300,7 @@ together, across Hermes and Paseo. It's off unless you turn it on.
   and `start_chat`, scoped to the caller's project as the Projects view groups
   it.
 - **Who is calling:** a Paseo agent by the id Paseo gives it, and a Hermes chat
-  by its session id, which the `signalbox-identity` Hermes plugin adds to each
+  by its session id, which the `wayroost-identity` Hermes plugin adds to each
   call. Wayroost checks both against the chats it lists; anyone else is
   unverified.
 - **Messages** arrive labelled as coming from another agent, not from you,

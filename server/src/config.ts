@@ -130,6 +130,7 @@ const RawConfig = z
     bridge: z
       .object({
         enabled: z.boolean().default(false),
+        legacyNames: z.boolean().default(true),
         port: z.number().int().min(1).max(65535).default(DEFAULT_BRIDGE_PORT),
       })
       .strict()
@@ -280,7 +281,7 @@ export interface AppConfig {
   paseo: { enabled: boolean; url: string };
   safetyHelper?: { socket: string };
   /** The bridge listens on 127.0.0.1:<port> only. */
-  bridge: { enabled: boolean; port: number };
+  bridge: { enabled: boolean; port: number; legacyNames: boolean };
   /** The Connectors helper on 127.0.0.1:<port>. */
   helper: { enabled: boolean; port: number };
   /** Voice mode: the speech service's Unix socket. */
@@ -572,7 +573,7 @@ export function parseConfig(input: unknown, options: ParseOptions = {}): AppConf
     hermes: { enabled: raw.hermes.enabled, url: hermesUrl.origin, secretPrompts: raw.hermes.secretPrompts },
     paseo: { enabled: raw.paseo.enabled, url: raw.paseo.url.replace(/\/+$/, '') },
     ...(raw.safetyHelper ? { safetyHelper: raw.safetyHelper } : {}),
-    bridge: { enabled: raw.bridge.enabled, port: raw.bridge.port },
+    bridge: { enabled: raw.bridge.enabled, port: raw.bridge.port, legacyNames: raw.bridge.legacyNames },
     helper: { enabled: raw.helper.enabled, port: raw.helper.port },
     speech: { enabled: raw.speech.enabled, socket: raw.speech.socket, cloudSocket: raw.speech.cloudSocket },
     feed: { enabled: raw.feed.enabled },

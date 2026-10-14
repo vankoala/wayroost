@@ -20,7 +20,7 @@ server/src/
   bridge/               project bridge: loopback listener, tools, project scoping, limits, token
   feed/                 For you: the card store, the service (actions, proactivity level, notifications), Web Push
 bridge/                 signalbox-bridge.mjs, the stdio MCP server agents start for the bridge
-hermes-plugin/          signalbox-identity, the Hermes plugin that tells the bridge which Hermes chat is calling, and its tests
+hermes-plugin/          wayroost-identity, the Hermes plugin that tells the bridge which Hermes chat is calling, and its tests
 shared/protocol.ts      the contract between server and browser
 web/src/                React app (Vite): inbox, projects view, conversation, approvals, composer, "/" menu, attachments, model and mode chips, image viewer
   voice/                voice mode: mic and playback, cutting replies into sentences, reading them aloud
@@ -120,16 +120,19 @@ Every environment variable is listed in
 
 The Hermes plugin has its own tests, `hermes-plugin/tests/test_signalbox_identity.py`,
 in plain `unittest`; `npm test` and CI don't run them. They cover which calls
-get the session id and when the hook stays out of the way. Run them as the user
-Hermes runs as, through Hermes' launcher, so the tests that load the plugin
-through Hermes' own plugin manager run too:
+get the session id and when the hook stays out of the way. Set
+`HERMES_PLUGIN_TEST_PYTHON` to the explicit Python interpreter in an
+environment with Hermes installed. Use an isolated home; application
+launchers bootstrap the shared install and must not be used for tests.
 
 ```bash
-hermes --run-module unittest discover -s hermes-plugin/tests -v
+plugin_test_home="$(mktemp -d)"
+HERMES_HOME="$plugin_test_home" "$HERMES_PLUGIN_TEST_PYTHON" -B -m unittest discover -s hermes-plugin/tests -v
+rm -rf -- "$plugin_test_home"
 ```
 
-With plain `python3 -m unittest`, only the hook tests run and the rest are
-skipped.
+An interpreter without Hermes can run the hook tests, but the plugin-manager
+integration checks are skipped. A complete plugin acceptance run has no skips.
 
 The helper's tests (`helper/test_*.py`: skill syncing, the phone line status
 the busy counts rely on, and the shadow role) are plain `unittest` as well, and `npm test` doesn't run
@@ -152,7 +155,7 @@ launch, permission, an approval answered outside Wayroost, streaming,
 follow-up, stop, the agent's commands, files, a message sent while it works,
 the model, reasoning and mode pickers, reading the images it shows, and a
 daemon restart after which stored agents must not be woken. A fake `hermes`
-provider checks that the `signalbox.parent-hermes-chat` label comes back as the
+provider checks that the `wayroost.parent-hermes-chat` label comes back as the
 agent's parent, and that its alias is the ACP session id the fake agent
 reports, before and after that restart.
 

@@ -76,14 +76,15 @@ are gone, the installer doesn't start the service.
 | `paseo.enabled` | `true` | at least one source enabled | Turn off if you don't run Paseo. |
 | `paseo.url` | `ws://127.0.0.1:19007` | `ws://` or `wss://` loopback | The Paseo daemon (`/ws` is added if no path is given). |
 | `bridge.enabled` | `false` | | Turns on the [project bridge](bridge.md): a listener on `127.0.0.1` that agents use to reach the other chats in their project. |
+| `bridge.legacyNames` | `true` | boolean | Rename transition: accept `signalbox` alongside `wayroost`. Set false after the cutoff audit; see [finish/undo](bridge-names.md). |
 | `bridge.port` | `19012` | 1–65535, not `listen.port` and not 19011 | The bridge listener's port. It only ever binds to `127.0.0.1`. |
 | `speech.enabled` | `false` | | Turns on [voice mode](voice.md). `deploy/setup-speech.sh` sets it after installing the speech service. |
 | `speech.socket` | `/run/signalbox-speech.sock` | absolute path | The speech service's Unix socket. |
 | `feed.enabled` | `false` | | Turns on [For you](for-you.md): cards from Hermes' brief and daytime checks (posted through the bridge, so turn that on too), the proactivity and quiet-hours settings, and phone notifications (these need an `https://` `publicOrigin`). |
-| `notifications.timeZone` | this PC's own zone | an IANA name this PC's time-zone database knows (`Europe/Berlin`, `UTC`) | Whose clock the quiet hours in Settings → Notifications are read on, so an owner away from home keeps their own 21:00. Unset means the zone this PC is set to. See [Alerts](notifications.md). |
+| `notifications.timeZone` | this PC's own zone | an IANA name this PC's time-zone database knows (`Europe/Berlin`, `UTC`) | Whose clock the quiet hours in Settings → Notifications are read on, so an owner away from home keeps their own 21:00. Unset means the zone this PC is set to. In pipeline mode this field is ignored; use `timeZone` in [owner-held settings](wayroost-settings.md). See [Alerts](notifications.md). |
 | `supervisor.socket` | `/run/wayroost/supervisor.sock` | absolute path, at most 107 bytes | Status & power: the supervisor's Unix socket. Without a `supervisor` block the power API says the supervisor isn't running. |
 | `supervisor.keyFile` | none | absolute path | Development only, when `CREDENTIALS_DIRECTORY` is unset: a file holding the supervisor's server key. When the `supervisor` block is configured, a configured credentials directory must supply a readable, valid `supervisor-server-key`; otherwise startup is refused, even with a `keyFile`. Without a `supervisor` block, no supervisor credential is required. The credential wins when both are there; a `supervisor` block with neither is refused. |
-| `stateDir` | `/var/lib/wayroost` for primary; `/var/lib/wayroost-shadow` for shadow | absolute path, isolated by role | Private state: the saved Hermes sign-in, the Paseo client id, the bridge token, For you's cards and phone subscriptions, and Wayroost's own settings (notification rules and quiet hours, with their backups and audit log). Primary deployments carried over from Signalbox can keep `/var/lib/signalbox` (mode 700). |
+| `stateDir` | `/var/lib/wayroost` for primary; `/var/lib/wayroost-shadow` for shadow | absolute path, isolated by role | Private state: the saved Hermes sign-in, the Paseo client id, the bridge token, For you's cards and phone subscriptions, and legacy Wayroost preferences. In pipeline mode, preferences use the [owner-held settings target](wayroost-settings.md); the state folder retains operational cards, queues and journals. Primary deployments carried over from Signalbox can keep `/var/lib/signalbox` (mode 700). |
 | `staticDir` | next to the server bundle | absolute path | Built web assets. You won't normally set this. |
 
 The example leaves the bridge out, so it stays off. To turn it on, add:
@@ -228,7 +229,7 @@ passes instead of starting on its own. "Now" actions are not affected.
 | `PASEO_LOG` | `npm run check:paseo` | Log level of the Paseo daemon the compatibility harness starts. Default `silent`. |
 | `CHROME` | `npm run check:ui`, `scripts/e2e-local.ts`, `scripts/make-icons.mjs` | Path to Chrome. Default `/usr/bin/google-chrome`. |
 | `WAYROOST_BRIDGE_URL` | `signalbox-bridge.mjs` | The bridge listener. Default `http://127.0.0.1:19012`; anything that isn't `http://` on this machine is refused. `setup-bridge.sh` sets it when `bridge.port` isn't the default. |
-| `WAYROOST_BRIDGE_TOKEN_FILE` | `signalbox-bridge.mjs` | Where the agent's copy of the bridge token is. Default `~/.config/signalbox/bridge-token`. |
+| `WAYROOST_BRIDGE_TOKEN_FILE` | `signalbox-bridge.mjs` | Where the agent's copy of the bridge token is. Default `~/.config/wayroost/bridge-token`. |
 | `PASEO_AGENT_ID`, `PASEO_AGENT_CWD` | `signalbox-bridge.mjs` | Set by Paseo for the agents it runs: which agent is calling, and its folder. |
 
 All existing `SIGNALBOX_*` runtime variables are accepted as fallbacks to the
@@ -377,7 +378,7 @@ explicit config paths continue to work.
 | `/root/.cloudflared/<tunnel-id>.json` | root | The tunnel credential as cloudflared created it. `setup-tunnel.sh` copies it to `/etc/signalbox/tunnel-credentials.json`. |
 | `/var/lib/signalbox/` | service user, 700 | `devices.json` (600: paired devices, each with only a SHA-256 hash of its secret, and whether pairing is locked), `pairing/pair.sock` (600, in a 700 folder: the recovery socket `pair-code` uses), `hermes-credentials.json` (600), `paseo-client-id` (600), `bridge-token` (600) once the bridge has been on, and with For you on, `feed.json` (600: cards and settings) and `push.json` (600: the VAPID key and each device's push subscription). |
 | `/opt/signalbox/bin/signalbox-bridge.mjs` | root, 755 | The bridge's agent side, a stdio MCP server, installed by `install.sh`. |
-| `~/.config/signalbox/bridge-token` | your user, 600 (folder 700) | The agents' copy of the bridge token, written by `setup-bridge.sh`. |
+| `~/.config/wayroost/bridge-token` | your user, 600 (folder 700) | The agents' copy of the bridge token, written by `setup-bridge.sh`. |
 | `/opt/signalbox-speech/` | root, read-only to the service | Voice mode: the speech service's venv and models, from `setup-speech.sh`. Its program is `/opt/signalbox/bin/signalbox-speech.py`. |
 | `/run/signalbox-speech.sock` | root, group `signalbox-voice`, 660 | Voice mode: the speech service's socket, made by `signalbox-speech.socket`. |
 

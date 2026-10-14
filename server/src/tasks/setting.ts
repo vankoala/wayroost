@@ -16,10 +16,14 @@ export class WorkerUpdatesSetting {
   private readonly path: string;
   private value: Omit<WorkerUpdatesStatus, 'timeBoxes'>;
   private readonly observers = new Set<(status: WorkerUpdatesStatus) => void>();
+  private settingsSource?: () => Omit<WorkerUpdatesStatus, 'timeBoxes'>;
+  useSettingsSource(source: () => Omit<WorkerUpdatesStatus, 'timeBoxes'>): void { this.settingsSource = source; }
+  refreshSettings(): void { if (this.state() !== 'unknown') for (const observer of this.observers) observer(this.status()); }
 
-  constructor(stateDir: string) {
+  constructor(stateDir: string, pipeline = false) {
     this.path = join(stateDir, FILE);
-    this.value = this.load();
+    this.value = pipeline ? { enabled: false, defaultMinutes: DEFAULT_TIME_BOX_MINUTES } : this.load();
+    if (pipeline) this.settingsSource = () => ({ enabled: false, state: 'unknown', defaultMinutes: DEFAULT_TIME_BOX_MINUTES });
   }
 
   private load(): Omit<WorkerUpdatesStatus, 'timeBoxes'> {
@@ -36,15 +40,20 @@ export class WorkerUpdatesSetting {
   }
 
   status(): WorkerUpdatesStatus {
-    return { ...this.value, timeBoxes: [...WORKER_TIME_BOXES] };
+    return { ...(this.settingsSource ? this.settingsSource() : this.value), timeBoxes: [...WORKER_TIME_BOXES] };
   }
 
   enabled(): boolean {
-    return this.value.enabled;
+    return this.status().enabled;
+  }
+
+  state(): NonNullable<WorkerUpdatesStatus['state']> {
+    const status = this.status();
+    return status.state ?? (status.enabled ? 'verified-on' : 'verified-off');
   }
 
   defaultMinutes(): number {
-    return this.value.defaultMinutes;
+    return this.status().defaultMinutes;
   }
 
   /** Changes apply immediately, even while worker delivery is paused. */
@@ -54,6 +63,7 @@ export class WorkerUpdatesSetting {
   }
 
   update(patch: { enabled?: boolean; defaultMinutes?: number }): WorkerUpdatesStatus {
+    if (this.settingsSource) throw new Error('config_writes_off');
     checkDeviceSignal();
     const next = { ...this.value, ...patch };
     const tmp = `${this.path}.tmp`;

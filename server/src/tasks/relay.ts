@@ -5,7 +5,7 @@ import type { BridgeObserver, SystemMessage } from '../bridge/service.js';
 import { CardInput } from '../feed/store.js';
 import type { Logger } from '../hermes/adapter.js';
 import type { HermesMessageRow } from '../hermes/normalize.js';
-import { HERMES_PARENT_LABEL, providerLabel, type WorkerSnapshot } from '../paseo/normalize.js';
+import { HERMES_PARENT_LABEL, LEGACY_HERMES_PARENT_LABEL, providerLabel, type WorkerSnapshot } from '../paseo/normalize.js';
 import { homeRelative, str } from '../text.js';
 import { checkDeviceSignal, deviceSignal } from '../security/device-signal.js';
 import { backgroundStarts, launchedHere, readLaunchProof, type BackgroundProcess } from './launch-proof.js';
@@ -25,8 +25,9 @@ import { ENDED, WORKER_ID, type RelayRecord, type TaskRecord, type TaskState, ty
 // a claim; such a worker is shown nested, and nothing more. What a worker wrote
 // is only ever quoted ("> "), after the lines Signalbox wrote, and never logged.
 
-export const DUE_LABEL = 'signalbox.due-minutes';
-export const SENDER = 'Signalbox task log';
+export const DUE_LABEL = 'wayroost.due-minutes';
+export const LEGACY_DUE_LABEL = 'signalbox.due-minutes';
+export const SENDER = 'Wayroost task log';
 /** The launching chat's id from the worker's parent label. */
 const CHAT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -141,7 +142,7 @@ export function stateOf(snap: WorkerSnapshot): TaskState | undefined {
 }
 
 export function dueMinutesOf(labels: Readonly<Record<string, string>>): number | undefined {
-  const raw = str(labels[DUE_LABEL])?.trim();
+  const raw = str(labels[DUE_LABEL] ?? labels[LEGACY_DUE_LABEL])?.trim();
   if (!raw || !/^\d{1,4}$/.test(raw)) return undefined;
   const minutes = Number(raw);
   return minutes >= 1 && minutes <= 1440 ? minutes : undefined;
@@ -288,7 +289,7 @@ export class TaskRelay {
     // the record); the label is only needed to start one.
     let task = this.deps.store.get(snap.id);
     if (task) this.cleanup(task);
-    const chat = this.deps.store.bridgeChat(snap.id) ?? str(snap.labels[HERMES_PARENT_LABEL])?.trim() ?? '';
+    const chat = this.deps.store.bridgeChat(snap.id) ?? str(snap.labels[HERMES_PARENT_LABEL] ?? snap.labels[LEGACY_HERMES_PARENT_LABEL])?.trim() ?? '';
     if (!task && (!chat || !CHAT_ID.test(chat) || !WORKER_ID.test(snap.id))) return undefined;
     const state = stateOf(snap);
     if (!task) {
@@ -632,7 +633,7 @@ export class TaskRelay {
   /** Off means observed updates and due nudges stay suppressed, even if the switch comes back on. */
   private suppressDisabledUpdate(task: TaskRecord): void {
     checkDeviceSignal();
-    if (this.deps.setting.enabled()) return;
+    if (this.deps.setting.state() !== 'verified-off') return;
     let changed = false;
     const update = this.currentUpdate(task);
     if (update && !task.relays.some((r) => r.id === update)) {
@@ -660,7 +661,7 @@ export class TaskRelay {
 
   /** The off event cancels queued news independently of chat readiness and bridge pause. */
   private suppressDisabledUpdates(): void {
-    if (this.deps.setting.enabled()) return;
+    if (this.deps.setting.state() !== 'verified-off') return;
     // Withdraw pending relay posts and durably save suppression when updates turn off.
     for (const task of this.deps.store.all()) this.suppressDisabledUpdate(task);
     this.deps.store.save();
@@ -701,7 +702,8 @@ export class TaskRelay {
   private async decide(task: TaskRecord, due: Due): Promise<void> {
     checkDeviceSignal();
     const now = this.now();
-    if (!this.deps.setting.enabled()) {
+    if (this.deps.setting.state() === 'unknown') return;
+    if (this.deps.setting.state() === 'verified-off') {
       task.relays.push({ id: due.relay, kind: due.kind, attempts: 0, skipped: 'switched off' });
       this.deps.store.changed();
       return;
@@ -788,6 +790,12 @@ export class TaskRelay {
     checkDeviceSignal();
     this.suppressDisabledUpdate(task);
     if (relay.skipped) return;
+    if (this.deps.setting.state() !== 'verified-on') {
+      // An unqueued record has no resend path; offer it again after settings recover.
+      if (relay.queuedAt === undefined) task.relays = task.relays.filter((r) => r !== relay);
+      this.deps.store.changed();
+      return;
+    }
     if (!this.deps.chats.connected()) {
       if (relay.queuedAt === undefined) task.relays = task.relays.filter((r) => r !== relay);
       this.deps.store.changed();
@@ -853,7 +861,8 @@ export class TaskRelay {
         if (!this.deps.workers.agentsLoaded || this.staleSince.has(task.id)) return false;
         const snap = this.deps.workers.workerSnapshot(task.id);
         if (snap && stateOf(snap) !== task.status) return false;
-        if (!this.deps.setting.enabled()) {
+        if (this.deps.setting.state() === 'unknown') return false;
+        if (this.deps.setting.state() === 'verified-off') {
           relay.skipped = 'switched off';
           this.deps.store.changed();
           return false;
@@ -912,6 +921,7 @@ export class TaskRelay {
 
   /** Updates handed over before but never delivered (a restart, a drop): hand them over again. */
   private async resend(task: TaskRecord): Promise<void> {
+    if (this.deps.setting.state() === 'unknown') return;
     for (const relay of task.relays) {
       checkDeviceSignal();
       if (!relay.queuedAt || relay.deliveredAt || relay.skipped) continue;
@@ -921,7 +931,8 @@ export class TaskRelay {
         this.deps.store.changed();
         continue;
       }
-      if (!this.deps.setting.enabled()) {
+      if (this.deps.setting.state() === 'unknown') return;
+      if (this.deps.setting.state() === 'verified-off') {
         relay.skipped = 'switched off';
         this.deps.store.changed();
         continue;

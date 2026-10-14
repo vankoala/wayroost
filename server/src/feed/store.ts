@@ -89,13 +89,18 @@ const SettingsShape = z.object({
 const idFor = (key: string) => createHash('sha256').update(key).digest('hex').slice(0, 16);
 
 export class FeedStore {
+  private privatePreferencesDisabled = false;
+  private legacySettings?: { value: unknown };
+  disablePrivatePreferences(): void { this.privatePreferencesDisabled = true; }
   private file: FeedFile;
   private readonly path: string;
 
   constructor(
     stateDir: string,
     private readonly now: () => number = Date.now,
+    ownerPreferences = false,
   ) {
+    this.privatePreferencesDisabled = ownerPreferences;
     this.path = join(stateDir, FILE);
     this.file = this.load();
   }
@@ -103,14 +108,16 @@ export class FeedStore {
   private load(): FeedFile {
     try {
       const raw = JSON.parse(readFileSync(this.path, 'utf8')) as Partial<FeedFile>;
-      const settings = SettingsShape.safeParse(raw.settings ?? {});
+      if (Object.hasOwn(raw, 'settings')) this.legacySettings = { value: raw.settings };
+      const settings = this.privatePreferencesDisabled ? undefined : SettingsShape.safeParse(raw.settings ?? {});
       return {
         cards: Array.isArray(raw.cards) ? raw.cards.filter((c) => c && typeof c.key === 'string') : [],
-        settings: settings.success ? settings.data : { ...DEFAULT_SETTINGS },
+        settings: this.privatePreferencesDisabled ? { ...DEFAULT_SETTINGS, level: 'off', lessLike: [] }
+          : settings?.success ? settings.data : { ...DEFAULT_SETTINGS },
         notified: Array.isArray(raw.notified) ? raw.notified.filter((n) => typeof n === 'string') : [],
       };
     } catch {
-      return { cards: [], settings: { ...DEFAULT_SETTINGS, lessLike: [] }, notified: [] };
+      return { cards: [], settings: { ...DEFAULT_SETTINGS, ...(this.privatePreferencesDisabled ? { level: 'off' as const } : {}), lessLike: [] }, notified: [] };
     }
   }
 
@@ -118,7 +125,9 @@ export class FeedStore {
     checkDeviceSignal();
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.file), { mode: 0o600 });
+    const { settings: _settings, ...operational } = this.file;
+    writeFileSync(tmp, JSON.stringify(this.privatePreferencesDisabled
+      ? { ...operational, ...(this.legacySettings ? { settings: this.legacySettings.value } : {}) } : this.file), { mode: 0o600 });
     renameSync(tmp, this.path);
   }
 
@@ -260,6 +269,7 @@ export class FeedStore {
   }
 
   updateSettings(patch: Partial<StoredSettings>): StoredSettings {
+    if (this.privatePreferencesDisabled) throw new Error('config_writes_off');
     checkDeviceSignal();
     this.file.settings = { ...this.file.settings, ...patch };
     this.save();
@@ -267,6 +277,7 @@ export class FeedStore {
   }
 
   addLessLike(topic: string, example: string): void {
+    if (this.privatePreferencesDisabled) throw new Error('config_writes_off');
     checkDeviceSignal();
     const clean = oneLine(topic, 40);
     if (!clean) return;
@@ -279,6 +290,7 @@ export class FeedStore {
   }
 
   removeLessLike(topic: string): void {
+    if (this.privatePreferencesDisabled) throw new Error('config_writes_off');
     checkDeviceSignal();
     const before = this.file.settings.lessLike.length;
     this.file.settings.lessLike = this.file.settings.lessLike.filter(

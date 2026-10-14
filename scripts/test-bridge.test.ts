@@ -98,7 +98,7 @@ class Client {
   private nextId = 1;
 
   constructor(env: Record<string, string>, cwd?: string) {
-    this.child = spawn(process.execPath, [WRAPPER], { env, cwd, stdio: 'pipe' });
+    this.child = spawn(process.execPath, [WRAPPER], { env: { WAYROOST_BRIDGE_NAME: 'wayroost', ...env }, cwd, stdio: 'pipe' });
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', (chunk: string) => {
       this.buffer += chunk;
@@ -250,7 +250,7 @@ describe('signalbox-bridge.mjs over stdio', () => {
     const init = await client.initialize('2025-06-18');
     expect(init.result.protocolVersion).toBe('2025-06-18');
     expect(init.result.capabilities).toEqual({ tools: { listChanged: false } });
-    expect(init.result.serverInfo).toMatchObject({ name: 'signalbox', title: 'Wayroost', version: VERSION });
+    expect(init.result.serverInfo).toMatchObject({ name: 'wayroost', title: 'Wayroost', version: VERSION });
     expect(init.result.instructions).toMatch(/other AI agents/);
     expect(init.result.instructions).toMatch(/approvals always stay with the user/);
 
@@ -404,6 +404,28 @@ describe('signalbox-bridge.mjs over stdio', () => {
     ]);
   });
 
+  it('maps both hidden caller names to the same identity and refuses legacy or conflicting identities', async () => {
+    const fake = await signalbox(() => ok({ delivered: 'now' }));
+    const session = '00000000_000000_fixture';
+    const hermes = start({ WAYROOST_BRIDGE_URL: fake.url, PASEO_AGENT_ID: '${PASEO_AGENT_ID}' });
+    for (const key of ['_wayroost_caller', '_signalbox_caller']) {
+      expect((await hermes.call('list_chats', { [key]: session })).isError).toBeUndefined();
+    }
+    expect(fake.seen.map(call => call.headers['x-bridge-hermes-session'])).toEqual([session, session]);
+    expect(fake.seen.map(call => call.headers['x-bridge-name'])).toEqual(['wayroost', 'signalbox']);
+    for (const call of fake.seen) expect(call.body).toEqual({ backend_hint: 'hermes' });
+    expect((await hermes.call('list_chats', { _wayroost_caller: session, _signalbox_caller: 'forged' })).isError).toBe(true);
+    const strict = start({ WAYROOST_BRIDGE_URL: fake.url, WAYROOST_BRIDGE_LEGACY_NAMES: 'false', PASEO_AGENT_ID: '${PASEO_AGENT_ID}' });
+    expect((await strict.call('list_chats', { _signalbox_caller: session })).isError).toBe(true);
+    expect((await strict.call('list_chats', { _wayroost_caller: session })).isError).toBeUndefined();
+    const alias = start({ WAYROOST_BRIDGE_URL: fake.url, WAYROOST_BRIDGE_NAME: 'signalbox' });
+    expect((await alias.initialize()).result.serverInfo.name).toBe('signalbox');
+    expect((await alias.call('list_chats')).isError).toBeUndefined();
+    const disabledAlias = start({ WAYROOST_BRIDGE_URL: fake.url, WAYROOST_BRIDGE_NAME: 'signalbox', WAYROOST_BRIDGE_LEGACY_NAMES: 'false' });
+    expect((await disabledAlias.call('list_chats')).isError).toBe(true);
+    expect(fake.seen).toHaveLength(4);
+  });
+
   it("passes the Hermes plugin's caller id on as a header only when Hermes started the wrapper", async () => {
     const fake = await signalbox(() => ok({ delivered: 'now' }));
     const session = '20260928_101500_a1b2c3';
@@ -516,7 +538,7 @@ describe('signalbox-bridge.mjs over stdio', () => {
     try {
       const client = start({ SIGNALBOX_BRIDGE_URL: fake.url, HOME: empty });
       expect(text(await client.call('send_message', { chat: 'paseo:a', text: 'hi' }))).toMatch(
-        /no token in ~\/\.config\/signalbox\/bridge-token/,
+        /no token in ~\/\.config\/wayroost\/bridge-token/,
       );
       await client.close();
     } finally {

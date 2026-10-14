@@ -51,7 +51,7 @@ export interface TranscriptItem {
   text: string;
   /** For role "agent": who sent it. */
   from?: string;
-  /** For role "agent": the sender's chat, when Signalbox knew it. */
+  /** For role "agent": the sender's chat, when Wayroost knew it. */
   reply_to?: string;
 }
 

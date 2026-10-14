@@ -36,16 +36,19 @@ sys.path.insert(0, str(_runtime_dir))
 try:
     if not (_runtime_dir / "wayroost_runtime.py").is_file():
         raise ImportError("Wayroost runtime is missing")
-    from wayroost_runtime import BackgroundGate, bridge_url, env as runtime_env  # noqa: E402
+    from wayroost_runtime import BackgroundGate, bridge_url, bridge_token_file, env as runtime_env  # noqa: E402
 except ImportError:
     BackgroundGate = None
     bridge_url = None
+
+    def bridge_token_file():
+        return os.path.expanduser("~/.config/wayroost/bridge-token")
 
     def runtime_env(suffix, default=None, environ=None):
         environ = os.environ if environ is None else environ
         return environ.get(f"WAYROOST_{suffix}", environ.get(f"SIGNALBOX_{suffix}", default))
 
-TOKEN_FILE = runtime_env("BRIDGE_TOKEN_FILE") or os.path.expanduser("~/.config/signalbox/bridge-token")
+TOKEN_FILE = runtime_env("BRIDGE_TOKEN_FILE") or bridge_token_file()
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 HERMES_ID = re.compile(r"\d{8}_\d{6}_[0-9A-Za-z]{1,64}")
 EVENTS = {"SessionStart": "start", "UserPromptSubmit": "prompt", "Stop": "stop", "SessionEnd": "end"}
@@ -113,7 +116,7 @@ def post(body):
     if not re.fullmatch(r"[A-Za-z0-9_-]{32,512}", token):
         return
     request = urllib.request.Request(f"{url}/bridge/v1/note_run", data=json.dumps(body).encode(), method="POST",
-                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}", "X-Bridge-Name": "wayroost"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback only, never a proxy
     with opener.open(request, timeout=1.0) as response:
         response.read()

@@ -34,4 +34,16 @@ describe('readableBridgeText', () => {
     expect(parseBridgeEnvelope(envelope)).toEqual({ sender, text: 'Can you skim the release notes for session fixes?' });
     expect(parseBridgeEnvelope('[Message from someone] hi')).toBeNull();
   });
+
+  it('emits Wayroost names and keeps historical envelopes and reply addresses readable', () => {
+    const current = bridgeEnvelope(sender, 'fixture', 'paseo:demo');
+    expect(current).toContain('via Wayroost');
+    expect(current).toContain('Wayroost send_message');
+    const legacy = current.replaceAll('Wayroost', 'Signalbox');
+    expect(parseBridgeEnvelope(legacy)).toEqual(parseBridgeEnvelope(current));
+    for (const message of [current, legacy]) {
+      expect(readableBridgeText(oneLine(message, 1000))).toBe(`${sender}: fixture`);
+      expect(readableBridgeText(oneLine(message, 140))).toBe(`Message from ${sender}`);
+    }
+  });
 });

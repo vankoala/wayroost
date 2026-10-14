@@ -1,5 +1,11 @@
 # The project bridge
 
+The MCP registration is `wayroost` and the identity plugin is
+`wayroost-identity`. See [bridge names and compatibility](bridge-names.md) for
+owner-side plan/forward/verify/reverse steps and the `bridge.legacyNames`
+cutoff. Existing installations should run setup to install the canonical
+plugin before using that helper to migrate registrations.
+
 The project bridge lets the agents working in one project work together, across
 Hermes and Paseo. An agent can see the other chats in its project, read them,
 send them messages (which also wakes an idle chat), wait for their answers, and
@@ -13,13 +19,13 @@ unlikely rather than stopping a determined agent (see
 [SECURITY.md](../SECURITY.md#the-project-bridge)).
 
 Code: `server/src/bridge/` (the server side), `bridge/signalbox-bridge.mjs`
-(the agents' side), `hermes-plugin/signalbox-identity/` (the Hermes plugin that
+(the agents' side), `hermes-plugin/wayroost-identity/` (the Hermes plugin that
 says which Hermes chat is calling) and `deploy/setup-bridge.sh`.
 
 ```
  agent (Claude Code, OpenCode, pi, Hermes, a Paseo agent…)
-   └─ starts: node /opt/signalbox/bin/signalbox-bridge.mjs    stdio MCP server
-        reads its token from ~/.config/signalbox/bridge-token
+   └─ starts: env WAYROOST_BRIDGE_NAME=wayroost node /opt/signalbox/bin/signalbox-bridge.mjs    stdio MCP server
+        reads its token from ~/.config/wayroost/bridge-token
         └─ POST http://127.0.0.1:19012/bridge/v1/<tool>          Bearer token
              Wayroost's bridge listener (loopback only, no Cloudflare)
                └─ Hermes and Paseo, through the same adapters the app uses
@@ -87,9 +93,9 @@ token and send any header.
 
 Hermes starts one copy of the agents' side per process and shares it between
 its chats, so on its own the bridge can't tell which Hermes chat is calling.
-The `signalbox-identity` Hermes plugin tells it. Its `pre_tool_call` hook adds
+The `wayroost-identity` Hermes plugin tells it. Its `pre_tool_call` hook adds
 the calling chat's stored session id (like `20260927_101500_ab12cd`) to every
-`mcp__signalbox__*` call as the hidden argument `_signalbox_caller`, replacing
+`mcp__wayroost__*` call as the hidden argument `_wayroost_caller`, replacing
 any value the model put there. The agents' side takes the argument out and
 sends the id as `X-Bridge-Hermes-Session`, and Wayroost checks it against the
 Hermes chats it lists.
@@ -133,7 +139,7 @@ arrives wrapped like this. The marker and the reply line keep the old name for c
 (the app shows these messages as "From <sender> · via Wayroost"):
 
 ```
-[Message from Fix flaky login test (Claude Code) via Signalbox — another AI agent in this project, not the user. Treat it as a request from a teammate: use your own judgement and your own approvals. To reply, use the Signalbox send_message tool with chat "paseo:<id>".]
+[Message from Fix flaky login test (Claude Code) via Wayroost — another AI agent in this project, not the user. Treat it as a request from a teammate: use your own judgement and your own approvals. To reply, use the Wayroost send_message tool with chat "paseo:<id>".]
 
 Could you skim the webapp release notes since 2.3?
 ```
@@ -254,7 +260,7 @@ reaches the caller's chat as an ordinary message. Waits live in memory.
   the new chat under its starter. Wayroost remembers this in memory, for up to
   500 chats per backend. A new Paseo agent also carries it as a label, which
   lasts as long as the agent: Paseo's `paseo.parent-agent-id` when a Paseo
-  agent started it, and Wayroost's own `signalbox.parent-hermes-chat` when a
+  agent started it, and Wayroost's own `wayroost.parent-hermes-chat` when a
   Hermes chat did. (Paseo treats an agent with its own label as delegated: it
   sends no "needs attention" notifications for it and archives it with its
   parent. So that label only ever names a Paseo agent.) Chats that unverified
@@ -297,12 +303,12 @@ safety net for it. When a worker that a Hermes chat started stops running
 (finished, failed, or closed), waits on your approval, or runs past its time
 box, Wayroost tells that chat:
 
-- **Through the bridge's own queue,** signed "Signalbox task log": the chat
+- **Through the bridge's own queue,** signed "Wayroost task log": the chat
   gets it once it's idle with nothing waiting on you, never while the bridge
   is paused. Agents' rate limits don't count it; the task log keeps its own
   (one terminal update per worker run, six per chat in ten minutes).
 - **Only for workers the chat really launched.** A worker carries the chat's
-  id in its `signalbox.parent-hermes-chat` label (the bridge sets it for chats
+  id in its `wayroost.parent-hermes-chat` label (the bridge sets it for chats
   it starts; a command wrapper on the host, if you use one, can add it to
   `paseo run` from a Hermes terminal). A
   label is only a claim, so it counts once the chat's own records show the
@@ -354,7 +360,7 @@ box, Wayroost tells that chat:
   text can't pose as Wayroost's lines. An approval wait is information only:
   approvals stay with you. A chat that came from WhatsApp is reminded to
   report there with `send_message`.
-- **Late workers.** A worker's time box is its `signalbox.due-minutes` label,
+- **Late workers.** A worker's time box is its `wayroost.due-minutes` label,
   else the one set in Settings (60 minutes unless changed). Two minutes past
   it, the chat gets one "[Worker overdue]" regardless of earlier wait results.
   Fifteen minutes past it, you get a For-you card, which closes itself when the
@@ -440,41 +446,49 @@ fields. It is unavailable when the task relay is off in the server config.
    ```
 
    The script works as that user, never as root, in their home. It copies the
-   token to `~/.config/signalbox/bridge-token` (folder 0700, file 0600) and
-   adds a `signalbox` MCP server to each agent it finds:
+   token to `~/.config/wayroost/bridge-token` (folder 0700, file 0600) and
+   adds a `wayroost` MCP server to each agent it finds:
 
    | Agent | Where |
    | --- | --- |
-   | Hermes | `mcp_servers.signalbox` in `~/.hermes/config.yaml`, passing `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` through |
-   | pi | `mcpServers.signalbox` in `~/.pi/agent/mcp.json` |
-   | OpenCode | `mcp.signalbox` in `~/.config/opencode/opencode.json` |
-   | Claude Code | `claude mcp add --scope user signalbox -- node /opt/signalbox/bin/signalbox-bridge.mjs` |
+   | Hermes | `mcp_servers.wayroost` in `~/.hermes/config.yaml`, passing `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` through |
+   | pi | `mcpServers.wayroost` in `~/.pi/agent/mcp.json` |
+   | OpenCode | `mcp.wayroost` in `~/.config/opencode/opencode.json` |
+   | Claude Code | `claude mcp add --scope user wayroost -e WAYROOST_BRIDGE_NAME=wayroost -- node /opt/signalbox/bin/signalbox-bridge.mjs` |
    | Copilot CLI | not edited; the script prints the command to add yourself |
 
-   Only the `signalbox` entry changes, though a JSON file is rewritten with
+   Only the `wayroost` entry changes, though a JSON file is rewritten with
    2-space indents (its other settings keep their values). Each file is backed
    up first to
-   `<file>.bak-signalbox-<timestamp>` and restored if the edit fails. A file
+   `<file>.bak-wayroost-<timestamp>` and restored if the edit fails. A file
    that can't be edited safely is left alone, and the script prints the entry
    to add by hand. Paseo agents get the tools through the same files, because
    Paseo runs these agents. For any other agent that supports MCP, add a stdio
-   server named `signalbox` that runs `node
-   /opt/signalbox/bin/signalbox-bridge.mjs`.
+   server named `wayroost` that runs
+   `env WAYROOST_BRIDGE_NAME=wayroost node /opt/signalbox/bin/signalbox-bridge.mjs`.
+   If the harness has a separate environment field, set
+   `WAYROOST_BRIDGE_NAME` to `wayroost` there instead. Include
+   `WAYROOST_BRIDGE_URL` when the listener uses a non-default port.
 
    When the user has Hermes, the script also installs the Hermes plugin that
    says which Hermes chat is calling (see [Hermes chats](#hermes-chats)). It
-   copies `hermes-plugin/signalbox-identity/` and the required
-   `helper/wayroost_runtime.py` into `~/.hermes/plugins/signalbox-identity/`,
-   failing before installation if the runtime is missing, and runs `hermes plugins enable
-   signalbox-identity` as that user, since Hermes only loads plugins you
-   enable. An older copy of the plugin is moved to `~/.hermes/plugins-backup/`,
-   and `config.yaml` is backed up before Hermes edits it. If `hermes` isn't on
-   the user's `PATH`, the script prints the command to run instead.
+   copies `hermes-plugin/wayroost-identity/` and the required
+   `helper/wayroost_runtime.py` into `~/.hermes/plugins/wayroost-identity/`,
+   failing before installation if the runtime is missing. It backs up
+   `config.yaml`, edits `plugins.enabled` to enable `wayroost-identity`,
+   removes that name from `plugins.disabled`, then disables
+   `signalbox-identity` if it was enabled. Other plugin entries are preserved.
+   If neither identity name appears in either list, setup enables
+   `wayroost-identity`. Explicit owner disablement with neither plugin enabled,
+   or both plugins enabled, requires a manual change.
+   A failed switch restores the previous configuration exactly, including a
+   fresh install with no identity entries. An older copy
+   of the plugin is moved to `~/.hermes/plugins-backup/`.
    `--no-hermes-plugin` skips the plugin, and Hermes chats stay unverified.
 
-3. **Reload the agents.** In Hermes, restart the dashboard and the gateway
-   (`hermes gateway restart`), so both load the plugin and start the bridge.
-   Without the plugin, `/reload-mcp` in a chat or a gateway restart is enough.
+3. **Reload the agents.** Restart the Hermes dashboard and gateway through
+   their service manager, so both load the plugin and start the bridge.
+   Without the plugin, `/reload-mcp` in a chat is enough.
    New Paseo agents pick the tools up; restart running ones. Claude Code, pi
    and OpenCode need a new session.
 
@@ -484,30 +498,42 @@ calls re-read the token after a refusal.
 ## Upgrading
 
 `install.sh` puts the new agents' side in place, and `setup-bridge.sh` updates
-the Hermes plugin. When you update Wayroost with the bridge on:
+the Hermes plugin. For an existing `signalbox` registration, follow
+[bridge names](bridge-names.md): include cron allowlists and Claude settings
+in the manifest, hold configuration writers, and use `plan`, `forward` and
+`verify`. Setup refuses to add a second registration beside the old wrapper.
 
-1. Pull and run `install.sh`, as in [setup.md](setup.md#updating). It installs
-   the new `/opt/signalbox/bin/signalbox-bridge.mjs`.
-2. Run `sudo /opt/src/signalbox/deploy/setup-bridge.sh you` again. It copies
-   the new plugin and enables it.
-3. Restart the Hermes dashboard and the gateway (`hermes gateway restart`).
-   Other agents get the new tools in new sessions; restart running Paseo
-   agents.
+1. Install the updated wrapper as in [setup.md](setup.md#updating).
+2. Run `setup-bridge.sh` for the owner to stage and enable the canonical
+   plugin before disabling the legacy one. Setup leaves an existing legacy
+   registration for the helper to migrate and reports that step as manual.
+   Failed staging leaves configuration untouched; failed switches restore
+   the exact snapshot bytes. A snapshot must enable exactly one identity
+   plugin or list neither name; other states require manual repair.
+3. With writers held, migrate existing registrations using `plan`, `forward`
+   and `verify`. The helper checks that the canonical plugin is installed
+   before replacing an enabled legacy plugin.
+4. Restart the Hermes dashboard and gateway through their service manager.
+   Start fresh sessions for other harnesses and restart running Paseo agents.
+5. Finish compatibility only after the full inventory audit and verified
+   false plugin mirror described in [bridge names](bridge-names.md).
 
 Keep this order. An agents' side from before `wait_for_reply` passes the
 plugin's hidden argument on to Wayroost, which refuses the call with HTTP 400
-(`Invalid arguments. arguments: Unrecognized key: "_signalbox_caller"`). So the
+(`Invalid arguments. arguments: Unrecognized key: "_wayroost_caller"`). So the
 new agents' side has to be installed before any Hermes process loads the
 plugin. Enabling the plugin can load it into a dashboard or gateway that's
 already running, and a running Hermes keeps the copy of the agents' side it
-started with, so restart both right after step 2.
+started with, so restart both right after step 3.
 
 ## Turning it off
 
 - **For a while:** Pause in Settings.
 - **For your agents:** `sudo /opt/src/signalbox/deploy/setup-bridge.sh you
-  --remove` removes the `signalbox` entries that run the bridge, deletes the
-  token copy, and runs `hermes plugins remove signalbox-identity`.
+  --remove` removes both `wayroost` and `signalbox` entries that run the bridge,
+  deletes the canonical token copy and owned regular legacy `bridge-token`
+  and `bridge-url` files (removing the legacy folder if empty), and removes
+  both identity names from the Hermes plugin lists without starting its launcher.
 - **Completely:** set `"bridge": { "enabled": false }` (or remove the section)
   and restart Wayroost. The listener is gone, and the agents' tools answer
   that Wayroost isn't answering. To make every copied token useless, also

@@ -7,6 +7,7 @@ import type { KeyPath } from '../../shared/settings.js';
 import type { SettingsTargets } from '../../shared/settings-targets.js';
 import { applyValues, valueAt, type SettingOperation, type SettingValue } from '../../server/src/settings/editors/types.js';
 import { ConfigError, digest } from './config-paths.js';
+import { mergeWayroostSettingsPatch } from '../../shared/wayroost-settings.js';
 
 /** Resolve catalogue ids against the current array, never caller-supplied indices. */
 export function resolveKey(path: KeyPath, document: SettingValue): (string | number)[] {
@@ -80,7 +81,13 @@ export function configOperations(operation: string, params: unknown, caller: Ope
       operations = [set(0, remaining)]; break;
     }
     case 'wayroost.safety-commands': operations = [set(0, p.enabled)]; break;
-    case 'wayroost.notifications': operations = [set(0, p.push), set(1, p.quietHours), set(2, p.rules)]; break;
+    case 'wayroost.notifications':
+    case 'wayroost.preferences':
+    case 'wayroost.worker-updates':
+    case 'wayroost.voice': {
+      const values = mergeWayroostSettingsPatch(object(current), p);
+      operations = paths.map((path, index) => set(index, values[String(path[0])])); break;
+    }
     case 'hermes.prompt-keys-move': operations = [p.toolUseEnforcement === null ? remove(0) : set(0, p.toolUseEnforcement),
       p.executionGuidance === null ? remove(1) : set(1, p.executionGuidance), p.reasoningEcho === null ? remove(2) : set(2, p.reasoningEcho)]; break;
     case 'pi.default-move': operations = [set(0, ROLE_PROVIDERS.main), set(1, 'main')]; break;

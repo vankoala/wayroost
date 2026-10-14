@@ -11,6 +11,13 @@ The first public release, to be tagged 0.1.0.
 
 ### Added
 
+- The bridge now registers as `wayroost`, with Hermes plugin
+  `wayroost-identity`. `bridge.legacyNames` controls compatibility with
+  the old names. Owner tooling migrates registrations and permission
+  references, verifies them semantically, audits cutoff, and reverses
+  the change while preserving unrelated later settings. See
+  [bridge names](docs/bridge-names.md).
+
 - **Worker updates** (see docs/bridge.md#worker-updates): when a Paseo worker
   that a Hermes chat started stops running, waits on your approval, or runs
   past its time box, Wayroost tells that chat

@@ -53,7 +53,8 @@ import {
   type WorkerUpdatesStatus,
 } from '../../../shared/protocol';
 import type { WorkerApprovalsStatus } from '../../../shared/safety';
-import { api, refreshList, reportTidy } from '../api';
+import { api, ApiError, refreshList, reportTidy } from '../api';
+import { settingsErrorText } from '../settingsModel.js';
 import { captureRollout, getRolloutGeneration, getState, setState, toast, useStore } from '../store.js';
 import { readMessage, setVoiceSettings, setVoiceStatus, SPEEDS, useVoiceSettings, useVoiceStatus } from '../voice';
 import { navigate, settingsPath } from '../router';
@@ -243,6 +244,7 @@ const timeBoxLabel = (m: number) => (m < 60 ? `${m} min` : m % 60 ? `${Math.floo
 function WorkerUpdatesSettings() {
   const desktop = useStore((s) => s.device?.kind === 'desktop');
   const [status, setStatus] = useState<WorkerUpdatesStatus | null>(null);
+  const [unavailable, setUnavailable] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -251,14 +253,16 @@ function WorkerUpdatesSettings() {
       (s) => {
         if (live) setStatus(s);
       },
-      () => {}, // no task log here (or an older server): no rows
+      (error: unknown) => {
+        if (live && error instanceof ApiError && error.status !== 404) setUnavailable(error.message);
+      },
     );
     return () => {
       live = false;
     };
   }, []);
 
-  if (!status) return null;
+  if (!status) return unavailable ? <div className="kv"><div className="grow"><div>Worker updates unavailable</div><p role="status" className="muted">{unavailable}</p></div></div> : null;
 
   const save = async (patch: { enabled?: boolean; defaultMinutes?: number }) => {
     if (!desktop) return;
@@ -420,11 +424,12 @@ function CloudAgentsSettings() {
  * /skills approval and /debug may run from Signalbox. Turning it on asks first;
  * turning it off doesn't. Hidden where the server has no Hermes.
  */
-function SafetyCommandsSettings() {
+export function SafetyCommandsSettings() {
   const writable = useStore(s => s.rollout?.settingsPages === true);
   const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
   const desktop = useStore((s) => s.device?.kind === 'desktop');
   const [status, setStatus] = useState<SafetyCommandsStatus | null>(null);
+  const [unavailable, setUnavailable] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState<ReturnType<typeof captureRollout> | null>(null);
 
@@ -435,9 +440,11 @@ function SafetyCommandsSettings() {
     const rollout = captureRollout(...(writable ? ['settingsPages' as const] : []));
     api.safetyCommands().then(
       (s) => {
-        if (live && rollout.still()) setStatus(s);
+        if (live && rollout.still()) { setStatus(s); setUnavailable(null); }
       },
-      () => {}, // Hermes is off, or an older server: no row
+      (error: unknown) => {
+        if (live && rollout.still()) { setStatus(null); setUnavailable(error instanceof Error ? error.message : 'Settings could not be read.'); }
+      },
     );
     return () => {
       live = false;
@@ -462,6 +469,7 @@ function SafetyCommandsSettings() {
   };
 
   if (!status) {
+    if (unavailable) return <div className="kv"><ShieldCheck size={18} /><div className="grow"><div>Safety commands unavailable</div><p role="status" className="muted">{unavailable}</p></div></div>;
     return (
       <div className="kv">
         <ShieldCheck size={18} />
@@ -1044,6 +1052,7 @@ function VoiceSettings({ loadCloud = false }: { loadCloud?: boolean }) {
     return () => { active = false; };
   }, [loadCloud, status?.enabled, status?.canChange]);
   if (!status?.enabled) return null;
+  if (status.settingsUnavailable) return <><div className="group-title">Voice settings unavailable</div><div className="group"><p role="status" className="muted">{settingsErrorText(status.settingsUnavailable)}</p></div></>;
   const previewLocal = (next: string) => readMessage('settings', sampleLine(next), 'preview', next);
   const voice = status.defaultVoice;
   const choice = status.appReadAloud ?? { provider: 'local' as const };

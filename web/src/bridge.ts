@@ -1,15 +1,15 @@
-// Messages agents send each other through the Signalbox bridge arrive wrapped
+// Messages agents send each other through the Wayroost bridge arrive wrapped
 // in an envelope (shared/protocol.ts). Titles and previews are cut short on the
 // server, often inside that envelope, so they're read leniently here: the web
 // shows who sent it and what they wrote, never the boilerplate.
 
 const PREFIX = '[Message from ';
-const VIA = ' via Signalbox';
+const VIAS = [' via Wayroost', ' via Signalbox'];
 
-/** "Some chat vi" → "Some chat": drops a " via Signalbox" that was cut short. */
+/** "Some chat vi" → "Some chat": drops a " via Wayroost" that was cut short. */
 function withoutCutVia(text: string): string {
   for (let i = text.indexOf(' '); i >= 0; i = text.indexOf(' ', i + 1)) {
-    if (VIA.startsWith(text.slice(i))) return text.slice(0, i);
+    if (VIAS.some(via => via.startsWith(text.slice(i)))) return text.slice(0, i);
   }
   return text;
 }
@@ -19,8 +19,8 @@ export function readableBridgeText(text: string): string;
 export function readableBridgeText(text: string | undefined): string | undefined;
 export function readableBridgeText(text: string | undefined): string | undefined {
   if (!text?.startsWith(PREFIX)) return text;
-  const via = text.indexOf(VIA);
-  if (via < 0) {
+  const via = Math.min(...VIAS.map(value => text.indexOf(value)).filter(index => index >= 0), Infinity);
+  if (!Number.isFinite(via)) {
     // Cut off in or just after the sender's name.
     const cut = text.slice(PREFIX.length).replace(/…$/u, '');
     const whole = withoutCutVia(cut);

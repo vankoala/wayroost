@@ -24,7 +24,7 @@ import { shadowBackground, type BackgroundGate } from '../background.js';
 //   → { ok: true, result } or { ok: false, error } with a matching HTTP status
 //
 // Agent and session ids are claims: the bridge only trusts one that matches a
-// chat Signalbox knows.
+// chat Wayroost knows.
 
 export const BRIDGE_HOST = '127.0.0.1';
 export const BRIDGE_BODY_LIMIT = 64 * 1024;
@@ -34,6 +34,8 @@ export interface BridgeServerOptions {
   background?: BackgroundGate;
   bridge: Pick<Bridge, 'call'>;
   token: string;
+  /** Accept old wrappers (no name header) and the signalbox alias during the rename transition. */
+  legacyNames?: boolean;
   port: number;
   log: Logger;
   /** For you: Hermes' pulse reads its preferences and posts cards here. */
@@ -110,6 +112,15 @@ export async function buildBridgeServer(options: BridgeServerOptions): Promise<F
   app.post('/bridge/v1/:tool', async (req, reply) => {
     const { tool } = req.params as { tool: string };
     if (!isBridgeTool(tool) && !isReportTool(tool)) return reply.code(404).send({ ok: false, error: 'Unknown tool.' });
+    // A name selects compatibility only; identity and every guard are shared.
+    // Pre-rename wrappers send no name, so absence means the legacy alias.
+    const name = header(req, 'x-bridge-name') ?? 'signalbox';
+    if (name !== 'wayroost' && name !== 'signalbox') {
+      return deny(req, reply, 400, 'unknown bridge name', 'Unknown bridge name.');
+    }
+    if (name === 'signalbox' && options.legacyNames === false) {
+      return deny(req, reply, 403, 'legacy bridge name', 'The signalbox bridge name is disabled; use wayroost.');
+    }
     const identity: BridgeIdentity = {};
     const agent = header(req, 'x-bridge-paseo-agent')?.trim();
     if (agent && CHAT_ID.test(agent)) identity.paseoAgent = agent;

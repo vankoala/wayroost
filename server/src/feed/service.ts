@@ -74,6 +74,23 @@ export interface PulsePreferences {
 }
 
 export class Feed implements FeedRouting {
+  private settingsSource?: () => StoredSettings;
+  private settingsTimeZone?: () => string | undefined;
+  private lastAppliedLevel?: ProactivityLevel;
+  appliedLevel(): ProactivityLevel | undefined { return this.lastAppliedLevel; }
+  useSettingsSource(source: () => StoredSettings, timeZone?: () => string | undefined): void {
+    this.deps.store.disablePrivatePreferences();
+    this.settingsSource = source;
+    this.settingsTimeZone = timeZone;
+  }
+  /** Apply a verified preference change to pulse jobs, including resolved writes. */
+  async applyPreferences(): Promise<void> {
+    if (this.settingsSource) {
+      const level = this.settingsSource().level;
+      await this.applyLevel(level);
+      this.lastAppliedLevel = level;
+    }
+  }
   private timer: ReturnType<typeof setInterval> | undefined;
   private pulseFound = false;
   private lastLook = 0;
@@ -207,7 +224,7 @@ export class Feed implements FeedRouting {
     for (const card of this.deps.store.markSeen()) this.publish(card);
   }
 
-  async act(id: string, action: FeedAction): Promise<FeedActionResult> {
+  async act(id: string, action: FeedAction, saveLessLike?: (feedback: StoredSettings['lessLike'][number]) => Promise<void>): Promise<FeedActionResult> {
     const { store } = this.deps;
     const card = store.get(id);
     if (!card) throw new UserFacingError('That card is gone.', 404);
@@ -227,7 +244,11 @@ export class Feed implements FeedRouting {
         updated = store.setStatus(id, 'later', { laterUntil: this.laterUntil() });
         break;
       case 'less':
-        if (card.topic) store.addLessLike(card.topic, card.title);
+        if (card.topic) {
+          if (this.settingsSource && !saveLessLike) throw new UserFacingError('Owner-held settings must be changed through the settings pipeline.', 409);
+          if (saveLessLike) await saveLessLike({ topic: card.topic, example: card.title, at: this.now() });
+          else store.addLessLike(card.topic, card.title);
+        }
         updated = store.setStatus(id, 'dismissed');
         break;
       case 'done':
@@ -247,6 +268,7 @@ export class Feed implements FeedRouting {
     push?: Partial<StoredSettings['push']>;
     removeLessLike?: string;
   }): Promise<FeedSettings> {
+    if (this.settingsSource) throw new UserFacingError('Owner-held settings must be changed through the settings pipeline.', 409);
     const { store } = this.deps;
     const current = this.currentSettings();
     if (patch.level && patch.level !== current.level) await this.applyLevel(patch.level);
@@ -340,7 +362,7 @@ export class Feed implements FeedRouting {
   private notifyApproval(approval: Approval): void {
     const key = `${approval.source}:${approval.conversationId}:${approval.id}`;
     const message = this.approvalMessage(approval);
-    if (!this.deps.push || !this.deps.store.settings().push.approvals || !this.deps.push.devices()) return;
+    if (!this.deps.push || !this.currentSettings().push.approvals || !this.deps.push.devices()) return;
     if (!this.deps.store.markNotified(key)) return;
     this.notify(message, { evenWhenQuiet: true });
   }
@@ -359,6 +381,7 @@ export class Feed implements FeedRouting {
 
   /** Quiet hours and the card switch, written from Settings → Notifications. */
   applyRouting(routing: { quietHours: StoredSettings['quietHours']; push: StoredSettings['push'] }): void {
+    if (this.settingsSource) return;
     const s = this.deps.store.settings();
     const same = JSON.stringify(s.quietHours) === JSON.stringify(routing.quietHours)
       && s.push.approvals === routing.push.approvals && s.push.cards === routing.push.cards;
@@ -366,6 +389,7 @@ export class Feed implements FeedRouting {
   }
 
   private currentSettings(): StoredSettings {
+    if (this.settingsSource) return this.settingsSource();
     const stored = this.deps.store.settings();
     const routing = this.deps.notifications?.settings();
     return routing ? { ...stored, quietHours: routing.quietHours, push: routing.push } : stored;
@@ -379,11 +403,12 @@ export class Feed implements FeedRouting {
 
   /** Local "HH:MM". */
   private clock(at: number): string {
+    const timeZone = this.settingsTimeZone ? this.settingsTimeZone() : this.deps.timeZone;
     return new Intl.DateTimeFormat('en-GB', {
       hour: '2-digit',
       minute: '2-digit',
       hour12: false,
-      ...(this.deps.timeZone ? { timeZone: this.deps.timeZone } : {}),
+      ...(timeZone ? { timeZone } : {}),
     }).format(at);
   }
 
@@ -404,13 +429,14 @@ export class Feed implements FeedRouting {
   }
 
   private doPrompt(card: FeedCard): string {
+    const timeZone = this.settingsTimeZone ? this.settingsTimeZone() : this.deps.timeZone;
     const when = new Intl.DateTimeFormat('en-US', {
       weekday: 'short',
       month: 'short',
       day: 'numeric',
       hour: 'numeric',
       minute: '2-digit',
-      ...(this.deps.timeZone ? { timeZone: this.deps.timeZone } : {}),
+      ...(timeZone ? { timeZone } : {}),
     }).format(card.createdAt);
     const lines = [`From my For-you feed (${SOURCE_LABELS[card.source]}, ${when}): "${card.title}"`];
     if (card.detail) lines.push(card.detail);

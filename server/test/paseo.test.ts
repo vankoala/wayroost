@@ -387,6 +387,8 @@ describe('paseo normalization', () => {
       expect(parentOf(labels)).not.toHaveProperty('parent');
     }
     expect(parentOf({ [PARENT_AGENT_LABEL]: 'p1' })).not.toHaveProperty('parentId');
+    expect(parentOf({ 'signalbox.parent-hermes-chat': 'h-old' }).parent).toEqual({ source: 'hermes', id: 'h-old' });
+    expect(parentOf({ [HERMES_PARENT_LABEL]: 'h-new', 'signalbox.parent-hermes-chat': 'h-old' }).parent).toEqual({ source: 'hermes', id: 'h-new' });
   });
 
   it('knows Hermes in Paseo by its ACP session id too, and passes on nothing else of how Paseo resumes it', () => {

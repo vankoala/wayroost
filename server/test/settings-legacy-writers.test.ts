@@ -335,14 +335,10 @@ it.each([false, true])('keeps the existing safety choice during notification app
 
 it.each([false, true])('recovers from a notification conflict on a fresh safety request (notifications=%s)', async wired => {
   const f = await fixture('on', { pipeline: true, local: true, sharedSafety: false, notificationsWired: wired });
-  const writer = wired ? f.notificationWrite! : f.supervisor.configApply;
-  const apply = wired ? Notifications.prototype.configApply.bind(f.notifications!) : f.supervisor.configApply.getMockImplementation()!;
+  const writer = f.supervisor.configApply;
+  const apply = f.supervisor.configApply.getMockImplementation()!;
   writer.mockImplementationOnce(async request => {
-    if (wired) {
-      const notification = await apply({ ...request, operation: 'wayroost.notifications',
-        params: { push: { approvals: false, cards: true }, quietHours: null, rules: [] } });
-      expect(notification.ok).toBe(true);
-    } else f.supervisor.documents['wayroost-settings']!.push = { approvals: false, cards: true };
+    f.supervisor.documents['wayroost-settings']!.push = { approvals: false, cards: true };
     return apply(request);
   });
   const conflict = await f.put('/api/safety-commands', { enabled: true });
@@ -353,7 +349,7 @@ it.each([false, true])('recovers from a notification conflict on a fresh safety 
   expect(f.safetyCommands.enabled()).toBe(true);
   expect((await f.get('/api/safety-commands')).json().enabled).toBe(true);
   expect(writer).toHaveBeenCalledTimes(2);
-  const document = wired ? JSON.parse(readFileSync(join(f.config.stateDir, WAYROOST_SETTINGS_FILE), 'utf8')) : f.supervisor.documents['wayroost-settings'];
+  const document = f.supervisor.documents['wayroost-settings'];
   expect(document).toMatchObject({ safetyCommandsEnabled: true, push: { approvals: false, cards: true } });
   expect(f.rows().filter(row => row.type === 'settings-change').map(row => row.data.result)).toEqual(['precondition_changed', 'ok']);
   expect(f.safetyWrite).not.toHaveBeenCalled();
@@ -373,20 +369,21 @@ it.each([false, true])('keeps a damaged audit isolated from the selected safety 
 });
 
 it('keeps startup read-only and accepts a fresh authorized safety enable after a notification conflict', async () => {
-  const apply = Notifications.prototype.configApply;
-  const writer = vi.spyOn(Notifications.prototype, 'configApply').mockImplementationOnce(async function (this: Notifications, request) {
-    expect((await apply.call(this, { ...request, operation: 'wayroost.notifications',
-      params: { push: { approvals: false, cards: true }, quietHours: null, rules: [] } })).ok).toBe(true);
-    return apply.call(this, request);
-  });
   const f = await fixture('on', { pipeline: true, local: true, legacySafety: true, notificationsWired: true,
     initialSettings: { push: { approvals: true, cards: false }, quietHours: null, rules: [] } });
+  const writer = f.supervisor.configApply;
+  const apply = writer.getMockImplementation()!;
+  writer.mockImplementationOnce(async request => {
+    f.supervisor.documents['wayroost-settings']!.push = { approvals: false, cards: true };
+    return apply(request);
+  });
   expect(writer).not.toHaveBeenCalled();
   expect(f.safetyCommands.enabled()).toBe(false);
   expect((await f.put('/api/safety-commands', { enabled: true })).json()).toEqual({ status: 'refused', code: 'precondition_changed' });
   expect((await f.put('/api/safety-commands', { enabled: true })).json().enabled).toBe(true);
   expect(f.safetyCommands.enabled()).toBe(true);
   expect(f.safetyWrite).not.toHaveBeenCalled();
-  expect(JSON.parse(readFileSync(join(f.config.stateDir, WAYROOST_SETTINGS_FILE), 'utf8')))
+  expect(f.supervisor.documents['wayroost-settings'])
     .toMatchObject({ safetyCommandsEnabled: true, push: { approvals: false, cards: true } });
+  expect(f.notificationWrite).not.toHaveBeenCalled();
 });

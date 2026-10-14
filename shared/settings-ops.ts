@@ -7,6 +7,7 @@
 // that aren't parameters come from the site file, the role map or the gateway
 // migration record, all root-owned.
 import { z } from 'zod';
+import { wayroostSettingsSchema, wayroostPreferencesBodySchema, wayroostNotificationsPatchSchema } from './wayroost-settings.js';
 import { INVISIBLE } from './invisible.js';
 import { CONSUMER_TARGETS, GATEWAY_CONSUMERS, GATEWAY_ROLES, ROLE_PROVIDERS, backendIdSchema, gatewayRoleSchema, isLoopbackUrl, type GatewayConsumer } from './gateway.js';
 import { decideRead, levelFor, strictestLevel, type LevelRule } from './settings-levels.js';
@@ -15,7 +16,7 @@ import { CHANGE_ID, targetIdSchema, MAX_OPERATION_KEYS, formatKeyPath, isSecretK
 import { OWNER_FILE_TARGETS, type OwnerFileTarget, type TargetId } from './settings-targets.js';
 
 /** Bumped whenever an operation is added, removed or changes shape; the supervisor reports it. */
-export const CATALOGUE_VERSION = 9;
+export const CATALOGUE_VERSION = 10;
 
 export const RECOVERY_OPERATIONS = ['gateway.socket-recover', 'hermes.drain-marker-remove'] as const;
 
@@ -114,6 +115,8 @@ export interface OperationSpec {
   /** The keys it may add, change or delete; `recorded`: the keys the migration record holds for that consumer and file. */
   keys: readonly KeyTemplate[] | 'recorded';
   callers: readonly OperationCaller[];
+  /** Partial Wayroost operations touch only parameters explicitly supplied. */
+  presentParamsOnly?: true;
   /** The consumer whose moved keys it writes. */
   consumer?: GatewayConsumer;
   /**
@@ -301,8 +304,23 @@ export const SETTINGS_OPERATIONS = {
   },
   'wayroost.notifications': {
     title: 'Notification rules and quiet hours', section: 'notifications', target: 'wayroost-settings', verb: 'config.apply',
-    params: settingsNotificationsBodySchema, level: anywhere, timing: NOW,
-    keys: [['push'], ['quietHours'], ['rules']], callers: ['server'],
+    params: wayroostNotificationsPatchSchema, level: anywhere, timing: NOW,
+    keys: [['push'], ['quietHours'], ['rules']], presentParamsOnly: true, callers: ['server'],
+  },
+  'wayroost.preferences': {
+    title: 'Wayroost preferences', section: 'notifications', target: 'wayroost-settings', verb: 'config.apply',
+    params: wayroostPreferencesBodySchema, level: anywhere, timing: NOW,
+    keys: [['timeZone'], ['feed']], presentParamsOnly: true, callers: ['server'],
+  },
+  'wayroost.worker-updates': {
+    title: 'Worker updates', section: 'notifications', target: 'wayroost-settings', verb: 'config.apply',
+    params: wayroostSettingsSchema.pick({ workerUpdates: true }).required(), level: pcOnly, timing: NOW,
+    keys: [['workerUpdates']], callers: ['server'],
+  },
+  'wayroost.voice': {
+    title: 'Voice preferences', section: 'notifications', target: 'wayroost-settings', verb: 'config.apply',
+    params: wayroostSettingsSchema.pick({ voice: true }).required(), level: pcOnly, timing: NOW,
+    keys: [['voice']], callers: ['server'],
   },
 
   // The stack launcher's moves onto roles. Values come from the site file and the role map.
@@ -502,6 +520,7 @@ export function operationKeys(spec: OperationSpec, params: Readonly<Record<strin
   if (spec.keys === 'recorded') return 'recorded';
   const paths: KeyPath[] = [];
   for (const template of spec.keys) {
+    if (spec.presentParamsOnly && !Object.hasOwn(params, String(template[0]))) continue;
     let partial: KeySegment[][] = [[]];
     for (const segment of template) {
       if (typeof segment === 'string') { partial = partial.map(path => [...path, segment]); continue; }
@@ -719,9 +738,11 @@ export const READ_VIEWS = {
     sandbox_mode: z.enum(['read-only', 'workspace-write', 'danger-full-access']),
   } },
   'opencode.permissions': { target: 'opencode-config', keys: [['permission']], level: 'pc-only' },
-  'wayroost.settings': { target: 'wayroost-settings', keys: [['safetyCommandsEnabled'], ['push', 'approvals'], ['push', 'cards'], ['quietHours'], ['rules']],
-    publicValues: { safetyCommandsEnabled: flag, 'push.approvals': flag, 'push.cards': flag,
-      quietHours: settingsNotificationsBodySchema.shape.quietHours, rules: settingsNotificationsBodySchema.shape.rules } },
+  'wayroost.settings': { target: 'wayroost-settings', keys: [['version'], ['safetyCommandsEnabled'], ['push'], ['push', 'approvals'], ['push', 'cards'], ['quietHours'], ['rules'], ['timeZone'], ['feed'], ['workerUpdates'], ['voice']],
+    publicValues: { version: wayroostSettingsSchema.shape.version, safetyCommandsEnabled: flag, 'push.approvals': flag, 'push.cards': flag,
+      push: wayroostSettingsSchema.shape.push,
+      quietHours: settingsNotificationsBodySchema.shape.quietHours, rules: settingsNotificationsBodySchema.shape.rules,
+      timeZone: wayroostSettingsSchema.shape.timeZone, workerUpdates: wayroostSettingsSchema.shape.workerUpdates, voice: wayroostSettingsSchema.shape.voice } },
 } as const satisfies Record<string, ReadView>;
 export type ReadViewId = keyof typeof READ_VIEWS;
 export const READ_VIEW_IDS = Object.keys(READ_VIEWS) as ReadViewId[];

@@ -10,6 +10,7 @@ import { shadowBackground, type BackgroundGate } from '../background.js';
 import { decideNotification, desktopPresence, type NotificationDecision } from './routing.js';
 import { NotificationSettingsStore, type ChangeContext, type NotificationSettings, type NotificationSettingsInput } from './settings.js';
 import type { ConfigApplyRequest, ConfigReadRequest, ConfigReadResult, ConfigUndoRequest, ConfigWriteResult } from '../../../shared/supervisor-config.js';
+import { WayroostSettingsStore } from '../settings/store.js';
 
 // Wayroost's alerts: the rules, the PC's presence and quiet hours say where each one goes,
 // and everything else asks this service. An alert the app should show leaves as a
@@ -73,23 +74,29 @@ export interface NotificationServicesDeps extends Omit<NotificationsDeps, 'setti
   feedEnabled: boolean;
   hermes: FeedDeps['hermes'];
   schedules?: FeedDeps['schedules'];
+  pipeline?: boolean;
 }
 
-/** Migrate before synchronizing the feed, and share the owner's zone with both readers. */
+/** Legacy startup migrates feed routing; pipeline startup selects safe snapshots without writing. */
 export async function createNotificationServices(deps: NotificationServicesDeps): Promise<{ notifications: Notifications; feed?: Feed }> {
-  const store = new FeedStore(deps.stateDir, deps.now);
+  const store = new FeedStore(deps.stateDir, deps.now, deps.pipeline);
   const settings = new NotificationSettingsStore(deps.stateDir);
   let migrated = true;
-  try { await (deps.background ?? shadowBackground).run(() => settings.initialize(store.settings())); }
+  try { if (!deps.pipeline) await (deps.background ?? shadowBackground).run(() => settings.initialize(store.settings())); }
   catch { migrated = false; deps.log.warn({}, 'notification preferences could not be migrated; stored settings have been left intact'); }
   const feed = deps.feedEnabled ? new Feed({
     store, hub: deps.hub, hermes: deps.hermes, schedules: deps.schedules, push: deps.push,
     log: deps.log, background: deps.background, now: deps.now, timeZone: deps.timeZone,
   }) : undefined;
   const notifications = new Notifications({ ...deps, settings, feed, claimPush: (key) => store.markNotified(key) });
+  if (deps.pipeline) {
+    const snapshot = new WayroostSettingsStore();
+    notifications.useSettingsSource(snapshot);
+    feed?.useSettingsSource(() => ({ ...snapshot.feed(), ...snapshot.notificationSettings() }), () => snapshot.timeZone());
+  }
   if (feed) {
     feed.useRouting(notifications);
-    if (migrated) {
+    if (migrated && !deps.pipeline) {
       try { (deps.background ?? shadowBackground).run(() => feed.applyRouting(notifications.settings())); }
       catch { deps.log.warn({}, 'feed notification preferences could not be synchronized'); }
     }
@@ -98,6 +105,10 @@ export async function createNotificationServices(deps: NotificationServicesDeps)
 }
 
 export class Notifications {
+  private settingsSource?: WayroostSettingsStore;
+  useSettingsSource(source: WayroostSettingsStore): void { this.settingsSource = source; this.deps.settings.disablePrivateWrites(); }
+  private stored(): NotificationSettings { return this.settingsSource?.notificationSettings() ?? this.deps.settings.settings(); }
+  private timeZone(): string | undefined { return this.settingsSource ? this.settingsSource.timeZone() : this.deps.timeZone; }
   private reports: (() => DevicePresence[]) | undefined;
   private readonly now: () => number;
   private readonly approvals = new Map<string, number>();
@@ -160,7 +171,7 @@ export class Notifications {
   }
 
   settings(): NotificationSettingsView {
-    const stored = this.deps.settings.settings();
+    const stored = this.stored();
     return {
       rules: stored.rules,
       quietHours: stored.quietHours,
@@ -168,22 +179,25 @@ export class Notifications {
       pushAvailable: Boolean(this.deps.push),
       pushDevices: this.deps.push?.devices() ?? 0,
       presence: this.currentPresence(),
-      timeZoneConfigured: this.deps.timeZone !== undefined,
+      timeZoneConfigured: this.timeZone() !== undefined,
     };
   }
 
   async configRead(_request: ConfigReadRequest): Promise<ConfigReadResult> {
+    if (this.settingsSource) return { ok: false, code: 'config_writes_off' };
     return this.deps.settings.configRead();
   }
 
-  /** The settings pipeline owns authorization, audit and events; this service owns persistence and routing. */
+  /** Legacy persistence only; pipeline mode uses the supervisor and this service only routes alerts. */
   async configApply(request: ConfigApplyRequest): Promise<ConfigWriteResult> {
+    if (this.settingsSource) return { ok: false, code: 'config_writes_off' };
     const result = await this.deps.settings.configApply(request);
     if (result.ok || 'committed' in result) this.syncFeed(this.deps.settings.settings());
     return result;
   }
 
   async configUndo(request: ConfigUndoRequest): Promise<ConfigWriteResult> {
+    if (this.settingsSource) return { ok: false, code: 'config_writes_off' };
     const result = await this.deps.settings.configUndo(request);
     if (result.ok || 'committed' in result) this.syncFeed(this.deps.settings.settings());
     return result;
@@ -191,6 +205,7 @@ export class Notifications {
 
   /** Change the rules, the quiet hours or the phone's switches, and tell the pages to read them again. */
   async update(input: NotificationSettingsInput, context: ChangeContext = {}): Promise<NotificationSettingsView> {
+    if (this.settingsSource) throw new UserFacingError('Owner-held settings must be changed through the settings pipeline.', 409);
     const change = await this.deps.settings.change(input, context);
     if (change.changed && (input.quietHours !== undefined || input.push !== undefined)) {
       this.syncFeed(change.settings);
@@ -204,6 +219,7 @@ export class Notifications {
    * reached through another door, so it isn't told to read them again by its own save.
    */
   async setRouting(routing: Pick<NotificationSettingsInput, 'quietHours' | 'push'>): Promise<NotificationSettings> {
+    if (this.settingsSource) throw new UserFacingError('Owner-held settings must be changed through the settings pipeline.', 409);
     const change = await this.deps.settings.change(routing);
     this.deps.hub.publish({ type: 'settings_changed', sections: ['notifications'] });
     return change.settings;
@@ -211,7 +227,8 @@ export class Notifications {
 
   /** Where one alert would go right now, as the settings page describes it. */
   decide(event: NotificationEvent, source: NotificationSource): NotificationDecision {
-    return decideNotification(event, source, this.deps.settings.settings(), this.currentPresence(), this.now(), this.deps.timeZone);
+    const decision = decideNotification(event, source, this.stored(), this.currentPresence(), this.now(), this.timeZone());
+    return this.settingsSource && !this.settingsSource.available() ? { ...decision, push: false, switchedOff: true } : decision;
   }
 
   /** Show an alert where the rules, the presence and the clock allow, and say where it went. */

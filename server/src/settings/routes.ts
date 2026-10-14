@@ -1,17 +1,21 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { CREDENTIAL_TEST_ERRORS } from '../../../shared/gateway.js';
 import { commandAllowlist } from '../../../shared/command-allowlist.js';
 import { ApprovalCodes } from '../hub/approval-codes.js';
+import { EventJournal } from '../hub/journal.js';
 import type { AppConfig } from '../config.js';
 import type { EventHub } from '../hub.js';
 import type { SupervisorApi } from '../supervisor-client.js';
 import type { SafetyCommandsSetting } from '../hermes/safety.js';
 import type { Notifications } from '../notifications/service.js';
 import type { Feed } from '../feed/service.js';
+import type { WorkerUpdatesSetting } from '../tasks/setting.js';
+import type { VoiceSetting } from '../voice-setting.js';
+import { mergeWayroostSettingsPatch, wayroostSettingsSchema, wayroostNotificationsPatchSchema, type WayroostSettingsDocument } from '../../../shared/wayroost-settings.js';
 import { HHMM } from '../feed/store.js';
 import { SAFETY_COMMANDS } from '../hermes/commands.js';
 import { PROACTIVITY_LEVELS, type CloudAgentsStatus } from '../../../shared/protocol.js';
@@ -30,7 +34,7 @@ import {
   type OperationSpec, type ReadViewId, type ReadView,
 } from '../../../shared/settings-ops.js';
 import {
-  EARLIER_SETTINGS_ROUTES, SETTINGS_ROUTES, SETTINGS_RESOLUTION_MESSAGE, settingsSectionSchema, settingsApplyBodySchema, settingsUndoBodySchema,
+  CHANGE_ID, EARLIER_SETTINGS_ROUTES, SETTINGS_ROUTES, SETTINGS_RESOLUTION_MESSAGE, settingsSectionSchema, settingsApplyBodySchema, settingsUndoBodySchema,
   settingsRestartBodySchema, settingsCredentialBodySchema, settingsCredentialTestBodySchema,
   settingValuesEqual, keyPathSchema, type SettingValue, type KeyPath, type SettingsSection, type SettingsLevel,
   settingsNotificationsWriteBodySchema,
@@ -51,6 +55,8 @@ const views: Record<SettingsSection, readonly ReadViewId[]> = {
 };
 const hash = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
 const changeId = () => `ch_${randomBytes(12).toString('hex')}`;
+const FEED_WORK_FILE = 'settings-consumers.jsonl';
+const feedWorkSchema = z.object({ change: z.string().regex(CHANGE_ID), pending: z.boolean() }).strict();
 const refused = (code: SettingsErrorCode): SettingsApplyResponse => ({ status: 'refused', code });
 const legacyOperations = new Set(['paseo.provider-enabled', 'wayroost.safety-commands', 'paseo.worker-approvals']);
 const modelStatusSchema = z.array(z.object({ role: z.enum(['main', 'coder', 'fast']), health: z.enum(['up', 'down', 'unmapped', 'owner_mismatch', 'unknown']), inFlight: z.number().int().nonnegative() }));
@@ -75,6 +81,9 @@ interface SettingsSnapshot {
   document: Record<string, unknown>;
   sha256?: string;
 }
+
+type PreferencesPatch = Record<string, unknown> | ((document: WayroostSettingsDocument) => Record<string, unknown>);
+type SettingsConsumerResult = Pick<Extract<SettingsApplyResponse, { status: 'applied' }>, 'calls' | 'callsMessage'> & { code?: SettingsErrorCode };
 
 function persistedFileMatches(snapshot: SettingsSnapshot, sha256: string | undefined): boolean {
   return sha256 !== undefined && snapshot.sha256 === sha256;
@@ -149,7 +158,8 @@ function intendedValues(operation: string, params: Record<string, unknown>, path
   };
   return paths.map((path, index) => {
     const before = valueAt(document, path).value;
-    const value = operation === 'hermes.revoke-always'
+    const value = ['wayroost.notifications', 'wayroost.preferences', 'wayroost.worker-updates', 'wayroost.voice'].includes(operation) ? params[String(path[0])]
+      : operation === 'hermes.revoke-always'
       ? commandAllowlist(before)?.filter(entry => hash(entry) !== params.entrySha256)
       : operation === 'paseo.worker-approvals'
       ? workerApprovalTools(before, params.enabled as boolean)
@@ -181,12 +191,16 @@ export interface SettingsOptions {
   modelStatus?: () => Promise<unknown>;
   roleLoads?: () => Promise<unknown>;
   agentAvailability?: () => Promise<unknown>;
+  validateVoice?: (voice: NonNullable<WayroostSettingsDocument['voice']>, signal?: AbortSignal) => Promise<SettingsErrorCode | undefined>;
+  applyPhoneVoice?: (voice: string) => Promise<void>;
   consumers?: {
     safetyCommands?: SafetyCommandsSetting;
     cloudAgents?: () => Promise<CloudAgentsStatus>;
     workerApprovals?: WorkerApprovalsApi;
     notifications?: Notifications;
     feed?: Feed;
+    workerUpdates?: Pick<WorkerUpdatesSetting, 'useSettingsSource' | 'refreshSettings'>;
+    voice?: VoiceSetting;
   };
 }
 
@@ -195,6 +209,7 @@ class SettingsPipeline {
   private readonly notificationOutcomes = new WeakMap<object, string>();
   private readonly drains = new Map<string, { record: SettingsWriteRecord; timing: Timing }>();
   private closed = false;
+  private initialized = false;
   private polling = false;
   private auditStore?: SettingsAudit;
   private readonly now: () => number;
@@ -204,6 +219,14 @@ class SettingsPipeline {
   private queue: Promise<unknown> = Promise.resolve();
   private readonly store = new WayroostSettingsStore();
   private settingsPending = false;
+  private expectedSettingsHash?: string;
+  private feedPreferencesPending = false;
+  private settingsRetryAt = 0;
+  private settingsRetryDelay = 1000;
+  private retryingSettings = false;
+  private feedWorkJournal?: EventJournal;
+  private feedWorkIdentity?: { dev: number; ino: number };
+  private feedWorkFailed = false;
   private readonly settingsUncertain = new Set<string>();
   readonly legacyRoutesViaPipeline: boolean;
 
@@ -215,16 +238,33 @@ class SettingsPipeline {
     this.codes = new ApprovalCodes({ identityOf: id => id, adminCapability: {}, now: this.now,
       record: event => this.audit.event(event.type, event) });
     this.timer = setInterval(() => {
-      try { this.codes.expire(this.now()); } catch { /* Writes will refuse the unavailable audit. */ }
+      try { this.codes.expire(this.now()); } catch { if (this.legacyRoutesViaPipeline) this.store.invalidate(); }
       if (!this.polling && this.drains.size) {
         this.polling = true;
         void this.enqueue(async () => { await this.refreshDrains(); }).catch(() => {}).finally(() => { this.polling = false; });
+      }
+      if (this.initialized && !this.closed && this.legacyRoutesViaPipeline && !this.store.available() && !this.retryingSettings && this.now() >= this.settingsRetryAt) {
+        this.retryingSettings = true;
+        void this.enqueue(() => this.refreshConsumers()).catch(() => this.store.invalidate()).finally(() => {
+          this.settingsRetryAt = this.now() + this.settingsRetryDelay;
+          this.settingsRetryDelay = this.store.available() ? 1000 : Math.min(30_000, this.settingsRetryDelay * 2);
+          this.retryingSettings = false;
+        });
       }
     }, 1000);
     this.timer.unref();
   }
 
   async initialize(): Promise<void> {
+    if (this.legacyRoutesViaPipeline) {
+      this.options.consumers?.safetyCommands?.useSettingsSource(() => this.safetyCommandsEnabled());
+      this.options.consumers?.notifications?.useSettingsSource(this.store);
+      this.options.consumers?.voice?.useSettingsSource(() => this.store.voice());
+      const workers = this.options.consumers?.workerUpdates;
+      workers?.useSettingsSource(() => this.store.workerUpdates());
+      if (workers) this.store.watch(() => workers.refreshSettings());
+      this.options.consumers?.feed?.useSettingsSource(() => ({ ...this.store.feed(), ...this.store.notificationSettings() }), () => this.store.timeZone());
+    }
     if (existsSync(join(this.config.stateDir, 'settings-audit.jsonl'))) {
       try { await this.resolveUncertain(); } catch { /* Unresolved writes keep changes closed. */ }
     }
@@ -233,40 +273,79 @@ class SettingsPipeline {
         if (entry.action === 'restart') this.drains.set(entry.runId, { record: entry, timing: entry.notes });
       }
     } catch { /* An unavailable journal keeps writes closed. */ }
-    if (this.legacyRoutesViaPipeline) {
-      this.options.consumers?.safetyCommands?.useSettingsSource(() => this.safetyCommandsEnabled());
-    }
     if (this.configSource('wayroost-settings')?.configRead
-      && (this.legacyRoutesViaPipeline && this.options.consumers?.safetyCommands || this.options.consumers?.notifications)) {
+      && this.config.role === 'primary'
+      && (this.options.consumers?.notifications || this.legacyRoutesViaPipeline &&
+        [this.options.consumers?.safetyCommands, this.options.consumers?.workerUpdates, this.options.consumers?.voice, this.options.consumers?.feed].some(Boolean))) {
       try {
         this.audit.verify();
-        for (const entry of this.audit.entries()) {
+        for (const entry of this.audit.entries().sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))) {
           if (entry.target !== 'wayroost-settings' || !entry.operation) continue;
           if (entry.result === 'outcome_unknown' && !entry.observed) this.settingsUncertain.add(entry.id);
+          if (entry.result === 'consumer_refused' && entry.pulse?.required) this.feedPreferencesPending = true;
         }
+        this.verifyFeedWork();
       }
       catch { /* The audit check keeps safety commands blocked. */ }
       await this.read('wayroost.settings');
     }
+    this.initialized = true;
+    this.settingsRetryAt = this.now() + 1000;
   }
 
   private safetyCommandsEnabled(): boolean {
     try {
       this.audit.verify();
       return !this.settingsPending && !this.settingsUncertain.size && this.store.safetyCommandsEnabled();
-    } catch { return false; }
+    } catch { if (this.legacyRoutesViaPipeline) this.store.invalidate(); return false; }
   }
 
   async refreshConsumers(): Promise<SettingsApplyResponse | undefined> {
-    if (!this.configSource('wayroost-settings')?.configRead) return;
-    await this.resolveUncertain();
+    if (!this.configSource('wayroost-settings')?.configRead) return this.legacyRoutesViaPipeline ? refused('config_writes_off') : undefined;
+    const resolution = await this.resolveUncertain({ target: 'wayroost-settings' });
+    if (resolution) return resolution;
     if (this.blocked('wayroost-settings').length) return { status: 'refused', code: 'outcome_unknown', message: SETTINGS_RESOLUTION_MESSAGE };
     const current = await this.read('wayroost.settings');
     return current.ok ? undefined : refused(current.code);
   }
 
   private get audit(): SettingsAudit { return this.auditStore ??= new SettingsAudit(this.config.stateDir, this.now); }
-  close(): void { this.closed = true; clearInterval(this.timer); this.auditStore?.close(); }
+  close(): void { this.closed = true; clearInterval(this.timer); this.auditStore?.close(); this.feedWorkJournal?.close(); }
+
+  private verifyFeedWork(): void {
+    if (!this.legacyRoutesViaPipeline) return;
+    if (this.feedWorkFailed) throw new SettingsAuditError();
+    if (!this.feedWorkJournal && !existsSync(join(this.config.stateDir, FEED_WORK_FILE))) return;
+    try {
+      const journal = this.feedWorkJournal ??= new EventJournal(this.config.stateDir, this.now, FEED_WORK_FILE);
+      const stat = lstatSync(journal.path);
+      this.feedWorkIdentity ??= stat;
+      if (!stat.isFile() || stat.nlink !== 1 || stat.dev !== this.feedWorkIdentity.dev || stat.ino !== this.feedWorkIdentity.ino) throw new Error('audit_unavailable');
+      for (const event of journal.load()) {
+        if (event.type !== 'settings-feed-work') throw new Error('audit_unavailable');
+        this.feedPreferencesPending = feedWorkSchema.parse(event.data).pending;
+      }
+    } catch {
+      this.feedWorkFailed = true;
+      this.store.invalidate();
+      throw new SettingsAuditError();
+    }
+  }
+
+  private recordFeedWork(change: string, pending: boolean): void {
+    this.audit.verify();
+    this.verifyFeedWork();
+    try {
+      this.feedWorkJournal ??= new EventJournal(this.config.stateDir, this.now, FEED_WORK_FILE);
+      this.feedWorkIdentity ??= lstatSync(this.feedWorkJournal.path);
+      this.feedWorkJournal.append({ type: 'settings-feed-work', data: feedWorkSchema.parse({ change, pending }) });
+      this.feedPreferencesPending = pending;
+    } catch {
+      this.feedWorkFailed = true;
+      this.store.invalidate();
+      throw new SettingsAuditError();
+    }
+  }
   notificationSource(request: object) { return this.notificationSources.get(request); }
   notificationOutcome(request: object) { return this.notificationOutcomes.get(request); }
 
@@ -283,25 +362,49 @@ class SettingsPipeline {
   private async guarded<T>(request: FastifyRequest, action: () => Promise<T>): Promise<T | SettingsApplyResponse> {
     try {
       checkDeviceSignal(request.deviceSignal);
-      await this.resolveUncertain();
+      const resolution = await this.resolveUncertain(this.resolutionScope(request));
+      if (resolution) return resolution;
       return await action();
     }
-    catch (error) { return refused(request.deviceSignal?.aborted ? 'not_permitted' : error instanceof SettingsAuditError ? 'audit_unavailable' : 'failed'); }
+    catch (error) {
+      if (error instanceof SettingsAuditError && this.legacyRoutesViaPipeline) this.store.invalidate();
+      return refused(request.deviceSignal?.aborted ? 'not_permitted' : error instanceof SettingsAuditError ? 'audit_unavailable' : 'failed');
+    }
   }
 
   private blocked(target: string) {
     return this.audit.unresolved().filter(entry => entry.target === target && !(entry.action === 'restart' && entry.runId));
   }
 
-  private async resolveUncertain(): Promise<void> {
+  private resolutionScope(request: FastifyRequest): { target?: string; change?: string } | undefined {
+    const route = request.routeOptions.url ?? request.url.split('?')[0]!;
+    if (['GET', 'HEAD'].includes(request.method) && [SETTINGS_ROUTES.notifications, SETTINGS_ROUTES.safetyCommands,
+      '/api/safety-commands', '/api/feed', '/api/voice', '/api/worker-updates'].includes(route)) return { target: 'wayroost-settings' };
+    if (request.method === 'POST' && route === SETTINGS_ROUTES.undo) {
+      const body = settingsUndoBodySchema.safeParse(request.body);
+      if (body.success) return { change: body.data.change };
+    }
+    if (request.method === 'POST' && route === SETTINGS_ROUTES.apply) {
+      const body = settingsApplyBodySchema.safeParse(request.body);
+      if (body.success && body.data.operation === 'settings.accept-current' && typeof body.data.params.change === 'string') return { change: body.data.params.change };
+    }
+  }
+
+  private async resolveUncertain(scope?: { target?: string; change?: string }): Promise<SettingsApplyResponse | undefined> {
+    let response: SettingsApplyResponse | undefined;
     for (const entry of this.audit.unresolved()) {
+      const relevant = scope !== undefined && (scope.change === entry.id || scope.target === entry.target);
       const { requestId, notes, undoOf, ...record } = entry;
       if (requestId && entry.runId && entry.action === 'restart') {
         this.drains.set(entry.runId, { record, timing: notes });
         await this.restartRun(entry.runId);
         continue;
       }
-      if (entry.target === 'wayroost-settings') { this.settingsUncertain.add(entry.id); continue; }
+      if (entry.target === 'wayroost-settings' && (!this.legacyRoutesViaPipeline || this.config.role !== 'primary' || !this.rolledOut(entry.operation))) {
+        this.settingsUncertain.add(entry.id);
+        continue;
+      }
+      if (entry.target === 'wayroost-settings') this.settingsUncertain.add(entry.id);
       if (!requestId || !this.supervisor?.configRequestStatus) continue;
       const parsed = configRequestStatusResultSchema.safeParse(await this.supervisor.configRequestStatus({ requestId }).catch(() => undefined));
       if (!parsed.success || !parsed.data.ok || parsed.data.requestId !== requestId || parsed.data.state !== 'terminal') continue;
@@ -311,13 +414,41 @@ class SettingsPipeline {
         || entry.action !== 'credential' && row.operation !== entry.operation || outcome === 'outcome_unknown') continue;
       if (outcome === 'applied' && row.result !== 'ok' || outcome === 'refused' && (row.result === 'ok' || row.result === 'outcome_unknown' || row.writtenSha256)) continue;
       this.audit.event('settings-write-resolved', { id: entry.id, requestId, outcome });
-      this.complete({ ...record, observed: 'supervisor', ...(row.backupId ? { backupId: row.backupId } : {}),
-        ...(row.backupSha256 ? { backupSha256: row.backupSha256 } : {}), ...(row.writtenSha256 ? { writtenSha256: row.writtenSha256 } : {}) },
-        notes, outcome === 'applied' ? 'ok' : row.result, undoOf);
+      if (outcome === 'applied' && entry.target === 'wayroost-settings' && this.legacyRoutesViaPipeline
+        && this.options.consumers?.feed && entry.pulse?.required) this.recordFeedWork(entry.id, true);
+      let verifiedSettings: Record<string, unknown> | undefined;
+      let verificationCode: SettingsErrorCode | undefined;
+      if (outcome === 'applied' && entry.target === 'wayroost-settings' && this.legacyRoutesViaPipeline) {
+        const current = await this.read('wayroost.settings', false);
+        if (!current.ok) verificationCode = current.code;
+        else if (!row.writtenSha256 || current.sha256 !== row.writtenSha256) verificationCode = 'verify_mismatch';
+        else verifiedSettings = documentOf(current);
+      }
+      const resolved = { ...record, observed: 'supervisor' as const, ...(row.backupId ? { backupId: row.backupId } : {}),
+        ...(row.backupSha256 ? { backupSha256: row.backupSha256 } : {}), ...(row.writtenSha256 ? { writtenSha256: row.writtenSha256 } : {}) };
+      this.complete(resolved, notes, verificationCode ?? (outcome === 'applied' ? 'ok' : row.result), undoOf);
+      this.settingsUncertain.delete(entry.id);
+      const change: ChangeResult = { id: entry.id, operation: entry.operation!, target: entry.target as UndoToken['target'],
+        keys: entry.keys, timing: notes, effective: 'verified', undoable: !!row.backupId };
+      if (verificationCode) {
+        this.store.invalidate();
+        if (relevant) response ??= { status: 'refused', code: verificationCode, change: { ...change, effective: 'mismatch' } };
+        continue;
+      }
       if (outcome === 'applied' && undoOf) await this.options.checks?.confirmUndo?.(entry.id, undoOf, this.now(), this.audit.entries());
       else if (outcome === 'applied') await this.options.checks?.confirmIntent?.(entry.id, this.now());
+      if (verifiedSettings) {
+        this.store.update(verifiedSettings);
+        const { code } = await this.applySettingsConsumers(resolved);
+        if (code) {
+          const failed = this.finish(resolved, notes, { status: 'refused', code, change: { ...change, effective: 'mismatch' } }, undoOf);
+          if (relevant) response ??= failed;
+          continue;
+        }
+      } else if (entry.target === 'wayroost-settings') await this.read('wayroost.settings');
       this.hub.publish({ type: 'settings_changed', sections: ['overview', 'checks'], change: entry.id });
     }
+    return response;
   }
 
   private async acceptCurrent(request: FastifyRequest, body: z.infer<typeof settingsApplyBodySchema>): Promise<SettingsApplyResponse> {
@@ -333,12 +464,45 @@ class SettingsPipeline {
     checkDeviceSignal(request.deviceSignal);
     const { requestId: _requestId, notes, undoOf, ...record } = entry;
     this.audit.event('settings-resolved-by-user', { id: entry.id, target: entry.target, device: request.device!.id, level: 'confirm' });
-    this.complete({ ...record, observed: 'resolved-by-user' }, notes, 'outcome_unknown', undoOf);
+    if (entry.target === 'wayroost-settings' && this.legacyRoutesViaPipeline && entry.pulse?.required) this.recordFeedWork(entry.id, true);
+    const resolved = { ...record, observed: 'resolved-by-user' as const };
+    this.complete(resolved, notes, 'outcome_unknown', undoOf);
     this.settingsUncertain.delete(entry.id);
-    if (entry.target === 'wayroost-settings') await this.read('wayroost.settings');
     this.hub.publish({ type: 'settings_changed', sections: ['overview', 'checks'], change: entry.id });
-    return { status: 'applied', change: { id: entry.id, operation: body.operation, target: entry.target as UndoToken['target'],
-      keys: [], timing: [{ label: 'now' }], effective: 'verified', undoable: false } };
+    const change: ChangeResult = { id: entry.id, operation: body.operation, target: entry.target as UndoToken['target'],
+      keys: [], timing: [{ label: 'now' }], effective: 'verified', undoable: false };
+    let consumers: Omit<SettingsConsumerResult, 'code'> = {};
+    if (entry.target === 'wayroost-settings') {
+      const current = await this.read('wayroost.settings');
+      if (!current.ok) return this.finish(resolved, notes, { status: 'refused', code: current.code, change: { ...change, effective: 'pending' } }, undoOf);
+      if (this.legacyRoutesViaPipeline) {
+        const { code, ...outcome } = await this.applySettingsConsumers(resolved);
+        if (code) return this.finish(resolved, notes, { status: 'refused', code, change: { ...change, effective: 'mismatch' } }, undoOf);
+        consumers = outcome;
+      }
+    }
+    return { status: 'applied', change, ...consumers, ...this.pulseWarnings() };
+  }
+
+  private pulseWarnings(): Pick<Extract<SettingsApplyResponse, { status: 'applied' }>, 'warnings'> {
+    const applied = this.options.consumers?.feed?.appliedLevel();
+    return this.legacyRoutesViaPipeline && this.store.available() && (this.feedPreferencesPending
+      || applied !== undefined && applied !== this.store.feed().level) ? { warnings: ['pulse_pending'] } : {};
+  }
+
+  private async applySettingsConsumers(record: SettingsWriteRecord): Promise<SettingsConsumerResult> {
+    if (!this.store.available()) return { code: 'unavailable' };
+    if (record.pulse?.required && this.feedPreferencesPending && this.options.consumers?.feed) {
+      try { await this.options.consumers.feed.applyPreferences(); }
+      catch { return { code: 'consumer_refused' }; }
+      this.recordFeedWork(record.id, false);
+    }
+    if (record.keys.includes('voice') && this.options.applyPhoneVoice) {
+      try { await this.options.applyPhoneVoice(this.store.voice().voice); }
+      catch { return { calls: 'failed', callsMessage: 'App voice saved. The phone and car lines could not be updated; try saving the voice again.' }; }
+      return { calls: 'updated' };
+    }
+    return {};
   }
 
   async legacyWrite(request: FastifyRequest, operation: string, writer: () => unknown | Promise<unknown>): Promise<unknown> {
@@ -354,25 +518,42 @@ class SettingsPipeline {
     });
   }
 
-  private async read(view: ReadViewId): Promise<ConfigReadResult> {
+  private async read(view: ReadViewId, publish = true): Promise<ConfigReadResult> {
+    const failure = (code: SettingsErrorCode): ConfigReadResult => {
+      if (view === 'wayroost.settings') this.store.invalidate();
+      return { ok: false, code };
+    };
     const source = this.configSource(READ_VIEWS[view].target);
-    if (!source?.configRead) return { ok: false, code: 'config_writes_off' };
-    if (view === 'wayroost.settings') this.store.invalidate();
+    if (!source?.configRead) return failure('config_writes_off');
     try {
       const result = configReadResultSchema.safeParse(await source.configRead({ view }));
-      if (!result.success || result.data.ok && result.data.view !== view) return { ok: false, code: 'failed' };
+      if (!result.success || result.data.ok && result.data.view !== view) return failure('failed');
+      if (!result.data.ok) return failure(result.data.code);
       if (result.data.ok && view === 'wayroost.settings') {
+        if (this.legacyRoutesViaPipeline && (!result.data.present || !result.data.sha256)) return failure('target_missing');
         try {
-          this.store.update(documentOf(result.data));
+          const document = documentOf(result.data);
+          if (this.legacyRoutesViaPipeline) {
+            wayroostSettingsSchema.parse(document);
+            try {
+              this.audit.verify();
+              this.verifyFeedWork();
+              if (this.settingsUncertain.size || this.expectedSettingsHash && this.expectedSettingsHash !== result.data.sha256) this.store.invalidate();
+              else if (publish && !this.settingsPending) this.store.update(document);
+            } catch { return failure('audit_unavailable'); }
+          } else {
+            // The legacy notification file predates the versioned owner document.
+            this.store.update({ version: 1, ...document });
+          }
         }
-        catch { return { ok: false, code: 'failed' }; }
+        catch { return failure('parse_failed'); }
       }
       return result.data;
-    } catch { return { ok: false, code: 'unavailable' }; }
+    } catch { return failure('unavailable'); }
   }
 
   private configSource(target: string) {
-    return target === 'wayroost-settings' ? this.options.consumers?.notifications ?? this.supervisor : this.supervisor;
+    return target === 'wayroost-settings' && !this.legacyRoutesViaPipeline ? this.options.consumers?.notifications ?? this.supervisor : this.supervisor;
   }
 
   async workerApprovals() {
@@ -398,6 +579,10 @@ class SettingsPipeline {
   async notifications() {
     const notifications = this.options.consumers?.notifications;
     if (!notifications) return refused('not_configured');
+    if (this.legacyRoutesViaPipeline) {
+      const result = await this.refreshConsumers();
+      if (result) return result;
+    }
     return notifications.settings();
   }
 
@@ -415,6 +600,17 @@ class SettingsPipeline {
         !certified && row.fix && 'restart' in row.fix && row.fix.restart.component === 'hermes' && row.fix.restart.when === 'idle'
           ? { ...row, fix: { restart: { component: 'hermes', when: 'now' } } } : row) };
       const entries = this.audit.unresolved().filter(entry => entry.target && !(entry.action === 'restart' && entry.runId));
+      if (this.legacyRoutesViaPipeline && this.options.consumers?.feed) {
+        this.verifyFeedWork();
+        const applied = this.options.consumers.feed.appliedLevel();
+        const drift = this.feedPreferencesPending || applied !== undefined && applied !== this.store.feed().level;
+        result.rows.unshift({ id: 'wayroost.pulse-drift', state: !this.store.available() ? 'unknown' : drift ? 'fail' : 'ok',
+          ...(drift ? { priority: 'high' as const } : {}),
+          sentence: !this.store.available() ? 'Pulse preferences are unavailable.' : drift
+            ? 'The saved feed level has unfinished pulse work. Save the level again to retry.' : 'No saved feed-level change is waiting for pulse application.',
+          ...(this.store.available() && drift ? { fix: { operation: 'wayroost.preferences', params: { feed: { level: this.store.feed().level } } } } : {}),
+        });
+      }
       const targets = [...new Set(entries.map(entry => entry.target!))];
       result.rows.unshift(...targets.map(target => {
         const entry = entries.find(entry => entry.target === target)!;
@@ -530,12 +726,12 @@ class SettingsPipeline {
     return this.audit.recent().filter(entry => entry.action === 'apply' || entry.action === 'undo').map(entry => ({
       id: entry.id, at: entry.at, action: entry.action, operation: entry.operation, target: entry.target,
       keys: entry.keys, device: entry.device ? { ...entry.device, name: '' } : undefined,
-      level: entry.level, timing: entry.notes, result: entry.result, undoable: !!this.audit.token(entry.id),
+      level: entry.level, timing: entry.notes, result: entry.result, undoable: this.backendMatches(entry) && !!this.audit.token(entry.id),
       ...(context ? { undoAccess: this.rolledOut(entry.operation) ? rowAccess(operationSpec(entry.operation ?? '') ? undoLevel(operationSpec(entry.operation ?? '')!) : 'pc-only', context) : 'read-only' } : {}),
     }));
   }
 
-  private async target(spec: OperationSpec, params: Record<string, unknown>) {
+  private async target(spec: OperationSpec, params: Record<string, unknown>, publish = true) {
     const target = operationTarget(spec, params);
     const view = (Object.keys(READ_VIEWS) as ReadViewId[]).find(id => READ_VIEWS[id].target === target);
     if (!view) return { ok: false as const, code: 'not_configured' as const };
@@ -544,7 +740,7 @@ class SettingsPipeline {
       : (Object.keys(READ_VIEWS) as ReadViewId[]).filter(id => READ_VIEWS[id].target === target
         && !(READ_VIEWS[id] as ReadView).namesOnly && !(READ_VIEWS[id] as ReadView).runtime
         && !(READ_VIEWS[id] as ReadView).comparisonDigests && !(READ_VIEWS[id] as ReadView).persisted);
-    const results = await Promise.all(ids.map(id => this.read(id)));
+    const results = await Promise.all(ids.map(id => this.read(id, publish)));
     let sha256: string | undefined;
     let present: boolean | undefined;
     for (const result of results) {
@@ -581,9 +777,20 @@ class SettingsPipeline {
     keys: string[], level: SettingsLevel, timing: Timing): SettingsWriteRecord {
     this.notificationSources.set(request, target.startsWith('hermes') || target === 'dashboard' || operation.startsWith('hermes.') || operation === 'wayroost.safety-commands' ? 'hermes'
       : target.startsWith('paseo') || operation.startsWith('paseo.') ? 'paseo' : 'supervisor');
-    return { id: changeId(), at: this.now(), action, operation, target, keys,
+    return { id: changeId(), at: this.now(), action, operation, target, keys, backend: this.backend(target),
       ...(request.device ? { device: { id: request.device.id, kind: request.device.kind } } : {}),
       level, timing: timing.map(note => note.label), result: 'failed' };
+  }
+
+  private backend(target: string): NonNullable<SettingsAuditRecord['backend']> {
+    return { kind: target === 'wayroost-settings' && !this.legacyRoutesViaPipeline ? 'private' : 'pipeline', role: this.config.role };
+  }
+
+  private backendMatches(entry: SettingsAuditEntry): boolean {
+    const backend = this.backend(entry.target ?? '');
+    // Untagged Wayroost settings changes predate the owner target and belong to the private store.
+    return entry.backend ? entry.backend.kind === backend.kind && entry.backend.role === backend.role
+      : entry.target !== 'wayroost-settings' || !this.legacyRoutesViaPipeline;
   }
 
   private finish(record: SettingsWriteRecord, timing: Timing, response: SettingsApplyResponse, undoOf?: string): SettingsApplyResponse {
@@ -598,6 +805,7 @@ class SettingsPipeline {
     }
     try { this.audit.record({ ...record, result }, timing, undoOf); }
     catch (error) {
+      if (this.legacyRoutesViaPipeline) this.store.invalidate();
       if (result === 'ok' && (record.writtenSha256 || record.action === 'credential')) {
         const section = record.operation ? operationSpec(record.operation)?.section : undefined;
         this.hub.publish({ type: 'settings_changed', sections: [...new Set(['overview', 'checks', ...(section ? [section] : [])])] as SettingsSection[], change: record.id });
@@ -610,6 +818,25 @@ class SettingsPipeline {
     const feed = this.options.consumers!.feed!;
     const parsed = feedSettingsBody.safeParse(request.body);
     if (!parsed.success) return refused('invalid_parameters');
+    if (this.legacyRoutesViaPipeline) {
+      const snapshot = await this.read('wayroost.settings');
+      if (!snapshot.ok) return refused(snapshot.code);
+      const { quietHours, push, level, removeLessLike } = parsed.data;
+      if (quietHours !== undefined || push !== undefined) {
+        const response = await this.apply(request, { operation: 'wayroost.notifications', params: {
+          ...(quietHours !== undefined ? { quietHours } : {}), ...(push ? { push } : {}),
+        } });
+        if (response.status !== 'applied') return response;
+      }
+      if (level !== undefined || removeLessLike !== undefined) {
+        const response = await this.preferences(request, document => ({ feed: {
+          ...(level !== undefined ? { level } : {}),
+          ...(removeLessLike !== undefined ? { lessLike: (document.feed?.lessLike ?? []).filter(entry => entry.topic.toLowerCase() !== removeLessLike.toLowerCase()) } : {}),
+        } }));
+        if (response.status !== 'applied') return response;
+      }
+      return { ...await feed.settings(), ...this.pulseWarnings() };
+    }
     const { quietHours, push, ...patch } = parsed.data;
     if (!this.options.consumers?.notifications) return feed.updateSettings(parsed.data);
     if (quietHours !== undefined || push !== undefined) {
@@ -623,6 +850,15 @@ class SettingsPipeline {
       if (response.status !== 'applied') return response;
     }
     return feed.updateSettings(patch);
+  }
+
+  async preferences(request: FastifyRequest, patch: PreferencesPatch): Promise<SettingsApplyResponse> {
+    const result = await this.read('wayroost.settings');
+    if (!result.ok) return refused(result.code);
+    const document = documentOf(result);
+    const params = typeof patch === 'function' ? patch(wayroostSettingsSchema.parse(document)) : patch;
+    const operation = params.workerUpdates ? 'wayroost.worker-updates' : params.voice ? 'wayroost.voice' : 'wayroost.preferences';
+    return this.apply(request, { operation, params }, { ok: true, document, sha256: result.sha256 });
   }
 
   async apply(request: FastifyRequest, input: unknown, notificationSnapshot?: SettingsSnapshot): Promise<SettingsApplyResponse> {
@@ -649,13 +885,24 @@ class SettingsPipeline {
       }
     }
     if (body.data.operation === 'wayroost.notifications') {
-      const parsed = settingsNotificationsWriteBodySchema.safeParse(parameters);
-      if (!parsed.success) return refused('invalid_parameters');
-      if (!('push' in parsed.data && 'quietHours' in parsed.data)) {
+      if (this.legacyRoutesViaPipeline) {
+        const parsed = wayroostNotificationsPatchSchema.safeParse(parameters);
+        if (!parsed.success) return refused('invalid_parameters');
         const current = await this.read('wayroost.settings');
         if (!current.ok) return refused(current.code);
-        notificationSnapshot = { ok: true, document: documentOf(current), sha256: current.sha256 };
-        parameters = { ...this.store.notificationSettings(), ...parsed.data };
+        const document = documentOf(current);
+        notificationSnapshot = { ok: true, document, sha256: current.sha256 };
+        parameters = parsed.data;
+      } else {
+        const parsed = settingsNotificationsWriteBodySchema.safeParse(parameters);
+        if (!parsed.success) return refused('invalid_parameters');
+        parameters = parsed.data;
+        if (!('push' in parsed.data && 'quietHours' in parsed.data)) {
+          const current = await this.read('wayroost.settings');
+          if (!current.ok) return refused(current.code);
+          notificationSnapshot = { ok: true, document: documentOf(current), sha256: current.sha256 };
+          parameters = { ...this.store.notificationSettings(), ...parsed.data };
+        }
       }
     }
     let requestedOperation = body.data.operation;
@@ -674,7 +921,8 @@ class SettingsPipeline {
     }
     const operation = parseOperation(requestedOperation, parameters, 'server');
     if (!operation.ok) return refused(operation.code);
-    const { spec, params } = operation;
+    const { spec } = operation;
+    let params = operation.params;
     if (!this.rolledOut(operation.operation)) return refused('not_rolled_out');
     if (spec.verb !== 'config.apply') return refused('invalid_parameters');
     if (this.blocked(operationTarget(spec, params)).length) return { status: 'refused', code: 'outcome_unknown', message: SETTINGS_RESOLUTION_MESSAGE };
@@ -690,13 +938,23 @@ class SettingsPipeline {
     }
     const record = this.metadata(request, 'apply', operation.operation, operationTarget(spec, params), keys, level, timing);
     if (!decision.allowed && decision.code !== 'confirm_required') return this.finish(record, timing, refused(decision.code));
-    if (legacyOperations.has(operation.operation) && !this.legacyRoutesViaPipeline) {
+    if (!this.legacyRoutesViaPipeline && (legacyOperations.has(operation.operation)
+      || ['wayroost.preferences', 'wayroost.worker-updates', 'wayroost.voice'].includes(operation.operation))) {
       return this.finish(record, timing, refused('config_writes_off'));
     }
     this.audit.verify();
     const current: SettingsSnapshot | { ok: false; code: SettingsErrorCode } = spec.recovery
       ? { ok: true, document: {} } : notificationSnapshot ?? await this.target(spec, params);
     if (!current.ok) return this.finish(record, timing, refused(current.code));
+    if (this.legacyRoutesViaPipeline && record.target === 'wayroost-settings') params = mergeWayroostSettingsPatch(current.document, params);
+    if (this.legacyRoutesViaPipeline && record.target === 'wayroost-settings') {
+      const before = wayroostSettingsSchema.parse(current.document);
+      const next = params.feed as WayroostSettingsDocument['feed'];
+      const requested = operation.params.feed as WayroostSettingsDocument['feed'];
+      const applied = this.options.consumers?.feed?.appliedLevel();
+      record.pulse = { required: next !== undefined && ((next.level ?? 'off') !== (before.feed?.level ?? 'off')
+        || requested?.level !== undefined && (this.feedPreferencesPending || applied !== undefined && applied !== (next.level ?? 'off'))) };
+    }
     let paths = operationKeys(spec, params, current.document);
     let intended: IntendedValue[];
     if (paths === 'recorded') {
@@ -733,6 +991,10 @@ class SettingsPipeline {
     }))) return this.finish(record, timing, refused('precondition_changed'));
     const authorization = this.authorize(request, level, operation.operation, { params, intentId: intentReference ? body.data.params.intentId : null, expected: expected ?? null }, current.sha256 ?? null, body.data.confirm);
     if (authorization) return authorization.status === 'confirm' ? authorization : this.finish(record, timing, authorization);
+    if (this.legacyRoutesViaPipeline && operation.operation === 'wayroost.voice') {
+      const code = await this.options.validateVoice?.(operation.params.voice as NonNullable<WayroostSettingsDocument['voice']>, request.deviceSignal);
+      if (code) return this.finish(record, timing, refused(code));
+    }
     const source = this.configSource(record.target!);
     if (!source?.configApply) return this.finish(record, timing, refused('config_writes_off'));
     checkDeviceSignal(request.deviceSignal);
@@ -760,7 +1022,7 @@ class SettingsPipeline {
   private async unknown(request: Pick<FastifyRequest, 'deviceSignal'>, record: SettingsWriteRecord, timing: Timing,
     undoOf?: string): Promise<SettingsApplyResponse> {
     // Keep uncertain local settings disabled until the confirmed Checks resolution.
-    if (record.target === 'wayroost-settings') { this.settingsUncertain.add(record.id); this.settingsPending = false; }
+    if (record.target === 'wayroost-settings') { this.store.invalidate(); this.settingsUncertain.add(record.id); this.settingsPending = false; }
     if (record.runId && record.action === 'restart') this.drains.set(record.runId, { record, timing });
     const response: SettingsApplyResponse = { status: 'refused', code: 'outcome_unknown', backupId: record.backupId ?? null };
     try { this.finish(record, timing, response, undoOf); }
@@ -773,7 +1035,6 @@ class SettingsPipeline {
     if (request.deviceSignal?.aborted) return this.finish(record, timing, refused('not_permitted'), undoOf);
     if (record.target === 'wayroost-settings') {
       this.settingsPending = true;
-      this.store.invalidate();
     }
     let raw: unknown;
     try { raw = await call(); }
@@ -837,31 +1098,43 @@ class SettingsPipeline {
       if (token) Object.assign(record, { backupId: token.backupId, backupSha256: token.backupSha256, writtenSha256: token.writtenSha256 });
       return this.unknown(request, record, timing, undoOf);
     }
-    if (record.target === 'wayroost-settings') this.settingsPending = false;
+    let verifiedSettings: Record<string, unknown> | undefined;
+    if (record.target === 'wayroost-settings' && !this.legacyRoutesViaPipeline) this.settingsPending = false;
     if (token) {
       Object.assign(record, { backupId: token.backupId, backupSha256: token.backupSha256, writtenSha256: token.writtenSha256 });
       try {
-        const current = await this.target(spec, { target: token.target });
+        if (record.target === 'wayroost-settings') this.expectedSettingsHash = token.writtenSha256;
+        const current = await this.target(spec, { target: token.target }, !this.legacyRoutesViaPipeline);
+        this.expectedSettingsHash = undefined;
         if (result.ok && !current.ok) return this.unknown(request, record, timing, undoOf);
         if (result.ok && (!current.ok || !persistedFileMatches(current, token.writtenSha256))) result = { ok: false, code: 'verify_mismatch', committed: true, undo: token };
-        else if (result.ok && record.target === 'wayroost-settings') {
-          const consumers = this.options.consumers;
-          if (this.legacyRoutesViaPipeline && consumers?.safetyCommands && consumers.safetyCommands.enabled() !== this.safetyCommandsEnabled()) {
+        else if (result.ok && record.target === 'wayroost-settings' && current.ok) {
+          const safety = this.options.consumers?.safetyCommands;
+          if (this.legacyRoutesViaPipeline && safety && safety.enabled() !== this.safetyCommandsEnabled()) {
             result = { ok: false, code: 'verify_mismatch', committed: true, undo: token };
-          }
+          } else verifiedSettings = current.document;
         }
       } catch { return this.unknown(request, record, timing, undoOf); }
+      finally { this.expectedSettingsHash = undefined; }
     }
     if (!token && record.target === 'wayroost-settings') {
-      await this.refreshConsumers();
+      if (this.legacyRoutesViaPipeline) {
+        const current = await this.read('wayroost.settings', false);
+        if (current.ok) verifiedSettings = documentOf(current);
+      } else await this.refreshConsumers();
     }
     if (token) Object.assign(record, { backupId: token.backupId, backupSha256: token.backupSha256, writtenSha256: token.writtenSha256 });
     try {
       if (result.ok && !undoOf) await this.options.checks?.confirmIntent?.(record.id, this.now());
       if (result.ok && undoOf) await this.options.checks?.confirmUndo?.(record.id, undoOf, this.now(), this.audit.entries());
     } catch { return this.unknown(request, record, timing, undoOf); }
-    if (!result.ok && !token) return this.finish(record, timing, refused(result.code), undoOf);
-    const safetyBlocked = record.operation === 'wayroost.safety-commands'
+    if (!result.ok && !token) {
+      const response = this.finish(record, timing, refused(result.code), undoOf);
+      if (record.target === 'wayroost-settings') this.settingsPending = false;
+      if (verifiedSettings && this.legacyRoutesViaPipeline) this.store.update(verifiedSettings);
+      return response;
+    }
+    const safetyBlocked = !this.legacyRoutesViaPipeline && record.operation === 'wayroost.safety-commands'
       && this.store.safetyCommandsEnabled() !== this.safetyCommandsEnabled();
     const idleCertified = record.operation === 'hermes.revoke-always' && await this.idleRestartCertified();
     if (record.operation === 'hermes.revoke-always' && !idleCertified) {
@@ -875,15 +1148,44 @@ class SettingsPipeline {
     if (record.operation === 'hermes.revoke-always') change.restartRequired = { component: 'hermes', choices: idleCertified ? ['idle', 'now'] : ['now'], timing: [...timing] };
     if (result.ok && result.unchanged) { delete record.backupId; delete record.backupSha256; delete record.writtenSha256; }
     let response: SettingsApplyResponse;
-    try { response = this.finish(record, timing, result.ok ? { status: 'applied', change } : { status: 'refused', code: result.code, change }, undoOf); }
+    try {
+      // Persist consumer work before owner completion can survive a restart or a lost reply.
+      const applyFeed = result.ok && verifiedSettings && this.legacyRoutesViaPipeline && this.options.consumers?.feed
+        && record.pulse?.required;
+      if (applyFeed) this.recordFeedWork(record.id, true);
+      response = this.finish(record, timing, result.ok ? { status: 'applied', change } : { status: 'refused', code: result.code, change }, undoOf);
+      if (record.target === 'wayroost-settings') {
+        this.settingsPending = false;
+        if (!result.ok && token && this.legacyRoutesViaPipeline) this.store.invalidate();
+      }
+      if (result.ok && verifiedSettings && this.legacyRoutesViaPipeline) {
+        // Publish and apply consumer preferences only after the durable completion record.
+        this.store.update(verifiedSettings);
+        const safety = this.options.consumers?.safetyCommands;
+        if (safety && safety.enabled() !== this.safetyCommandsEnabled()) {
+          this.store.invalidate();
+          result = { ok: false, code: 'verify_mismatch', committed: true, undo: token! };
+          change.effective = 'mismatch';
+          response = this.finish(record, timing, { status: 'refused', code: 'verify_mismatch', change }, undoOf);
+        } else {
+          const { code, ...consumers } = await this.applySettingsConsumers(record);
+          if (code) {
+            result = { ok: false, code, committed: true, undo: token! };
+            change.effective = 'mismatch';
+            response = this.finish(record, timing, { status: 'refused', code, change }, undoOf);
+          } else response = { status: 'applied', change, ...consumers, ...this.pulseWarnings() };
+        }
+      }
+    }
     catch (error) {
       if (!(error instanceof SettingsAuditError)) throw error;
+      if (record.target === 'wayroost-settings') { this.settingsPending = false; this.store.invalidate(); }
       return { status: 'refused', code: 'audit_unavailable', change: { ...change, undoable: false } };
     }
     if (result.ok && !result.unchanged && !undoOf && record.operation === 'hermes.revoke-always' && idleCertified) {
       const restartTiming: Timing = [{ label: 'restart-when-idle:hermes' }];
       const restartRecord: SettingsWriteRecord = { id: changeId(), at: this.now(), action: 'restart', operation: 'service.restart-hermes',
-        target: 'hermes', keys: [], device: record.device, level: 'anywhere', timing: restartTiming.map(note => note.label), result: 'outcome_unknown' };
+        target: 'hermes', keys: [], backend: this.backend('hermes'), device: record.device, level: 'anywhere', timing: restartTiming.map(note => note.label), result: 'outcome_unknown' };
       try {
         const restart = await this.launchRestart(request, restartRecord, restartTiming, 'hermes', 'idle');
         if ('run' in restart && restart.run) change.restartRequired!.runId = restart.run.id;
@@ -900,12 +1202,14 @@ class SettingsPipeline {
     if (!body.success) return refused('invalid_parameters');
     const saved = this.audit.token(body.data.change);
     if (!saved) return refused('undo_changed');
+    if (!this.backendMatches(saved.entry)) return refused(legacyOperations.has(saved.token.operation) && !this.legacyRoutesViaPipeline ? 'config_writes_off' : 'undo_changed');
     if (!this.rolledOut(saved.token.operation)) return refused('not_rolled_out');
     if (this.blocked(saved.token.target).length) return { status: 'refused', code: 'outcome_unknown', message: SETTINGS_RESOLUTION_MESSAGE };
     const spec = operationSpec(saved.token.operation)!;
     const level = stricterLevel(saved.entry.level, undoLevel(spec));
     const timing = saved.entry.notes;
     const record = this.metadata(request, 'undo', saved.token.operation, saved.token.target, saved.entry.keys, level, timing);
+    if (saved.entry.pulse) record.pulse = saved.entry.pulse;
     const decision = decideChange(level, settingsContext(request, this.config));
     if (!decision.allowed && decision.code !== 'confirm_required') return this.finish(record, timing, refused(decision.code));
     if (legacyOperations.has(saved.token.operation) && !this.legacyRoutesViaPipeline) {
@@ -930,7 +1234,8 @@ class SettingsPipeline {
     const response = await this.apply(request, { operation, params, ...(confirm ? { confirm } : {}) });
     this.notificationOutcomes.set(request, response.status);
     if (response.status !== 'applied') return response;
-    if (operation === 'wayroost.safety-commands') return { enabled: this.safetyCommandsEnabled(), commands: SAFETY_COMMANDS };
+    if (operation === 'wayroost.safety-commands') return { enabled: this.safetyCommandsEnabled(), commands: SAFETY_COMMANDS,
+      ...(response.warnings ? { warnings: response.warnings } : {}) };
     if (operation === 'paseo.provider-enabled') {
       const status = await this.options.consumers?.cloudAgents?.();
       if (!status) return refused('not_configured');
@@ -1124,6 +1429,8 @@ export async function registerSettingsRoutes(app: FastifyInstance, config: AppCo
     notificationSource: (request: FastifyRequest) => pipeline.notificationSource(request),
     notificationOutcome: (request: FastifyRequest) => pipeline.notificationOutcome(request),
     workerApprovals: (request: FastifyRequest) => pipeline.serialize(request, () => pipeline.workerApprovals()),
+    preferences: (request: FastifyRequest, patch: PreferencesPatch) => pipeline.serialize(request, () => pipeline.preferences(request, patch)),
+    refresh: (request: FastifyRequest) => pipeline.serialize(request, () => pipeline.refreshConsumers()),
     legacyRoutesViaPipeline: pipeline.legacyRoutesViaPipeline,
     legacyWrite: async (request: FastifyRequest, reply: FastifyReply, operation: string, writer: () => unknown | Promise<unknown>) =>
       send(reply, await pipeline.legacyWrite(request, operation, writer)),

@@ -529,9 +529,14 @@ export type ChangeResult = z.infer<typeof changeResultSchema>;
 
 export const SETTINGS_RESOLUTION_MESSAGE = 'The target is blocked until the supervisor records a terminal outcome or you use Checks to accept the current file as is on this PC.';
 
+export const settingsWarningSchema = z.literal('pulse_pending');
+export type SettingsWarning = z.infer<typeof settingsWarningSchema>;
+
 export const settingsApplyResponseSchema = z.discriminatedUnion('status', [
   z.object({ status: z.literal('confirm'), confirm: z.string().regex(CONFIRM_CODE), summary: z.string().max(500), expiresAt: z.number().int() }).strict(),
-  z.object({ status: z.literal('applied'), change: changeResultSchema }).strict(),
+  z.object({ status: z.literal('applied'), change: changeResultSchema,
+    warnings: z.array(settingsWarningSchema).max(1).optional(),
+    calls: z.enum(['updated', 'failed', 'off']).optional(), callsMessage: z.string().max(500).optional() }).strict(),
   /** `change` is present when the file was written but a later step failed (it can be undone). */
   z.object({ status: z.literal('refused'), code: settingsErrorCodeSchema, change: changeResultSchema.optional(),
     message: z.literal(SETTINGS_RESOLUTION_MESSAGE).optional(),
@@ -575,6 +580,8 @@ export const settingsAuditRecordSchema = z.object({
   writtenSha256: sha256Schema.optional(),
   runId: z.uuid({ version: 'v4' }).optional(),
   observed: z.enum(['before', 'intended', 'supervisor', 'resolved-by-user']).optional(),
+  backend: z.object({ kind: z.enum(['pipeline', 'private']), role: z.enum(['primary', 'shadow']) }).strict().optional(),
+  pulse: z.object({ required: z.boolean() }).strict().optional(),
   device: z.object({ id: z.string().regex(DEVICE_ID), kind: z.enum(DEVICE_KINDS) }).strict().optional(),
   level: settingsLevelSchema,
   timing: z.array(timingLabelSchema).max(MAX_TIMING_NOTES),

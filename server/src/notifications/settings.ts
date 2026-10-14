@@ -109,6 +109,8 @@ function parsedInput(input: NotificationSettingsInput): NotificationSettingsInpu
 }
 
 export class NotificationSettingsStore {
+  private privateWritesDisabled = false;
+  disablePrivateWrites(): void { this.privateWritesDisabled = true; }
   readonly path: string;
   private readonly backups: string;
   private readonly auditFile: string;
@@ -153,13 +155,16 @@ export class NotificationSettingsStore {
   }
 
   async configApply(request: ConfigApplyRequest): Promise<ConfigWriteResult> {
+    if (this.privateWritesDisabled) return { ok: false, code: 'config_writes_off' };
     const signal = deviceSignal();
     return this.#one(async () => {
       checkDeviceSignal(signal);
       try {
-        const operation = parseOperation(request.operation, request.params, 'server');
+        const legacyBody = request.operation === 'wayroost.notifications' ? settingsNotificationsBodySchema.safeParse(request.params) : undefined;
+        const operation = parseOperation(request.operation, legacyBody?.success ? legacyBody.data : request.params, 'server');
         if (!operation.ok) return { ok: false, code: operation.code };
         if (operation.spec.target !== 'wayroost-settings') return { ok: false, code: 'unknown_operation' };
+        if (!['wayroost.notifications', 'wayroost.safety-commands'].includes(request.operation)) return { ok: false, code: 'config_writes_off' };
         const stored = this.#read();
         const paths = operationKeys(operation.spec, operation.params, stored?.document ?? {});
         if (paths === 'recorded') return { ok: false, code: 'invalid_parameters' };
@@ -188,6 +193,7 @@ export class NotificationSettingsStore {
   }
 
   async configUndo(request: ConfigUndoRequest): Promise<ConfigWriteResult> {
+    if (this.privateWritesDisabled) return { ok: false, code: 'config_writes_off' };
     const signal = deviceSignal();
     return this.#one(async () => {
       checkDeviceSignal(signal);
@@ -233,6 +239,7 @@ export class NotificationSettingsStore {
   }
 
   async change(input: NotificationSettingsInput, context: ChangeContext = {}): Promise<NotificationSettingsChange> {
+    if (this.privateWritesDisabled) throw new Error('config_writes_off');
     const signal = deviceSignal();
     const wanted = parsedInput(input);
     return this.#one(() => {
@@ -243,6 +250,7 @@ export class NotificationSettingsStore {
 
   /** Seed an upgrade from the existing feed preferences only when no settings file exists. */
   async initialize(routing: Pick<NotificationSettings, 'quietHours' | 'push'>): Promise<void> {
+    if (this.privateWritesDisabled) throw new Error('config_writes_off');
     await this.#one(async () => {
       if (this.#read()) return;
       const wanted = parsedInput(routing);
@@ -253,6 +261,7 @@ export class NotificationSettingsStore {
 
   /** Put the bytes back that a change replaced; the core refuses it if anything else changed since. */
   async undo(token: UndoToken): Promise<void> {
+    if (this.privateWritesDisabled) throw new Error('config_writes_off');
     const signal = deviceSignal();
     await this.#one(async () => {
       checkDeviceSignal(signal);

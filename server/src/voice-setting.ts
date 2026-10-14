@@ -13,10 +13,13 @@ export class VoiceSetting {
   private readonly path: string;
   private value: string;
   private app: AppVoice = { provider: 'local' };
+  private settingsSource?: () => { voice: string; appReadAloud: AppVoice };
+  useSettingsSource(source: () => { voice: string; appReadAloud: AppVoice }): void { this.settingsSource = source; }
 
-  constructor(stateDir: string) {
+  constructor(stateDir: string, pipeline = false) {
     this.path = join(stateDir, FILE);
-    this.value = this.load();
+    this.value = pipeline ? '' : this.load();
+    if (pipeline) this.settingsSource = () => ({ voice: '', appReadAloud: { provider: 'local' } });
   }
 
   private load(): string {
@@ -32,7 +35,7 @@ export class VoiceSetting {
   }
 
   voice(): string {
-    return this.value;
+    return this.settingsSource ? this.settingsSource().voice : this.value;
   }
 
   setVoice(voice: string): string {
@@ -40,11 +43,12 @@ export class VoiceSetting {
     return voice;
   }
 
-  appReadAloud(): AppVoice { return { ...this.app }; }
+  appReadAloud(): AppVoice { return { ...(this.settingsSource ? this.settingsSource().appReadAloud : this.app) }; }
 
   setAppReadAloud(choice: AppVoice): void { this.save(this.value, choice); }
 
   private save(voice: string, app: AppVoice): void {
+    if (this.settingsSource) throw new Error('config_writes_off');
     checkDeviceSignal();
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;

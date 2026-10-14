@@ -5,7 +5,7 @@ import { shadowBackground, type BackgroundGate } from '../background.js';
 
 // The bridge's bearer token lives in the service's private state directory.
 // deploy/setup-bridge.sh (as root) copies it to the agent user's
-// ~/.config/signalbox/bridge-token. It is never logged.
+// ~/.config/wayroost/bridge-token. It is never logged.
 
 export const BRIDGE_TOKEN_FILE = 'bridge-token';
 const TOKEN = /^[A-Za-z0-9_-]{32,512}$/;

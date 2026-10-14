@@ -157,6 +157,7 @@ export const settingsTargetsSchema = z.object({
     'pi-models': piJsonTarget.optional(),
     'pi-mcp': piJsonTarget.optional(),
     'paseo-config': paseoConfigTarget.optional(),
+    /** Strict versioned document: shared/wayroost-settings.ts; owner-run file lock, backup and audit. */
     'wayroost-settings': piJsonTarget.optional(),
     'gateway-role-map': gatewayRoleMapTarget.optional(),
     'gateway-credentials': gatewayCredentialsTarget.optional(),

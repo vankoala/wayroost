@@ -1,4 +1,6 @@
-import { SETTINGS_RESOLUTION_MESSAGE } from '../../shared/settings.js';
+import { SETTINGS_RESOLUTION_MESSAGE, type SettingsErrorCode } from '../../shared/settings.js';
+import type { WayroostSettingsDocument } from '../../shared/wayroost-settings.js';
+import { oneLine } from './feed/store.js';
 import { checkDeviceSignal, withDeviceSignal, actionSignal } from './security/device-signal.js';
 import { listenerTls } from '../../lib/loopback-tls.js';
 import { wayroostEnv } from './environment.js';
@@ -182,7 +184,7 @@ export interface AppDeps {
   power?: PowerOptions;
   settings?: SettingsOptions;
   /** Settings → Project bridge → Worker updates, when the task log runs (bridge, Hermes and Paseo all on). */
-  workerUpdates?: Pick<WorkerUpdatesSetting, 'status' | 'update'>;
+  workerUpdates?: Pick<WorkerUpdatesSetting, 'status' | 'update'> & Partial<Pick<WorkerUpdatesSetting, 'useSettingsSource' | 'refreshSettings'>>;
   /** The authenticated, read-only task ledger, when worker updates are available. */
   tasks?: Pick<TaskRelay, 'status'>;
   /**
@@ -633,11 +635,23 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return reply.code(500).send({ error: 'Something went wrong' });
   });
 
+  const voiceSetting = deps.speech ? new VoiceSetting(config.stateDir, config.settings.legacyRoutesViaPipeline) : undefined;
   const settingsRoutes = await registerSettingsRoutes(app, config, deps.supervisor, hub, { checks: buildChecks(config, deps.supervisor), ...productionSettingsReaders(config, deps.supervisor), ...deps.settings, consumers: {
     safetyCommands: deps.safetyCommands, workerApprovals: deps.workerApprovals,
     cloudAgents: sources.paseo.cloudAgents?.bind(sources.paseo),
     notifications: deps.notifications, feed: deps.feed,
-  } });
+    voice: voiceSetting,
+    workerUpdates: deps.workerUpdates?.useSettingsSource && deps.workerUpdates.refreshSettings ? deps.workerUpdates as WorkerUpdatesSetting : undefined,
+  }, validateVoice: async (voice, signal) => {
+    try { await validateVoice(voice, signal); return undefined; }
+    catch (error) {
+      checkDeviceSignal(signal);
+      return error instanceof UserFacingError && error.status === 400 ? 'invalid_parameters' : 'unavailable';
+    }
+  }, applyPhoneVoice: deps.phone ? async voice => {
+    const health = await deps.speech?.health();
+    await deps.phone!.setPhoneVoice(voice || health?.defaultVoice || '');
+  } : undefined });
 
   // ---- JSON API -----------------------------------------------------------
 
@@ -739,7 +753,6 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   // ---- Voice mode -----------------------------------------------------------
 
-  const voiceSetting = deps.speech ? new VoiceSetting(config.stateDir) : undefined;
   const sharedVoice = (voices: string[], fallback: string) => {
     const chosen = voiceSetting?.voice() ?? '';
     return chosen && voices.includes(chosen) ? chosen : fallback;
@@ -779,7 +792,28 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       return { enabled: true, available: true, voices: health.voices, defaultVoice: sharedVoice(health.voices, health.defaultVoice), ...base };
     } catch { return { enabled: true, available: false, voices: [], defaultVoice: '', ...base }; }
   };
-  app.get('/api/voice', voiceStatus);
+  const validateVoice = async (body: NonNullable<WayroostSettingsDocument['voice']>, signal?: AbortSignal): Promise<void> => {
+    if (!deps.speech || !voiceSetting) throw new UserFacingError('Voice mode is off.', 404);
+    if (body.voice) {
+      const health = await deps.speech.health();
+      checkDeviceSignal(signal);
+      if (!health.voices.includes(body.voice)) throw new UserFacingError("That voice isn't available.", 400);
+    }
+    if (body.appReadAloud?.provider === 'elevenlabs') {
+      const choice = body.appReadAloud;
+      const catalog = await loadCatalog(signal);
+      if (!catalog.available) throw new UserFacingError('ElevenLabs is unavailable. The local voice is still available.', 503);
+      if (!catalog.voices.some(v => v.id === choice.voiceId) || !catalog.models.some(m => m.id === choice.modelId)) throw new UserFacingError("That ElevenLabs voice or model isn't available.", 400);
+    }
+  };
+  app.get('/api/voice', async (req) => {
+    if (settingsRoutes.legacyRoutesViaPipeline) {
+      const result = await settingsRoutes.refresh(req);
+      if (result) return { ...await voiceStatus(req), canChange: false,
+        settingsUnavailable: result.status === 'refused' ? result.code : 'unavailable' } satisfies VoiceStatus;
+    }
+    return voiceStatus(req);
+  });
   // A read, so the preHandler hook doesn't cover it: it checks the live device itself, before
   // and after the vendor call.
   app.get('/api/voice/catalog', async (req): Promise<CloudStatus> => {
@@ -790,34 +824,32 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return catalog;
   });
 
-  app.put('/api/voice', async (req): Promise<VoiceSaveResult> => {
+  app.put('/api/voice', async (req, reply) => {
     requireDesktop(req);
     if (!deps.speech || !voiceSetting) throw new UserFacingError('Voice mode is off.', 404);
     const body = VoiceBody.parse(req.body);
-    if (body.voice) {
-      const health = await deps.speech.health();
-      if (!health.voices.includes(body.voice)) throw new UserFacingError("That voice isn't available.", 400);
-    }
-    if (body.appReadAloud?.provider === 'elevenlabs') {
-      const choice = body.appReadAloud;
-      // A local health check may have awaited before this outward catalog request.
-      requestDevice(req, devices);
-      const catalog = await loadCatalog(req.deviceSignal);
-      if (!catalog.available) throw new UserFacingError('ElevenLabs is unavailable. The local voice is still available.', 503);
-      if (!catalog.voices.some(v => v.id === choice.voiceId) || !catalog.models.some(m => m.id === choice.modelId)) throw new UserFacingError("That ElevenLabs voice or model isn't available.", 400);
-    }
+    await validateVoice(body, req.deviceSignal);
     // The preHandler hook checked the device before the handler; the vendor catalog and the
     // speech service are awaited since, so check it again right before saving.
     if (requestDevice(req, devices).kind !== 'desktop') throw new UserFacingError('Only a paired desktop can do that.', 403);
-    if (body.voice) voiceSetting.setVoice(body.voice);
-    if (body.appReadAloud) voiceSetting.setAppReadAloud(body.appReadAloud);
     let calls: VoiceSaveResult['calls'] = 'off';
     let callsMessage: string | undefined;
-    if (body.voice && deps.phone) {
+    let warnings: VoiceSaveResult['warnings'];
+    if (settingsRoutes.legacyRoutesViaPipeline) {
+      const result = await settingsRoutes.preferences(req, { voice: body });
+      if (result.status !== 'applied') return reply.code(result.status === 'refused' ? 409 : 200).send(result);
+      calls = result.calls ?? 'off';
+      callsMessage = result.callsMessage;
+      warnings = result.warnings;
+    } else {
+      if (body.voice) voiceSetting.setVoice(body.voice);
+      if (body.appReadAloud) voiceSetting.setAppReadAloud(body.appReadAloud);
+    }
+    if (body.voice && deps.phone && !settingsRoutes.legacyRoutesViaPipeline) {
       try { await deps.phone.setPhoneVoice(body.voice); calls = 'updated'; }
       catch { calls = 'failed'; callsMessage = 'App voice saved. The phone and car lines could not be updated; try saving the voice again.'; }
     }
-    return { ...await voiceStatus(req), calls, ...(callsMessage ? { callsMessage } : {}) };
+    return { ...await voiceStatus(req), calls, ...(callsMessage ? { callsMessage } : {}), ...(warnings ? { warnings } : {}) };
   });
 
   let speaking = 0;
@@ -1052,7 +1084,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return deps.workerUpdates;
   };
 
-  app.get('/api/worker-updates', async (): Promise<WorkerUpdatesStatus> => workerUpdates().status());
+  app.get('/api/worker-updates', async (req, reply) => {
+    if (settingsRoutes.legacyRoutesViaPipeline) {
+      const result = await settingsRoutes.refresh(req);
+      if (result) return reply.code(503).send(result);
+    }
+    return workerUpdates().status();
+  });
 
   app.get('/api/tasks', async (): Promise<TaskList> => {
     if (!deps.tasks) throw new UserFacingError('Tasks need the bridge, Hermes and Paseo.', 404);
@@ -1061,10 +1099,15 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get('/api/capabilities', async () => ({ tasks: !!deps.tasks }));
 
-  app.put('/api/worker-updates', async (req): Promise<WorkerUpdatesStatus> => {
+  app.put('/api/worker-updates', async (req, reply) => {
     const patch = WorkerUpdatesBody.parse(req.body);
     const setting = workerUpdates();
     requireDesktopChange(req);
+    if (settingsRoutes.legacyRoutesViaPipeline) {
+      const result = await settingsRoutes.preferences(req, { workerUpdates: patch });
+      if (result.status !== 'applied') return reply.code(result.status === 'refused' ? 409 : 200).send(result);
+      return { ...setting.status(), ...(result.warnings ? { warnings: result.warnings } : {}) };
+    }
     const result = setting.update({
       ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
       ...(patch.defaultMinutes !== undefined ? { defaultMinutes: patch.defaultMinutes } : {}),
@@ -1211,7 +1254,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return deps.feed;
   };
 
-  app.get('/api/feed', async (): Promise<FeedList> => feed().list());
+  app.get('/api/feed', async (req): Promise<FeedList> => {
+    const result = settingsRoutes.legacyRoutesViaPipeline ? await settingsRoutes.refresh(req) : undefined;
+    const list = await feed().list();
+    return result ? { ...list, settings: { ...list.settings, settingsUnavailable: result.status === 'refused' ? result.code : 'unavailable' } } : list;
+  });
 
   app.post('/api/feed/seen', async () => {
     feed().markSeen();
@@ -1220,7 +1267,30 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.post('/api/feed/:id/action', async (req): Promise<FeedActionResult> => {
     const { id } = FeedParams.parse(req.params);
-    return feed().act(id, FeedActionBody.parse(req.body).action);
+    let warnings: FeedActionResult['warnings'];
+    const response = await feed().act(id, FeedActionBody.parse(req.body).action, settingsRoutes.legacyRoutesViaPipeline ? async feedback => {
+      const entry = { ...feedback, topic: oneLine(feedback.topic, 40), example: oneLine(feedback.example, 100) };
+      if (!entry.topic) return;
+      const result = await settingsRoutes.preferences(req, document => ({ feed: { lessLike: [entry,
+        ...(document.feed?.lessLike ?? []).filter(previous => oneLine(previous.topic, 40).toLowerCase() !== entry.topic.toLowerCase())].slice(0, 30) } }));
+      if (result.status !== 'applied') {
+        const code = result.status === 'refused' ? result.code : 'confirm_required';
+        const messages: Partial<Record<SettingsErrorCode, string>> = {
+          target_missing: 'Owner-held settings are missing; the preference was not saved.',
+          unavailable: 'The settings owner did not answer; try again.',
+          locked: 'The settings file is busy; try again.',
+          not_rolled_out: 'Settings writes have not been enabled on this site.',
+          shadow_read_only: 'This shadow is read-only; change preferences on primary.',
+          not_permitted: 'This device cannot change preferences.',
+          precondition_changed: 'Preferences changed during this save; try again.',
+          outcome_unknown: SETTINGS_RESOLUTION_MESSAGE,
+        };
+        throw new UserFacingError(messages[code] ?? `Preference save refused: ${code.replaceAll('_', ' ')}.`,
+          ['not_rolled_out', 'shadow_read_only', 'not_permitted'].includes(code) ? 403 : ['unavailable', 'audit_unavailable'].includes(code) ? 503 : 409);
+      }
+      warnings = result.warnings;
+    } : undefined);
+    return { ...response, ...(warnings ? { warnings } : {}) };
   });
 
   const phonePush = () => deps.notifications ?? feed();

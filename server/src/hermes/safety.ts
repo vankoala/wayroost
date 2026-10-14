@@ -15,9 +15,10 @@ export class SafetyCommandsSetting {
   private value: boolean;
   private settingsSource?: () => boolean;
 
-  constructor(stateDir: string) {
+  constructor(stateDir: string, pipeline = false) {
     this.path = join(stateDir, FILE);
-    this.value = this.load();
+    this.value = pipeline ? false : this.load();
+    if (pipeline) this.settingsSource = () => false;
   }
 
   private load(): boolean {
@@ -35,6 +36,7 @@ export class SafetyCommandsSetting {
   useSettingsSource(source: () => boolean): void { this.settingsSource = source; }
 
   setEnabled(enabled: boolean): boolean {
+    if (this.settingsSource) throw new Error('config_writes_off');
     checkDeviceSignal();
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const tmp = `${this.path}.tmp`;

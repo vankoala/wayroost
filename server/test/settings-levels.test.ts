@@ -53,6 +53,7 @@ describe('level rules', () => {
       'hermes.approval-mode': { manual: 'anywhere', smart: 'pc-only', off: 'pc-only' }, 'hermes.revoke-always': 'anywhere',
       'hermes.skill-staging': { true: 'anywhere', false: 'pc-only' }, 'paseo.worker-approvals': { true: 'anywhere', false: 'pc-only' },
       'wayroost.safety-commands': { true: 'pc-only', false: 'anywhere' }, 'wayroost.notifications': 'anywhere',
+      'wayroost.preferences': 'anywhere', 'wayroost.worker-updates': 'pc-only', 'wayroost.voice': 'pc-only',
       'hermes.prompt-keys-move': 'confirm', 'hermes.move-to-roles': 'confirm', 'hermes.coder-mcp-path': 'confirm',
       'pi.coder-mcp-path': 'confirm', 'pi.catalog-roles': 'confirm', 'pi.default-move': 'confirm', 'paseo.profile-move': 'confirm',
       'gateway.restore-recorded': 'confirm', 'gateway.reapply-intended': 'confirm', 'gateway.record-override': 'pc-only', 'gateway.record-migration': 'pc-only',

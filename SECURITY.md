@@ -441,7 +441,7 @@ off unless you turn it on (`"bridge": { "enabled": true }`). When it's on:
 - **A bearer token is the only credential.** Wayroost makes it from 32 random
   bytes on the first start with the bridge on, keeps it in its state directory
   (mode 600) and compares it in constant time. `setup-bridge.sh` copies it to
-  the agents' user as `~/.config/signalbox/bridge-token` (mode 600). It's never
+  the agents' user as `~/.config/wayroost/bridge-token` (mode 600). It's never
   logged.
 - **Browsers are refused.** A request that carries an `Origin` header is
   refused, the `Host` must be the bridge's own loopback address (which blocks
@@ -460,12 +460,16 @@ off unless you turn it on (`"bridge": { "enabled": true }`). When it's on:
   itself.)
 - **The agents' side** sends the token only to an `http://` address on this
   machine, and never through a proxy.
-- **The Hermes plugin** (`signalbox-identity`, which `setup-bridge.sh`
+- **The Hermes plugin** (`wayroost-identity`, which `setup-bridge.sh`
   installs and enables unless you pass `--no-hermes-plugin`) runs inside
   Hermes on every tool call. It only adds the calling chat's session id to
-  Wayroost's own `mcp__signalbox__*` calls, never raises (Hermes blocks a
+  Wayroost's own `mcp__wayroost__*` calls, never raises (Hermes blocks a
   call whose hook fails), and does nothing in a Hermes that Paseo runs. The
-  agents' side passes the id on only when Hermes started it.
+  agents' side passes the id on only when Hermes started it. Both tool
+  prefixes share the same identity during the transition;
+  `bridge.legacyNames=false` refuses old prefixes and unstamped launches.
+  Audit registrations and verify the plugin mirror before cutoff; see
+  [bridge names](docs/bridge-names.md).
 - **Logs** record each call's tool, caller, target and outcome, never the
   message, a title, a folder or the token.
 
@@ -501,7 +505,7 @@ writes into a chat, so:
   with `paseo run`, ran cleanly, and printed the worker's full id as the row
   under its own run table's header (or in its JSON), within ten minutes of the
   worker's creation. Text in a message, worker output further down a result,
-  and outputs with two run tables never count. The `signalbox.parent-hermes-chat`
+  and outputs with two run tables never count. The `wayroost.parent-hermes-chat`
   label alone is a claim anyone running `paseo` could make; an unproven worker
   gets nothing, and at most 40 of them (10 per chat) are followed at once.
 - **It never carries an instruction from a worker.** Wayroost writes the
@@ -581,7 +585,7 @@ When it's on:
   the bridge's loopback listener, behind its token, Host and no-browser checks,
   and take at most 20 cards per call. Agents aren't offered them as tools, but
   any process with the token (every agent running as your user can read
-  `~/.config/signalbox/bridge-token`) can post a card and choose its "from"
+  `~/.config/wayroost/bridge-token`) can post a card and choose its "from"
   label. That's why **Do it** shows the request before anything happens.
 - **The proactivity level only touches the pulse jobs.** Settings changes go
   through the usual API checks and only pause, resume or reschedule the two

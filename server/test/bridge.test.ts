@@ -1246,9 +1246,9 @@ function stubBridge(answer: (tool: string) => unknown = () => ({ hello: 'world' 
   };
 }
 
-async function listener(bridge = stubBridge()) {
+async function listener(bridge = stubBridge(), legacyNames = true) {
   const { lines, log } = recordingLog();
-  const app = await buildBridgeServer({ background: new BackgroundGate('primary'), bridge, token: TOKEN, port: PORT, log });
+  const app = await buildBridgeServer({ background: new BackgroundGate('primary'), bridge, token: TOKEN, port: PORT, log, legacyNames });
   cleanups.push(() => app.close());
   const post = (tool: string, body: unknown, headers: Record<string, string> = {}) =>
     app.inject({
@@ -1261,6 +1261,54 @@ async function listener(bridge = stubBridge()) {
 }
 
 describe('bridge listener', () => {
+  it('shares identity between both names and refuses legacy and unnamed wrappers after cutoff', async () => {
+    for (const legacyNames of [true, false]) {
+      const { post, seen } = await listener(stubBridge(), legacyNames);
+      for (const name of ['wayroost', 'signalbox', undefined]) {
+        const response = await post('list_chats', {}, {
+          ...(name ? { 'x-bridge-name': name } : {}),
+          'x-bridge-hermes-session': '00000000_000000_fixture', 'x-bridge-cwd': APP,
+        });
+        expect(response.statusCode).toBe(name !== 'wayroost' && !legacyNames ? 403 : 200);
+      }
+      expect(seen).toHaveLength(legacyNames ? 3 : 1);
+      for (const call of seen) expect(call.identity).toEqual({ hermesSession: '00000000_000000_fixture', cwd: APP });
+      expect((await post('list_chats', {}, { 'x-bridge-name': 'other' })).statusCode).toBe(400);
+    }
+  });
+
+  it('both names share project, approval, command and pause guards and the same caller', async () => {
+    const { bridge } = setup();
+    const app = await buildBridgeServer({ background: new BackgroundGate('primary'), bridge, token: TOKEN, port: PORT,
+      legacyNames: true, log: recordingLog().log });
+    cleanups.push(() => app.close());
+    const call = (name: string, tool: string, args: object) => app.inject({ method: 'POST', url: `/bridge/v1/${tool}`,
+      headers: { host: `127.0.0.1:${PORT}`, authorization: `Bearer ${TOKEN}`, 'x-bridge-name': name,
+        'x-bridge-paseo-agent': 'caller', 'x-bridge-cwd': APP }, payload: args });
+    const newIdentity = (await call('wayroost', 'list_chats', {})).json();
+    expect((await call('signalbox', 'list_chats', {})).json()).toEqual(newIdentity);
+    expect(newIdentity.result.you.chat).toBe('paseo:caller');
+    for (const [tool, args] of [
+      ['read_chat', { chat: 'paseo:elsewhere' }],
+      ['send_message', { chat: 'paseo:idle', text: '/approve' }],
+      ['start_chat', { backend: 'paseo', agent: 'claude', mode: 'auto', text: 'fixture' }],
+      ['respond_to_approval', {}],
+    ] as const) {
+      const canonical = await call('wayroost', tool, args);
+      const legacy = await call('signalbox', tool, args);
+      expect(canonical.statusCode).toBeGreaterThanOrEqual(400);
+      expect([legacy.statusCode, legacy.json()]).toEqual([canonical.statusCode, canonical.json()]);
+    }
+    // Aliases share the pair limit; changing the name cannot buy more messages.
+    for (const name of ['wayroost', 'signalbox', 'wayroost', 'signalbox']) {
+      expect((await call(name, 'send_message', { chat: 'paseo:idle', text: 'fixture' })).statusCode).toBe(200);
+    }
+    for (const name of ['wayroost', 'signalbox']) {
+      expect((await call(name, 'send_message', { chat: 'paseo:idle', text: 'fifth' })).statusCode).toBe(429);
+    }
+    bridge.setPaused(true);
+    for (const name of ['wayroost', 'signalbox']) expect((await call(name, 'list_chats', {})).statusCode).toBe(503);
+  });
   it('requires the bearer token and never logs it', async () => {
     const { app, post, logs, seen } = await listener();
     const wrong = 'not-the-token-0123456789abcdefghijklmnop';
@@ -1490,14 +1538,16 @@ describe('bridge config and token', () => {
   };
 
   it('is off by default on port 19012, and validated strictly', () => {
-    expect(parseConfig(valid).bridge).toEqual({ enabled: false, port: 19012 });
-    expect(parseConfig({ ...valid, bridge: { enabled: true } }).bridge).toEqual({ enabled: true, port: 19012 });
-    expect(parseConfig({ ...valid, bridge: { enabled: true, port: 9000 } }).bridge).toEqual({ enabled: true, port: 9000 });
+    expect(parseConfig(valid).bridge).toEqual({ enabled: false, port: 19012, legacyNames: true });
+    expect(parseConfig({ ...valid, bridge: { enabled: true } }).bridge).toEqual({ enabled: true, port: 19012, legacyNames: true });
+    expect(parseConfig({ ...valid, bridge: { enabled: true, port: 9000, legacyNames: true } }).bridge).toEqual({ enabled: true, port: 9000, legacyNames: true });
+    expect(parseConfig({ ...valid, bridge: { legacyNames: false } }).bridge.legacyNames).toBe(false);
     const bad = [
       { bridge: { enabled: true, port: 19010 } }, // the app's own port
-      { listen: { host: '127.0.0.1', port: 9000 }, bridge: { enabled: true, port: 9000 } },
+      { listen: { host: '127.0.0.1', port: 9000 }, bridge: { enabled: true, port: 9000, legacyNames: true } },
       { bridge: { enabled: true, port: 19011 } }, // cloudflared metrics
       { bridge: { enabled: 'yes' } },
+      { bridge: { legacyNames: 'false' } },
       { bridge: { enabled: true, host: '0.0.0.0' } },
       { bridge: { port: 70000 } },
     ];

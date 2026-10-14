@@ -12,6 +12,7 @@ import type { SettingsOptions } from '../src/settings/routes.js';
 import { SettingsAudit } from '../src/settings/audit.js';
 import { blockedReason, parseSlash } from '../src/hermes/commands.js';
 import { settingsApplyResponseSchema, SETTINGS_ERROR_CODES, recentChangeSchema } from '../../shared/settings.js';
+import { describeApplyResponse, settingsErrorText } from '../../web/src/settingsModel.js';
 import { FakeSettingsSupervisor } from './fake-settings-supervisor.js';
 import { SafetyCommandsSetting } from '../src/hermes/safety.js';
 import { pendingWorkerApprovals, WorkerApprovalsStatus } from '../../shared/safety.js';
@@ -111,6 +112,29 @@ it('refuses verification when live Safety differs from the saved settings', asyn
   expect(f.events).toEqual([expect.objectContaining({ type: 'settings_changed' })]);
 });
 
+it.each(['apply', 'undo'] as const)('does not describe a refused %s as saved when consumer validation precedes persistence', async action => {
+  const f = await fixture({ local: true });
+  const params = { provider: 'codex', enabled: false };
+  const first = action === 'undo' ? (await f.write('paseo.provider-enabled', params)).json() : undefined;
+  if (first) expect(first.status).toBe('applied');
+  const before = structuredClone(f.supervisor.documents['paseo-config']);
+  const sha = f.supervisor.sha('paseo-config');
+  const method = action === 'apply' ? f.supervisor.configApply : f.supervisor.configUndo;
+  method.mockClear();
+  method.mockResolvedValueOnce({ ok: false, code: 'consumer_refused' });
+  f.events.length = 0;
+  const response = action === 'apply' ? await f.write('paseo.provider-enabled', params) : await f.undo(first.change.id);
+  const body = settingsApplyResponseSchema.parse(response.json());
+  expect(body).toEqual({ status: 'refused', code: 'consumer_refused' });
+  expect(method).toHaveBeenCalledOnce();
+  expect(f.supervisor.documents['paseo-config']).toEqual(before);
+  expect(f.supervisor.sha('paseo-config')).toBe(sha);
+  expect(f.events).toEqual([]);
+  const message = 'The settings could not be accepted or applied. Check the current values and retry.';
+  expect(settingsErrorText('consumer_refused')).toBe(message);
+  expect(describeApplyResponse(body)).toEqual({ kind: 'refused', code: 'consumer_refused', message });
+});
+
 it('refreshes a live consumer even when the supervisor reports a failure after committing', async () => {
   const f = await fixture({ consumers: true });
   const apply = f.supervisor.configApply.getMockImplementation()!;
@@ -119,7 +143,11 @@ it('refreshes a live consumer even when the supervisor reports a failure after c
     if (!result.ok || !('undo' in result)) throw new Error('demo-unexpected-result');
     return { ok: false, code: 'consumer_refused', committed: true, undo: result.undo };
   });
-  expect((await f.write('wayroost.safety-commands', { enabled: false })).json()).toMatchObject({ status: 'refused', code: 'consumer_refused' });
+  const response = settingsApplyResponseSchema.parse((await f.write('wayroost.safety-commands', { enabled: false })).json());
+  expect(response).toMatchObject({ status: 'refused', code: 'consumer_refused', change: { effective: 'mismatch', undoable: true } });
+  if (response.status !== 'refused') throw new Error('expected a refusal');
+  expect(describeApplyResponse(response)).toMatchObject({ kind: 'refused', code: 'consumer_refused', change: response.change,
+    message: 'The settings could not be accepted or applied. Check the current values and retry.' });
   expect(f.safetyCommands.enabled()).toBe(false);
   expect(f.events).toEqual([expect.objectContaining({ type: 'settings_changed' })]);
 });
@@ -333,38 +361,26 @@ it('drops a lost credential write without retaining or recording its secret', as
   expect(JSON.stringify(f.rows())).not.toContain('obviously-fake-credential');
 });
 
-it.each([false, true])('preserves absence preconditions against a file created during dispatch with explicit expected=%s', async explicit => {
+it.each([false, true])('refuses a missing authoritative document before dispatch with explicit expected=%s', async explicit => {
   const f = await fixture({ consumers: true });
   delete f.supervisor.documents['wayroost-settings'];
-  const apply = f.supervisor.configApply.getMockImplementation()!;
-  f.supervisor.configApply.mockImplementationOnce(async request => {
-    f.supervisor.documents['wayroost-settings'] = { push: { approvals: false, cards: true } };
-    return apply(request);
-  });
-  const response = explicit
-    ? await f.write('wayroost.notifications', { push: { approvals: true, cards: false }, quietHours: null }, { expected: { keys: [0, 1, 2].map(key => ({ key, exists: false })) } })
-    : await f.write('wayroost.notifications', { push: { approvals: true, cards: false }, quietHours: null });
-  expect(response.json()).toEqual({ status: 'refused', code: 'precondition_changed' });
-  expect(f.supervisor.documents['wayroost-settings']).toEqual({ push: { approvals: false, cards: true } });
-  expect(f.supervisor.configApply.mock.calls[0]![0].preconditions).toEqual({
-    keys: [0, 1, 2].map(key => ({ key, exists: false })),
-  });
+  const response = await f.write('wayroost.notifications', { push: { approvals: true, cards: false }, quietHours: null },
+    explicit ? { expected: { keys: [0, 1, 2].map(key => ({ key, exists: false })) } } : {});
+  expect(response.json()).toEqual({ status: 'refused', code: 'target_missing' });
+  expect(f.supervisor.documents['wayroost-settings']).toBeUndefined();
+  expect(f.supervisor.configApply).not.toHaveBeenCalled();
+  expect(f.safetyCommands.enabled()).toBe(false);
   expect(f.events).toEqual([]);
 });
 
-it('creates absent settings under key preconditions without replacing unrelated fields', async () => {
+it('preserves absent owner fields on a valid versioned document', async () => {
   const f = await fixture({ consumers: true });
-  delete f.supervisor.documents['wayroost-settings'];
-  const apply = f.supervisor.configApply.getMockImplementation()!;
-  f.supervisor.configApply.mockImplementationOnce(async request => {
-    f.supervisor.documents['wayroost-settings'] = { safetyCommandsEnabled: true };
-    return apply(request);
-  });
+  f.supervisor.documents['wayroost-settings'] = { version: 1, safetyCommandsEnabled: true };
   expect((await f.write('wayroost.notifications', { push: { approvals: true, cards: false }, quietHours: null })).json())
     .toMatchObject({ status: 'applied', change: { effective: 'verified' } });
-  expect(f.supervisor.documents['wayroost-settings']!.push).toEqual({ approvals: true, cards: false });
   expect(f.supervisor.documents['wayroost-settings']!.safetyCommandsEnabled).toBe(true);
-  expect(f.supervisor.configApply.mock.calls[0]![0].preconditions).toEqual({ keys: [0, 1, 2].map(key => ({ key, exists: false })) });
+  expect(f.supervisor.documents['wayroost-settings']).not.toHaveProperty('workerUpdates');
+  expect(f.supervisor.configApply.mock.calls[0]![0].preconditions).toHaveProperty('file');
 });
 
 it('requires confirmed PC acceptance before another request and preserves the resolution after restart', async () => {

@@ -17,7 +17,7 @@ import { withDeviceSignal } from '../src/security/device-signal.js';
 import { UserFacingError, type HermesSource } from '../src/sources.js';
 import { INVISIBLE } from '../../shared/invisible.js';
 import { backgroundStarts, launchedHere, readLaunchProof } from '../src/tasks/launch-proof.js';
-import { DUE_LABEL, SENDER, TaskRelay, quoteWorker, type TaskRelayDeps } from '../src/tasks/relay.js';
+import { DUE_LABEL, SENDER, TaskRelay, dueMinutesOf, quoteWorker, type TaskRelayDeps } from '../src/tasks/relay.js';
 import { WorkerUpdatesSetting } from '../src/tasks/setting.js';
 import { TaskStore } from '../src/tasks/store.js';
 import type { TaskEvent, TaskEventTotal } from '../src/tasks/history.js';
@@ -3067,3 +3067,9 @@ describe('its own source', () => {
 
 // Typed only: a card the log raises must pass the feed's own input rules.
 export type _Card = FeedCard;
+
+it('keeps historical time-box labels readable, with canonical labels taking precedence', () => {
+  expect(dueMinutesOf({ 'signalbox.due-minutes': '30' })).toBe(30);
+  expect(dueMinutesOf({ [DUE_LABEL]: '45', 'signalbox.due-minutes': '30' })).toBe(45);
+  expect(dueMinutesOf({ [DUE_LABEL]: 'bad', 'signalbox.due-minutes': '30' })).toBeUndefined();
+});

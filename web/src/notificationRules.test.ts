@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NotificationSettingsView } from '../../shared/protocol';
 import { NotificationRules } from './components/NotificationRules';
 import { ForYouSettings } from './components/ForYouSettings';
+import { SafetyCommandsSettings } from './pages/Settings.js';
+import { settingsErrorText } from './settingsModel.js';
 import { api, serializeNotificationSettingsSave } from './api.js';
 import { disablePush, enablePush, pushState } from './push';
 import { getState, setState } from './store';
@@ -27,16 +29,19 @@ const fixture = vi.hoisted(() => ({
   saved: [] as unknown[],
   failure: '' as string,
   feedEnabled: false,
+  settingsUnavailable: undefined as string | undefined,
 }));
 
 vi.mock('./api', async () => {
   const actual = await vi.importActual<typeof import('./api.js')>('./api.js');
   const feedSettings = () => ({
     level: 'normal', pulseFound: true, lessLike: [],
+    ...(fixture.settingsUnavailable ? { settingsUnavailable: fixture.settingsUnavailable } : {}),
     quietHours: fixture.view.quietHours, push: fixture.view.push,
     pushAvailable: fixture.view.pushAvailable, pushDevices: fixture.view.pushDevices,
   });
   return { ...actual, api: {
+    safetyCommands: vi.fn(async () => { throw new Error('The settings file for this target is missing.'); }),
     feed: async () => {
       if (!fixture.feedEnabled) throw new Error('For you is disabled.');
       return { settings: feedSettings() };
@@ -90,6 +95,7 @@ afterEach(async () => {
   fixture.saved.length = 0;
   fixture.failure = '';
   fixture.feedEnabled = false;
+  fixture.settingsUnavailable = undefined;
   fixture.view = startingView;
   vi.restoreAllMocks();
   vi.clearAllMocks();
@@ -103,6 +109,37 @@ const select = (box: HTMLElement, label: string): HTMLSelectElement =>
   box.querySelector(`select[aria-label="${label}"]`) as HTMLSelectElement;
 const button = (box: HTMLElement, label: string): HTMLButtonElement =>
   box.querySelector(`button[aria-label="${label}"]`) as HTMLButtonElement;
+
+it('shows the feed settings reason when cards remain readable during an outage', async () => {
+  fixture.feedEnabled = true;
+  fixture.settingsUnavailable = 'target_missing';
+  const box = await render(true);
+  expect(box.textContent).toContain('For you unavailable');
+  expect(box.textContent).toContain('The settings file for this target is missing');
+  expect(box.querySelector('select[aria-label="How often Hermes speaks up"]')).toBeNull();
+});
+
+it('shows Safety command read failures instead of a permissive placeholder', async () => {
+  const box = await render();
+  await act(async () => root!.render(h(SafetyCommandsSettings)));
+  expect(box.textContent).toContain('Safety commands unavailable');
+  expect(box.textContent).toContain('The settings file for this target is missing');
+  expect(box.textContent).not.toContain('Approvals are never automatic');
+});
+
+it('describes a missing target without assuming an owner settings migration', () => {
+  expect(settingsErrorText('target_missing')).toContain('this target');
+  expect(settingsErrorText('target_missing')).not.toContain('migration');
+});
+
+it('shows unavailable settings and the missing-owner reason instead of editable defaults', async () => {
+  vi.mocked(api.notificationSettings).mockRejectedValue(new Error('The authoritative settings file is missing. An explicit migration is required.'));
+  const box = await render();
+  expect(box.textContent).toContain('Notifications unavailable');
+  expect(box.querySelector('[role="status"]')?.textContent).toContain('explicit migration');
+  expect(box.querySelector('select')).toBeNull();
+  expect(fixture.saved).toEqual([]);
+});
 
 describe('notification write rollout', () => {
   it.each(['quiet hours', 'phone alerts'].flatMap(control => [false, undefined].map(settingsPages => ({ control, settingsPages }))))

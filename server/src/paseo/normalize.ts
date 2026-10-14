@@ -137,8 +137,9 @@ export function agentStatus(agent: AgentSnapshotPayload, pendingApprovals: numbe
  * it only ever names a Paseo agent.
  */
 export const PARENT_AGENT_LABEL = 'paseo.parent-agent-id';
-/** Signalbox's label for the Hermes chat that started an agent through the bridge. Paseo ignores it. */
-export const HERMES_PARENT_LABEL = 'signalbox.parent-hermes-chat';
+/** Wayroost's label for the Hermes chat that started an agent through the bridge. Paseo ignores it. */
+export const HERMES_PARENT_LABEL = 'wayroost.parent-hermes-chat';
+export const LEGACY_HERMES_PARENT_LABEL = 'signalbox.parent-hermes-chat';
 
 type Parent = NonNullable<ConversationSummary['parent']>;
 
@@ -146,7 +147,7 @@ type Parent = NonNullable<ConversationSummary['parent']>;
 export function labelledParent(labels: Record<string, string> | undefined): Parent | undefined {
   const paseo = str(labels?.[PARENT_AGENT_LABEL])?.trim();
   if (paseo) return { source: 'paseo', id: paseo };
-  const hermes = str(labels?.[HERMES_PARENT_LABEL])?.trim();
+  const hermes = str(labels?.[HERMES_PARENT_LABEL] ?? labels?.[LEGACY_HERMES_PARENT_LABEL])?.trim();
   if (hermes) return { source: 'hermes', id: hermes };
   return undefined;
 }
@@ -199,7 +200,7 @@ export function agentProject(agent: Pick<AgentSnapshotPayload, 'cwd'>, placement
 
 /**
  * When the agent last really did something: its last user message (a bridge
- * delivery counts), or when Signalbox saw it start or stop running. Not Paseo's
+ * delivery counts), or when Wayroost saw it start or stop running. Not Paseo's
  * `updatedAt`, which also moves when an agent is merely reloaded or resumed.
  * Without either: when it was created, else `updatedAt`.
  */
@@ -219,7 +220,7 @@ export function agentSummary(
   label: string,
   pendingApprovals: number,
   placement: Placement = null,
-  /** When Signalbox last saw the agent start or stop running. */
+  /** When Wayroost last saw the agent start or stop running. */
   lastSeenActive?: number,
 ): ConversationSummary {
   let preview: string | undefined;

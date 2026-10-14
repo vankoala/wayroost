@@ -116,6 +116,7 @@ export function NotificationRules() {
   const [deviceBusy, setDeviceBusy] = useState(false);
   const busy = saving || deviceBusy;
   const [push, setPush] = useState<PushState | null>(null);
+  const [unavailable, setUnavailable] = useState<string | null>(null);
   // Reads keep their generation; saves invalidate reads before and during the write.
   const settingsGeneration = useRef(0);
   const rolloutGeneration = useStore(() => getRolloutGeneration('settingsPages'));
@@ -129,8 +130,13 @@ export function NotificationRules() {
       (settings) => {
         if (!live || !rollout.still() || generation !== settingsGeneration.current) return;
         setEditor((current) => refreshEditor(current, settings));
+        setUnavailable(null);
       },
-      () => {}, // Notifications aren't set up here: no section
+      (error: unknown) => {
+        if (!live || !rollout.still() || generation !== settingsGeneration.current) return;
+        setUnavailable(error instanceof Error ? error.message : 'The authoritative settings could not be read.');
+        setEditor(current => ({ ...current, view: null }));
+      },
     );
     return () => { live = false; };
   }, [rolledOut, rolloutGeneration]);
@@ -154,7 +160,7 @@ export function NotificationRules() {
     return () => { live = false; };
   }, [view?.pushAvailable]);
 
-  if (!view) return null;
+  if (!view) return unavailable ? <div className="section"><div className="section-label">Notifications unavailable</div><p role="status" className="muted">{unavailable}</p></div> : null;
 
   const rules = drafts.map(({ event, source, delivery }) => ({ event, source, delivery }));
   const dirty = JSON.stringify(rules) !== JSON.stringify(draftsFrom(view));

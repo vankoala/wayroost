@@ -57,8 +57,9 @@ ones are forgotten after 14, and at most 300 are kept.
   work you started; your phone's own Do Not Disturb can hold those.
   These are the same hours Settings → Notifications routes alerts by, and
   writing them on either page writes the other; they're read in the time
-  zone the site file names (`notifications.timeZone`), not this PC's. See
-  [Alerts](notifications.md).
+  zone named by the [owner-held settings document](wayroost-settings.md)
+  in pipeline mode, or `notifications.timeZone` in the legacy site file. Unset
+  uses this PC's zone. See [Alerts](notifications.md).
 - **Notifications on this device**, turned on per phone or computer. Then
   choose what they're for:
   - *When an agent needs you*: an approval or question in Hermes or Paseo,
@@ -136,8 +137,8 @@ so it never caches pages or sees requests.
 
 | File | In | Contents |
 | --- | --- | --- |
-| `feed.json` | the state folder (`/var/lib/signalbox`), mode 600 | The cards, your settings and turned-down topics, and which approvals have been notified. |
-| `wayroost-settings.json` | the state folder, mode 600 | Wayroost's own settings: notification rules, quiet hours, and the phone's switches. Written through the write-through core, which keeps `settings-backups/` and `settings-audit/settings.jsonl` beside it. See [Alerts](notifications.md). |
+| `feed.json` | the state folder (`/var/lib/signalbox`), mode 600 | Cards and approval notification bookkeeping. Legacy mode also stores preferences and turned-down topics; pipeline mode preserves those opaque legacy fields without reading them. |
+| `wayroost-settings.json` | the state folder, mode 600 | Legacy notification preferences, with `settings-backups/` and `settings-audit/settings.jsonl`. Pipeline mode uses the [owner-held settings target](wayroost-settings.md) for all Wayroost preferences instead. |
 | `push.json` | the state folder, mode 600 | The VAPID key pair and each device's push subscription. An unusable one is set aside as `push.json.bad` and a new key made (phones then turn notifications on again). |
 | `pulse-relay-state.json` | `~/.hermes`, mode 600 | The relay's side: which runs it has handled, and cards Wayroost couldn't take yet (for up to 12 hours). |
 
@@ -163,7 +164,7 @@ posting cards it stays empty, but phone notifications for approvals still work.
   approvals still apply.
 - **Who can post cards.** Anything holding the bridge token can post: the
   pulse, and any agent running as your user (the agents' copy of the token is
-  in `~/.config/signalbox/bridge-token`). Browsers can't use the bridge. A card
+  in `~/.config/wayroost/bridge-token`). Browsers can't use the bridge. A card
   from an agent is labelled "From an agent" only if it says `source: "agent"`.
   Because the label can't be trusted, the confirmation step matters.
 - **Notifications carry little.** Approval notifications say which agent needs

@@ -11,6 +11,7 @@ import { Devices } from '../src/devices.js';
 import { encryptPayload, endpointProblem, PushSender } from '../src/feed/push.js';
 import { BRIEF_JOB, Feed, SCOUT_JOB, SCOUT_SCHEDULES } from '../src/feed/service.js';
 import { CardInput, FeedStore } from '../src/feed/store.js';
+import { WayroostSettingsStore } from '../src/settings/store.js';
 import { apiHeaders, makeApp, makeKeys, makeToken, postHeaders, seedDevices, TEST_PHONE, type Keys } from './helpers.js';
 
 const dir = () => mkdtempSync(join(tmpdir(), 'sb-feed-'));
@@ -524,6 +525,23 @@ describe('Feed service', () => {
     now = Date.UTC(2026, 9, 2, 23, 0);
     feed.ingest('scout', [card('mail:4')]);
     expect(sent).toHaveLength(1);
+  });
+
+  it('uses the verified owner snapshot for standalone approval alerts and never reads private preferences', () => {
+    const push = { devices: () => 1, send: vi.fn(async () => ({ sent: 1, failed: 0, removed: 0 })) };
+    const { feed, hub, store } = service({ push: push as unknown as PushSender });
+    const snapshot = new WayroostSettingsStore();
+    snapshot.update({ version: 1, push: { approvals: false } });
+    feed.useSettingsSource(() => ({ ...snapshot.feed(), ...snapshot.notificationSettings() }));
+    const privateRead = vi.spyOn(store, 'settings');
+    feed.start();
+    cleanups.push(async () => feed.stop());
+    hub.publish({ type: 'approval_upsert', approval: approval('owner-alert-1') });
+    expect(push.send).not.toHaveBeenCalled();
+    snapshot.update({ version: 1, push: { approvals: true } });
+    hub.publish({ type: 'approval_upsert', approval: approval('owner-alert-2') });
+    expect(push.send).toHaveBeenCalledOnce();
+    expect(privateRead).not.toHaveBeenCalled();
   });
 
   it('applies the proactivity level to the pulse jobs, and nothing else', async () => {

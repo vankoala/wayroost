@@ -12,9 +12,12 @@ and undo for these settings while the switch is `false`.
 Before deliberately enabling this switch, stop Wayroost and the existing writers.
 Carry the current Cloud agents and Worker approvals choices into the pipeline's
 Paseo configuration, preserving their effective provider policies. Copy the
-current `enabled` value from `hermes-safety-commands.json` into
-`safetyCommandsEnabled` in the shared Wayroost settings, preserving notification
-fields. This is a one-time operator action: startup never copies or
+effective Safety, notification, feed, worker-update and voice choices into the
+versioned [owner-held settings document](wayroost-settings.md), preserving
+absent versus explicit values where their effective defaults agree. Materialize
+legacy defaults for worker updates and feed level, and carry the site-file
+notification time zone explicitly. This is a one-time operator action: startup
+never copies or
 reconciles either store. Verify the supervisor's config verbs and writes, then
 set `settings.legacyRoutesViaPipeline` to `true` and restart Wayroost. Before
 rolling back to `false`, stop the writers and carry the current pipeline choices

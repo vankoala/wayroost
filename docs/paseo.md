@@ -60,7 +60,7 @@ Each agent becomes a conversation:
 | status | `running`/`initializing` → working; `error` → error; pending permissions → needs you |
 | agent | the provider label (Claude Code, Codex, OpenCode, Pi, Hermes…) |
 | project | the git root (worktrees group with the main repo) or the working directory |
-| nested under | the agent in Paseo's `paseo.parent-agent-id` label, else the Hermes chat in Wayroost's `signalbox.parent-hermes-chat` label, else (while Wayroost remembers it) the chat that started it through the [bridge](bridge.md#starting-chats) |
+| nested under | the agent in Paseo's `paseo.parent-agent-id` label, else the Hermes chat in Wayroost's `wayroost.parent-hermes-chat` label, else (while Wayroost remembers it) the chat that started it through the [bridge](bridge.md#starting-chats) |
 | Hermes · in Paseo | agents whose provider is `hermes`. Such an agent is also known by its ACP session id, the id Hermes gives it, so the `delegate_task` runs it starts nest under it. Nothing else of how Paseo resumes it leaves the server. |
 
 Only active agents are listed: archived ones are left out, like in the Paseo

@@ -641,26 +641,29 @@ describe('production settings pipeline', () => {
 
   it.each(['before', 'intended', 'other'] as const)('keeps an uncertain local write blocked with %s values until the Checks confirmation', async observed => {
     const f = await fixture({ pipeline: true });
+    const privateApply = vi.spyOn(f.notifications, 'configApply');
     expect((await f.write('wayroost.safety-commands', { enabled: true })).json().status).toBe('applied');
-    const apply = f.notifications.configApply.bind(f.notifications);
-    vi.spyOn(f.notifications, 'configApply').mockImplementationOnce(async request => {
+    const apply = f.supervisor.configApply.getMockImplementation()!;
+    f.supervisor.configApply.mockImplementationOnce(async request => {
       if (observed !== 'before') await apply(request);
       throw new Error('lost response');
     });
     const params = { push: { approvals: false, cards: true }, quietHours: null, rules: [] };
     expect((await f.write('wayroost.notifications', params)).json().code).toBe('outcome_unknown');
     if (observed === 'other') await apply({ requestId: randomUUID(), operation: 'wayroost.notifications', params: { ...params, quietHours: { start: '22:00', end: '06:00' } } });
-    Object.assign(f.supervisor, { configRequestStatus: vi.fn(async () => { throw new Error('must not look up server writes'); }) });
+    Object.assign(f.supervisor, { configRequestStatus: vi.fn(async () => { throw new Error('supervisor outcome unavailable'); }) });
     expect((await f.app.inject({ url: '/api/safety-commands', headers: apiHeaders('fake') })).json()).toMatchObject({ status: 'refused', code: 'outcome_unknown' });
+    expect((await f.app.inject({ url: '/api/settings/notifications', headers: apiHeaders('fake') })).json()).toMatchObject({ status: 'refused', code: 'outcome_unknown' });
+    expect(f.notifications.settings().push.cards).toBe(false);
     const change = f.audit().filter(entry => entry.operation === 'wayroost.notifications').at(-1).id;
     const fix = { target: 'wayroost-settings', change };
     const prompt = (await f.write('settings.accept-current', fix)).json();
-    const file = readFileSync(join(f.config.stateDir, 'wayroost-settings.json'), 'utf8');
+    const file = structuredClone(f.supervisor.documents['wayroost-settings']);
     expect((await f.write('settings.accept-current', fix, { confirm: prompt.confirm })).json().status).toBe('applied');
-    expect(readFileSync(join(f.config.stateDir, 'wayroost-settings.json'), 'utf8')).toBe(file);
+    expect(f.supervisor.documents['wayroost-settings']).toEqual(file);
     expect((await f.app.inject({ url: '/api/safety-commands', headers: apiHeaders('fake') })).json().enabled).toBe(true);
-    expect(f.supervisor.configRequestStatus).not.toHaveBeenCalled();
-    expect(f.notifications.configApply).toHaveBeenCalledOnce();
+    expect(f.supervisor.configRequestStatus).toHaveBeenCalled();
+    expect(privateApply).not.toHaveBeenCalled();
   });
 });
 

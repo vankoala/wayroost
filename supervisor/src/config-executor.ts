@@ -4,6 +4,7 @@ import { basename, dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
+import { wayroostSettingsSchema } from '../../shared/wayroost-settings.js';
 import { READ_VIEWS, operationTarget, parseOperation, publicKeyNames, readViewValues, type ReadView, type ReadViewId } from '../../shared/settings-ops.js';
 import { settingsTargetsSchema, type SettingsTargets } from '../../shared/settings-targets.js';
 import { configApplyRequestSchema, configReadRequestSchema, configReadResultSchema, configUndoRequestSchema,
@@ -192,6 +193,7 @@ async function readConfigSnapshot(site: SettingsTargets, id: ReadViewId): Promis
   const managedBefore = await readManaged();
   const document = effectiveHermes ? await resolveHermesConfig(site, view)
     : target.format === 'toml' ? readConfigToml(snapshot!.source) : (target.format === 'yaml' ? yamlEditor : jsonEditor).parse(snapshot!.source);
+  if (view.target === 'wayroost-settings' && !wayroostSettingsSchema.safeParse(document).success) throw new ConfigError('parse_failed');
   if (effectiveHermes && ((await read())?.sha256 !== snapshot?.sha256 || (await readManaged())?.sha256 !== managedBefore?.sha256)) {
     throw new ConfigError('precondition_changed');
   }
@@ -291,6 +293,7 @@ async function writeConfig(input: ExecutorRequest, dependencies: ExecutorDepende
       if (request) {
         if (request.afterSeconds !== undefined) throw new ConfigError('invalid_parameters');
         const current = editor.parse(snapshot.source);
+        if (targetId === 'wayroost-settings' && !wayroostSettingsSchema.safeParse(current).success) throw new ConfigError('parse_failed');
         const plan = configOperations(operation, request.params, input.caller, current, input.site, input.context);
         keys = await publicKeyNames(targetId, plan.paths);
         const preconditions: ValuePrecondition[] = request.preconditions && 'keys' in request.preconditions ? request.preconditions.keys.map(condition => {
@@ -302,6 +305,7 @@ async function writeConfig(input: ExecutorRequest, dependencies: ExecutorDepende
         if (request.preconditions && 'file' in request.preconditions && request.preconditions.file.sha256 !== snapshot.sha256) throw new ConfigError('precondition_changed');
         checkPreconditions(current, preconditions);
         const edited = plan.operations.length ? editor.edit(snapshot.source, plan.operations) : snapshot.source;
+        if (targetId === 'wayroost-settings' && !wayroostSettingsSchema.safeParse(editor.parse(edited)).success) throw new ConfigError('invalid_parameters');
         const record = parsed?.ok && parsed.spec.records || input.context?.migration
           ? migrationRecord(targetId, plan.paths, current, editor.parse(edited), snapshot.sha256, digest(edited)) : undefined;
         const prospectiveUndo = { operation, target: targetId, backupId, backupSha256: snapshot.sha256, writtenSha256: digest(edited) };
@@ -330,6 +334,8 @@ async function writeConfig(input: ExecutorRequest, dependencies: ExecutorDepende
       if (snapshot.sha256 !== token.writtenSha256) throw new ConfigError('undo_changed');
       const backup = await readConfigFile(join(configBackupDirectory(target), token.backupId), target.runAs.uid);
       if (backup.sha256 !== token.backupSha256) throw new ConfigError('backup_mismatch');
+      if (targetId === 'wayroost-settings' && (!wayroostSettingsSchema.safeParse(editor.parse(snapshot.source)).success
+        || !wayroostSettingsSchema.safeParse(editor.parse(backup.source)).success)) throw new ConfigError('parse_failed');
       const record = input.context?.migration ? migrationRecord(targetId, input.context.migration.keys.map(key => key.path), editor.parse(snapshot.source),
         editor.parse(backup.source), snapshot.sha256, backup.sha256) : undefined;
       const prospectiveReverse = { operation, target: targetId, backupId, backupSha256: snapshot.sha256, writtenSha256: backup.sha256 };

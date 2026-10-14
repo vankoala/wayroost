@@ -1,4 +1,4 @@
-import { checkDeviceSignal, deviceSignal, actionSignal } from '../security/device-signal.js';
+import { abortOnDevice, checkDeviceSignal, deviceSignal, actionSignal, withDeviceSignal } from '../security/device-signal.js';
 import type { HermesCredentials } from '../secrets.js';
 
 // Signs in to the Hermes dashboard the way its own clients do: password login
@@ -98,12 +98,15 @@ export class HermesAuth {
   }
 
   /** A currently valid access token, refreshing or signing in again as needed. */
-  async token(): Promise<string> {
+  async token(signal = deviceSignal()): Promise<string> {
+    checkDeviceSignal(signal);
     if (this.accessToken && Date.now() < this.expiresAt - EXPIRY_MARGIN_MS) return this.accessToken;
-    this.inflight ??= this.renew().finally(() => {
+    // The session is shared; revoking one device cancels only that device's wait.
+    this.inflight ??= withDeviceSignal(undefined, () => this.renew()).finally(() => {
       this.inflight = undefined;
     });
-    await this.inflight;
+    await abortOnDevice(this.inflight, signal);
+    checkDeviceSignal(signal);
     return this.accessToken!;
   }
 
@@ -111,7 +114,7 @@ export class HermesAuth {
   async fetch(path: string, init: RequestInit = {}, signal = deviceSignal()): Promise<Response> {
     const send = async () => {
       checkDeviceSignal(signal);
-      const token = await this.token();
+      const token = await this.token(signal);
       checkDeviceSignal(signal);
       return fetch(`${this.baseUrl}${path}`, {
         ...init,

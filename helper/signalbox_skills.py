@@ -461,7 +461,7 @@ class SkillsService:
                 if copy["hash"] == src["hash"]:
                     self._set_synced(place.id, name, src["hash"])
                     continue
-                # A copy from before this sync existed (sync-claude.sh, Paseo's installer, an older
+                # A copy from before this sync existed (an earlier manual copy script, Paseo's installer, an older
                 # install): the shared folder is the source, so it is replaced, and kept in backups.
                 never_synced = self._synced(place.id, name) is None
                 if (copy["hash"] == self._synced(place.id, name) or never_synced) and not blocked(place.id, name, src["hash"]):

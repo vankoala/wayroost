@@ -1,4 +1,4 @@
-import { checkDeviceSignal, deviceSignal, withDeviceSignal } from '../security/device-signal.js';
+import { abortOnDevice, checkDeviceSignal, deviceSignal, withDeviceSignal } from '../security/device-signal.js';
 import { randomBytes } from 'node:crypto';
 import { posix } from 'node:path';
 import { z } from 'zod';
@@ -169,6 +169,13 @@ interface Staged {
 }
 
 const LIST_TTL_MS = 3_000;
+/**
+ * Total time for a listing, including retries after invalidation and optional lookups.
+ * Expiry rejects with 503; /api/conversations omits Hermes rows for that refresh,
+ * as it does for other Hermes list errors. The web requests another list on startup,
+ * socket reopen or a user action.
+ */
+const LIST_WAIT_MS = 30_000;
 const ACTIVE_POLL_MS = 5_000;
 /** After a turn ends or a session stops: long enough for Hermes to settle it. */
 const ACTIVE_CHECK_DELAY_MS = 300;
@@ -325,12 +332,17 @@ export class HermesAdapter implements HermesSource {
   /** Chats archived or deleted from Signalbox: not kept in the list just because we're attached. */
   private readonly tidied = new Set<string>();
   private listCache: { at: number; ids: string[] } | undefined;
+  /** The chat list being fetched, shared by lists that overlap within one revision. */
+  private listFetch: Promise<void> | undefined;
+  private listRevision = 0;
   /** delegate_task runs from the last listing, by id, with the chat each nests under. */
   private subagents = new Map<string, SubagentEntry>();
   private subagentRows: { at: number; rows: HermesSessionRow[] } | undefined;
   /** The run list being fetched, shared by lists that overlap (the one after connecting, and yours). */
   private subagentFetch: Promise<HermesSessionRow[]> | undefined;
+  private subagentRevision = 0;
   private acpRows: { at: number; rows: HermesSessionRow[] } | undefined;
+  private acpFetch: Promise<HermesSessionRow[]> | undefined;
   /** The folder Hermes runs a chat with no folder of its own in (see refreshDefaultFolder). */
   private defaultFolder: string | undefined;
   private defaultFolderAt = 0;
@@ -462,11 +474,11 @@ export class HermesAdapter implements HermesSource {
     this.storedByRuntime.clear();
     this.catalogs.clear();
     this.modelOptions.clear();
-    this.listCache = undefined;
+    this.invalidateList();
     this.defaultFolderAt = 0;
     // Hermes may have been upgraded or reconfigured while we were away.
     this.subagentSupport = undefined;
-    this.subagentRows = undefined;
+    this.invalidateSubagents();
     this.acpRows = undefined;
     // Attachments are rebuilt only for chats that are live in Hermes (refreshActive).
     await this.refreshActive();
@@ -476,31 +488,85 @@ export class HermesAdapter implements HermesSource {
   // ---- inbox ----------------------------------------------------------------
 
   async listConversations(): Promise<ConversationSummary[]> {
+    const signal = deviceSignal();
+    checkDeviceSignal(signal);
     if (this.statusValue.state === 'needs_credentials') return [];
-    if (!this.listCache || Date.now() - this.listCache.at >= LIST_TTL_MS) {
-      let data: { sessions?: HermesSessionRow[] };
-      try {
-        data = await this.auth.json<{ sessions?: HermesSessionRow[] }>(LIST_QUERY);
-      } catch (err) {
+    const deadline = Date.now() + LIST_WAIT_MS;
+    const expired = new UserFacingError('Hermes took too long to list conversations. Try again in a moment.', 503);
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(expired), LIST_WAIT_MS).unref();
+    });
+    const wait = <T>(pending: Promise<T>) => abortOnDevice(Promise.race([pending, timeout]), signal);
+    try {
+      for (;;) {
+        checkDeviceSignal(signal);
+        if (this.status().state === 'needs_credentials') return [];
+        if (Date.now() >= deadline) throw expired;
+        if (!this.listCache || Date.now() - this.listCache.at >= LIST_TTL_MS) {
+          // Shared work belongs to the adapter; each device cancels only its own wait.
+          this.listFetch ??= withDeviceSignal(undefined, () => this.fetchChats());
+          await wait(this.listFetch);
+          // An invalidated request cannot fill the cache; join or start its replacement.
+          continue;
+        }
+        const cache = this.listCache;
+        await wait(withDeviceSignal(undefined, () => this.refreshDefaultFolder()));
+        checkDeviceSignal(signal);
+        if (this.status().state === 'needs_credentials') return [];
+        // Sub-agent runs come on top; they never take a chat's place, and never break the list.
+        await wait(withDeviceSignal(undefined, () => this.refreshSubagents(cache.ids)
+          .catch((err) => this.log.warn({ err: String(err) }, "couldn't list hermes sub-agents"))));
+        checkDeviceSignal(signal);
+        if (this.status().state === 'needs_credentials') return [];
+        if (Date.now() >= deadline) throw expired;
+        // Archived or deleted from here while this list waited: not brought back.
+        const chats = cache.ids.filter((id) => !this.tidied.has(id));
+        return [...chats, ...[...this.subagents.keys()].filter((id) => !chats.includes(id))].map((id) => this.summaryFor(id));
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private fetchChats(): Promise<void> {
+    const revision = this.listRevision;
+    const fetch = this.auth.json<{ sessions?: HermesSessionRow[] }>(LIST_QUERY)
+      .then((data) => {
+        if (revision !== this.listRevision) return;
+        for (const row of data.sessions ?? []) {
+          this.rows.set(row.id, row);
+          // Listed again (say, Hermes un-archived it on new activity): it shows as usual.
+          this.tidied.delete(row.id);
+        }
+        const ids = new Set((data.sessions ?? []).map((r) => r.id));
+        // Keep chats we're attached to even if the list query filtered them out,
+        // unless they were archived or deleted from here.
+        for (const stored of this.runtimeByStored.keys()) if (!this.tidied.has(stored)) ids.add(stored);
+        this.listCache = { at: Date.now(), ids: [...ids] };
+      })
+      .catch((err: unknown) => {
         if (err instanceof HermesAuthError && (err.status === undefined || err.status === 503)) this.onFailure(err);
         throw this.userError(err);
-      }
-      for (const row of data.sessions ?? []) {
-        this.rows.set(row.id, row);
-        // Listed again (say, Hermes un-archived it on new activity): it shows as usual.
-        this.tidied.delete(row.id);
-      }
-      const ids = new Set((data.sessions ?? []).map((r) => r.id));
-      // Keep chats we're attached to even if the list query filtered them out,
-      // unless they were archived or deleted from here.
-      for (const stored of this.runtimeByStored.keys()) if (!this.tidied.has(stored)) ids.add(stored);
-      this.listCache = { at: Date.now(), ids: [...ids] };
-    }
-    const chats = this.listCache.ids;
-    await this.refreshDefaultFolder();
-    // Sub-agent runs come on top; they never take a chat's place, and never break the list.
-    await this.refreshSubagents().catch((err) => this.log.warn({ err: String(err) }, "couldn't list hermes sub-agents"));
-    return [...chats, ...[...this.subagents.keys()].filter((id) => !chats.includes(id))].map((id) => this.summaryFor(id));
+      })
+      .finally(() => {
+        // An older request must not clear the fresh request installed after invalidation.
+        if (this.listFetch === fetch) this.listFetch = undefined;
+      });
+    return fetch;
+  }
+
+  private invalidateList(): void {
+    this.listRevision++;
+    this.listCache = undefined;
+    this.listFetch = undefined;
+  }
+
+  private invalidateSubagents(): void {
+    this.subagentRevision++;
+    this.subagentRows = undefined;
+    this.subagentFetch = undefined;
+    this.acpFetch = undefined;
   }
 
   /**
@@ -526,34 +592,54 @@ export class HermesAdapter implements HermesSource {
   }
 
   /** The delegate_task runs of the listed chats (see resolveSubagents). */
-  private async refreshSubagents(): Promise<void> {
-    if (!(await this.subagentsSupported())) {
+  private async refreshSubagents(chats: string[]): Promise<void> {
+    const revision = this.subagentRevision;
+    const supported = await this.subagentsSupported();
+    if (revision !== this.subagentRevision) return;
+    if (!supported) {
       this.subagents.clear();
       return;
     }
     if (!this.subagentRows || Date.now() - this.subagentRows.at >= SUBAGENT_TTL_MS) {
-      this.subagentFetch ??= this.auth
-        .json<{ sessions?: HermesSessionRow[] }>(SUBAGENT_QUERY)
-        .then((data) => data.sessions ?? [])
-        .finally(() => {
-          this.subagentFetch = undefined;
-        });
-      this.subagentRows = { at: Date.now(), rows: await this.subagentFetch };
+      if (!this.subagentFetch) {
+        const fetch = this.auth
+          .json<{ sessions?: HermesSessionRow[] }>(SUBAGENT_QUERY)
+          .then((data) => data.sessions ?? [])
+          .finally(() => {
+            if (this.subagentFetch === fetch) this.subagentFetch = undefined;
+          });
+        this.subagentFetch = fetch;
+      }
+      const rows = await this.subagentFetch;
+      if (revision !== this.subagentRevision) return;
+      this.subagentRows = { at: Date.now(), rows };
     }
     const acpFresh = this.acpRows && Date.now() - this.acpRows.at < ACP_TTL_MS;
     const input = {
-      listed: (this.listCache?.ids ?? []).map((id) => this.rows.get(id) ?? { id }),
+      listed: chats.map((id) => this.rows.get(id) ?? { id }),
       rows: this.subagentRows.rows,
       movedTo: this.movedTo,
     };
     let result = resolveSubagents(acpFresh ? { ...input, acp: this.acpRows!.rows } : input);
     if (result.needsAcp) {
       // Only now: some run's parent may be an ACP session under a later id.
-      const data = await this.auth.json<{ sessions?: HermesSessionRow[] }>(ACP_QUERY).catch(() => ({ sessions: [] }));
-      this.acpRows = { at: Date.now(), rows: data.sessions ?? [] };
-      result = resolveSubagents({ ...input, acp: this.acpRows.rows });
+      if (!this.acpFetch) {
+        const fetch = this.auth
+          .json<{ sessions?: HermesSessionRow[] }>(ACP_QUERY)
+          .then((data) => data.sessions ?? [])
+          .finally(() => {
+            if (this.acpFetch === fetch) this.acpFetch = undefined;
+          });
+        this.acpFetch = fetch;
+      }
+      const rows = await this.acpFetch.catch(() => undefined);
+      if (revision !== this.subagentRevision) return;
+      if (rows) this.acpRows = { at: Date.now(), rows };
+      result = resolveSubagents({ ...input, acp: rows ?? [] });
     }
-    this.subagents = new Map(result.entries.map((entry) => [entry.row.id, entry]));
+    this.subagents = new Map(result.entries
+      .filter((entry) => entry.parent?.source !== 'hermes' || !this.tidied.has(entry.parent.id))
+      .map((entry) => [entry.row.id, entry]));
   }
 
   /** `sessions.show_subagents` is in Hermes' defaults only in versions that can list runs. */
@@ -703,7 +789,8 @@ export class HermesAdapter implements HermesSource {
       this.hub.publish({ type: 'conversation_removed', source: 'hermes', id: stored });
     }
     if (this.listCache) this.listCache = { ...this.listCache, ids: this.listCache.ids.filter((x) => x !== id) };
-    this.subagentRows = undefined;
+    if (this.listFetch) this.invalidateList();
+    this.invalidateSubagents();
   }
 
   listApprovals(): Approval[] {
@@ -803,7 +890,7 @@ export class HermesAdapter implements HermesSource {
   private scheduleListRefresh(delay = 800): void {
     clearTimeout(this.listRefresh);
     this.listRefresh = setTimeout(async () => {
-      this.listCache = undefined;
+      this.invalidateList();
       try {
         for (const c of await this.listConversations()) this.publishSummary(c.id);
       } catch {
@@ -1787,7 +1874,7 @@ export class HermesAdapter implements HermesSource {
     const now = Date.now() / 1000;
     const preview = text.trim() || attachments.map((a) => a.name).join(', ');
     this.rows.set(stored, { id: stored, preview, started_at: now, last_active: now, cwd: cwd ?? null, ...(chosen ? { model: chosen[1] } : {}) });
-    this.listCache = undefined;
+    this.invalidateList();
     if (options.startedBy) {
       this.startedBy.set(stored, options.startedBy);
       if (this.startedBy.size > MAX_STARTED_BY) this.startedBy.delete(this.startedBy.keys().next().value!);
@@ -1941,7 +2028,8 @@ export class HermesAdapter implements HermesSource {
     this.storedByRuntime.clear();
     for (const id of [...this.pending.keys()]) this.removePending(id);
     this.rows.clear();
-    this.listCache = undefined;
+    this.invalidateList();
+    this.invalidateSubagents();
     this.setStatus('needs_credentials', 'Sign in with your Hermes dashboard username and password.');
     return this.statusValue;
   }
@@ -2087,7 +2175,7 @@ export class HermesAdapter implements HermesSource {
       entry.approval = { ...entry.approval, conversationId: to };
       this.hub.publish({ type: 'approval_upsert', approval: entry.approval });
     }
-    this.listCache = undefined;
+    this.invalidateList();
     this.hub.publish({ type: 'conversation_moved', source: 'hermes', from, to });
     this.publishSummary(to);
     this.publishSummary(from);
@@ -2122,7 +2210,7 @@ export class HermesAdapter implements HermesSource {
 
     if (!event.session_id) {
       if (event.type === 'sessions.changed') {
-        this.subagentRows = undefined;
+        this.invalidateSubagents();
         this.scheduleListRefresh();
       }
       // A cron job was claimed, finished, added or changed: open Scheduled-jobs pages refetch.
@@ -2256,7 +2344,7 @@ export class HermesAdapter implements HermesSource {
       case 'subagent.start':
       case 'subagent.complete':
         // A delegate_task run in this chat started or finished: list it under the chat.
-        this.subagentRows = undefined;
+        this.invalidateSubagents();
         this.scheduleListRefresh();
         return;
       case 'session.reclaimed':

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as promises from 'node:fs/promises';
 import type { ServerEvent } from '../../shared/protocol.js';
 import { DEFAULT_NOTIFICATION_RULES, SETTINGS_API } from '../../shared/settings.js';
-import { currentConfigVerbs, type DrainRestartRequest } from '../../shared/supervisor-config.js';
+import { currentConfigVerbs, type DrainRestartRequest, type ConfigWriteResult } from '../../shared/supervisor-config.js';
 import { BackgroundGate } from '../src/background.js';
 import { Feed } from '../src/feed/service.js';
 import { FeedStore } from '../src/feed/store.js';
@@ -443,8 +443,10 @@ describe('writing them', () => {
   });
 
   it('requires confirmed PC acceptance before a legacy save after an uncertain local write', async () => {
-    const t = await routeFixture({ pipeline: true, supervisor: new FakeSettingsSupervisor(), local: true, initialSettings: { ...body(), safetyCommandsEnabled: true } });
-    vi.spyOn(t.notifications, 'configApply').mockRejectedValueOnce(new Error('demo-lost-reply'));
+    const supervisor = new FakeSettingsSupervisor();
+    supervisor.documents['wayroost-settings']!.safetyCommandsEnabled = true;
+    const t = await routeFixture({ pipeline: true, supervisor, local: true, initialSettings: { ...body(), safetyCommandsEnabled: true } });
+    supervisor.configApply.mockRejectedValueOnce(new Error('demo-lost-reply'));
     const lost = await t.app.inject({ method: 'PUT', url: '/api/settings/safety-commands', headers: postHeaders(t.token),
       payload: { enabled: false } });
     expect(lost.json()).toMatchObject({ status: 'refused', code: 'outcome_unknown' });
@@ -459,29 +461,30 @@ describe('writing them', () => {
       payload: { enabled: true } });
     expect(legacy.statusCode).toBe(200);
     expect(legacy.json().enabled).toBe(true);
+    const apply = supervisor.configApply.getMockImplementation()!;
+    supervisor.configApply.mockImplementationOnce(async request => ({ ...await apply(request), unchanged: true } as ConfigWriteResult));
     const noop = await t.app.inject({ method: 'PUT', url: '/api/settings/safety-commands', headers: postHeaders(t.token),
       payload: { enabled: true } });
     expect(noop.json()).toMatchObject({ status: 'applied', change: { effective: 'verified', undoable: false } });
     expect(t.safetyCommands.enabled()).toBe(true);
-    expect(t.read().safetyCommandsEnabled).toBe(true);
+    expect(supervisor.documents['wayroost-settings']!.safetyCommandsEnabled).toBe(true);
   });
 
-  it('uses one local writer for notification apply, undo and legacy safety writes', async () => {
+  it('uses one owner writer for notification apply, undo and legacy safety writes', async () => {
     const supervisor = new FakeSettingsSupervisor();
+    supervisor.documents['wayroost-settings'] = { version: 1 };
     const t = await routeFixture({ supervisor, pipeline: true });
+    const privateApply = vi.spyOn(t.notifications, 'configApply');
+    const privateUndo = vi.spyOn(t.notifications, 'configUndo');
     const changed = (await t.put(body())).json();
     expect(changed).toMatchObject({ status: 'applied', change: { effective: 'verified', undoable: true } });
-    expect(supervisor.configApply).not.toHaveBeenCalled();
-    expect(supervisor.configRead).not.toHaveBeenCalledWith({ view: 'wayroost.settings' });
-    const localRead = await t.notifications.configRead({ view: 'wayroost.settings' });
-    expect(localRead).toMatchObject({ ok: true, present: true, values: expect.arrayContaining([
-      { path: ['quietHours'], exists: true, value: body().quietHours },
-      { path: ['rules'], exists: true, value: body().rules },
-    ]) });
+    expect(supervisor.configApply).toHaveBeenCalledOnce();
+    expect(supervisor.configRead).toHaveBeenCalledWith({ view: 'wayroost.settings' });
+    expect(await t.notifications.configRead({ view: 'wayroost.settings' })).toEqual({ ok: false, code: 'config_writes_off' });
     const restore = await t.app.inject({ method: 'POST', url: '/api/settings/undo', headers: postHeaders(t.token),
       payload: { change: changed.change.id } });
     expect(restore.json()).toMatchObject({ status: 'applied', change: { effective: 'verified', undoable: true } });
-    expect(supervisor.configUndo).not.toHaveBeenCalled();
+    expect(supervisor.configUndo).toHaveBeenCalledOnce();
     expect((await t.get()).json()).toMatchObject({ rules: DEFAULT_NOTIFICATION_RULES, quietHours: { start: '21:00', end: '07:00' },
       push: { approvals: true, cards: false } });
     expect(t.feed.settings()).toMatchObject({ quietHours: { start: '21:00', end: '07:00' }, push: { approvals: true, cards: false } });
@@ -489,19 +492,19 @@ describe('writing them', () => {
     const redo = await t.app.inject({ method: 'POST', url: '/api/settings/undo', headers: postHeaders(t.token),
       payload: { change: restore.json().change.id } });
     expect(redo.json()).toMatchObject({ status: 'applied', change: { effective: 'verified' } });
-    expect(t.read()).toMatchObject(body());
+    expect(supervisor.documents['wayroost-settings']).toMatchObject(body());
     const oldSafetyWriter = vi.spyOn(t.safetyCommands, 'setEnabled');
     const safety = await t.app.inject({ method: 'PUT', url: '/api/safety-commands', headers: postHeaders(t.token), payload: { enabled: false } });
     expect(safety.statusCode).toBe(200); expect(safety.json().enabled).toBe(false);
     expect(oldSafetyWriter).not.toHaveBeenCalled();
-    expect(supervisor.configApply).not.toHaveBeenCalled();
-    expect(t.read()).toEqual({ ...body(), safetyCommandsEnabled: false });
-    expect((await t.get()).json()).toMatchObject(body());
     writeFileSync(join(t.state, WAYROOST_SETTINGS_FILE), JSON.stringify({ ...body(), safetyCommandsEnabled: true }));
+    expect((await t.app.inject({ url: '/api/safety-commands', headers: apiHeaders(t.token) })).json().enabled).toBe(false);
+    supervisor.documents['wayroost-settings']!.safetyCommandsEnabled = true;
     expect((await t.app.inject({ url: '/api/safety-commands', headers: apiHeaders(t.token) })).json().enabled).toBe(true);
     expect((await t.put({ quietHours: null })).json()).toMatchObject({ status: 'applied' });
-    expect(t.read()).toEqual({ ...body(), quietHours: null, safetyCommandsEnabled: true });
+    expect(supervisor.documents['wayroost-settings']).toEqual({ version: 1, ...body(), quietHours: null, safetyCommandsEnabled: true });
     expect(t.safetyCommands.enabled()).toBe(true);
+    expect(privateApply).not.toHaveBeenCalled(); expect(privateUndo).not.toHaveBeenCalled();
     for (const route of ['PUT /api/settings/notifications', 'PUT /api/settings/safety-commands', 'PUT /api/safety-commands',
       'PUT /api/cloud-agents/:id', 'PUT /api/worker-approvals']) expect(changeRoutes(t.app).filter(entry => entry === route)).toHaveLength(1);
   });

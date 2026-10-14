@@ -28,7 +28,7 @@ def load(name, path):
 with patch.dict(os.environ, {"WAYROOST_ROLE": "primary"}):
     helper = load("shadow_helper_test", Path(__file__).with_name("signalbox-helper.py"))
     hook = load("shadow_hook_test", Path(__file__).resolve().parent.parent / "claude-hook" / "signalbox-claude-hook.py")
-    identity = load("shadow_identity_test", Path(__file__).resolve().parent.parent / "hermes-plugin" / "signalbox-identity" / "__init__.py")
+    identity = load("shadow_identity_test", Path(__file__).resolve().parent.parent / "hermes-plugin" / "wayroost-identity" / "__init__.py")
 
 
 class ShadowTests(unittest.TestCase):
