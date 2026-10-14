@@ -12,6 +12,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 repo, home = map(Path, sys.argv[1:3])
+# Children get a minimal PATH, so keep the test runner's own Node binary.
+node = os.environ["NODE_BIN"]
 os.environ.clear()
 os.environ.update(HOME=str(home), PATH=os.defpath, WAYROOST_ROLE="primary")
 script = (repo / "deploy/setup-bridge.sh").read_text()
@@ -124,7 +126,7 @@ function check(code: string): void {
   const folder = mkdtempSync(join(process.cwd(), '.tmp', 'bridge-reporters-'));
   folders.push(folder);
   const output = execFileSync('python3', ['-I', '-B', '-c', setup + code, process.cwd(), folder], {
-    env: { PATH: process.env.PATH, TMPDIR: folder }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000,
+    env: { PATH: process.env.PATH, TMPDIR: folder, NODE_BIN: process.execPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000,
   });
   expect(output).toBe('');
 }
@@ -274,7 +276,7 @@ for harness in ("pi", "claude", "opencode", "paseo"):
                 env["PASEO_AGENT_ID"] = "fake-agent"
             if stamp is not None:
                 env["WAYROOST_BRIDGE_NAME"] = stamp
-            child = subprocess.Popen(["node", "--import", str(transport), str(repo / "bridge/signalbox-bridge.mjs")],
+            child = subprocess.Popen([node, "--import", str(transport), str(repo / "bridge/signalbox-bridge.mjs")],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
             request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_chats", "arguments": {}}}
             child.stdin.write(json.dumps(request) + "\n")
