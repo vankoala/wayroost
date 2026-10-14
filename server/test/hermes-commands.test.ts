@@ -36,6 +36,12 @@ describe('hermes "/" commands', () => {
     expect(blockedReason({ name: 'status', arg: '' })).toBeNull();
   });
 
+  it('directs blocked commands to the Safety settings page', () => {
+    for (const command of ['/yolo', '/approvals off', '/approve', '/memory approval off', '/skills approval', '/skills approve', '/debug']) {
+      expect(blockedReason(parseSlash(command)!)).toContain('Turn on Settings → Safety → Hermes safety commands');
+    }
+  });
+
   it('lets the safeguard commands through when the setting is on', () => {
     for (const cmd of [
       { name: 'yolo', arg: '' },

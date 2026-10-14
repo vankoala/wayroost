@@ -1,13 +1,14 @@
 import { checkDeviceSignal } from './security/device-signal.js';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { CLOUD_ID, type AppVoice } from '../../shared/voice.js';
+import type { AppVoice } from '../../shared/voice.js';
+import { readLegacyVoice } from '../../shared/legacy-settings.js';
+export { VOICE_NAME } from '../../shared/legacy-settings.js';
 
 // The shared local voice and the opt-in app output; other outputs remain local.
 // Empty local voice means the speech service's own default.
 
 const FILE = 'voice.json';
-export const VOICE_NAME = /^[a-z]{2}_[a-z]{2,20}$/;
 
 export class VoiceSetting {
   private readonly path: string;
@@ -24,11 +25,9 @@ export class VoiceSetting {
 
   private load(): string {
     try {
-      const data = JSON.parse(readFileSync(this.path, 'utf8')) as { voice?: unknown; appReadAloud?: AppVoice };
-      const voice = data.voice;
-      const app = data.appReadAloud;
-      if (app?.provider === 'elevenlabs' && typeof app.voiceId === 'string' && CLOUD_ID.test(app.voiceId) && typeof app.modelId === 'string' && CLOUD_ID.test(app.modelId)) this.app = { provider: 'elevenlabs', voiceId: app.voiceId, modelId: app.modelId };
-      return typeof voice === 'string' && VOICE_NAME.test(voice) ? voice : '';
+      const parsed = readLegacyVoice(readFileSync(this.path, 'utf8'));
+      this.app = parsed.value.appReadAloud;
+      return parsed.value.voice;
     } catch {
       return '';
     }

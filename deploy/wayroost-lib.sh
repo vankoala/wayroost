@@ -1,5 +1,7 @@
 # shellcheck shell=bash
-# Shared installer helpers. Dry runs only print plans, including file contents.
+# Shared installer helpers. Legacy dry runs include file contents; transaction
+# plans print paths and metadata only.
+set -euo pipefail
 
 fail() { echo "$*" >&2; exit 1; }
 
@@ -139,4 +141,1115 @@ install_tls() {
     [[ "$output" =~ ^$service\ fingerprint:\ sha256/[A-Za-z0-9+/]{43}=$ ]] || fail 'TLS tool did not confirm a fingerprint; refusing to continue.'
     printf '%s\n' "$output"
   fi
+}
+
+# The journal is written before publication. Resume compares disk state against
+# both versions, and reverse refuses changes made outside the transaction.
+wayroost_transaction() {
+  local option
+  local -a python=(/usr/bin/python3 -I)
+  for option in "$@"; do
+    case "$option" in --root|--root=*) python=(python3) ;; esac
+  done
+  "${python[@]}" - "$REPO" "$@" <<'PY'
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+fake_root = False
+deployment_root = None
+link_paths = set()
+systemd_whitespace = ' \t\n\r'
+systemd_load_paths = ['/etc/systemd/system.control', '/run/systemd/system.control',
+                      '/run/systemd/transient', '/run/systemd/generator.early',
+                      '/etc/systemd/system', '/etc/systemd/system.attached',
+                      '/run/systemd/system', '/run/systemd/system.attached',
+                      '/run/systemd/generator', '/usr/local/lib/systemd/system',
+                      '/usr/lib/systemd/system', '/run/systemd/generator.late']
+unit_directories = ['/etc/systemd/system', '/run/systemd/system',
+                    '/usr/local/lib/systemd/system', '/usr/lib/systemd/system']
+
+class DeploymentError(ValueError):
+    pass
+
+
+def fail(message):
+    raise DeploymentError(message)
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def absolute(value, root=None, inspect=False):
+    path = Path(value)
+    if not path.is_absolute() or '..' in path.parts or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        fail('Paths must be absolute, without parent traversal or control characters.')
+    path = filesystem_path(path)
+    if inspect:
+        no_links(root / path.relative_to('/') if root else path)
+    return path
+
+
+def filesystem_path(path):
+    # Linux treats single and double leading slashes as the same filesystem root.
+    path = Path(os.path.normpath(str(path)))
+    return Path('/') / path.relative_to(path.anchor)
+
+
+def link_target(path, value):
+    value = Path(value)
+    unresolved = path.parent / value
+    if value.is_absolute() and deployment_root and not filesystem_path(value).is_relative_to(deployment_root):
+        unresolved = deployment_root / value.relative_to(value.anchor)
+    no_links(unresolved)
+    return filesystem_path(unresolved)
+
+
+def link_metadata(path, value, owner):
+    value = str(link_target(path, value))
+    return {'kind': 'symlink', 'hash': digest(value.encode()), 'target': value,
+            'mode': '0777', 'owner': owner}
+
+
+def overlaps(left, right):
+    left, right = filesystem_path(left), filesystem_path(right)
+    return left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def unit_destination(path, root):
+    def load_path(value):
+        logical = Path(value)
+        return root / logical.relative_to('/') if root else logical
+
+    for directory in systemd_load_paths:
+        candidate = load_path(directory) / path.name
+        if filesystem_path(candidate) == filesystem_path(path):
+            return
+        no_links(candidate.parent)
+        if candidate.exists() or candidate.is_symlink():
+            fail('Unit destination is shadowed by a higher-priority systemd unit.')
+    fail('Unit directory must be a supported systemd load path.')
+
+
+def no_links(path):
+    for part in [*reversed(path.parents), *([] if path in link_paths else [path])]:
+        if part.is_symlink():
+            fail('Refusing a symlink in a deployment path.')
+
+
+def protected(path, inspect=True, publication=True):
+    parts = path.parts
+    for index in range(len(parts) - 1):
+        if parts[index] in ['opt', 'etc', 'lib', 'run'] and parts[index + 1].startswith('signalbox'):
+            fail('Refusing a legacy Signalbox target.')
+        if parts[index:index + 3] == ('lib', 'private', 'signalbox'):
+            fail('Refusing a legacy Signalbox target.')
+    if any(re.fullmatch(r'signalbox[^/]*\.(?:service|socket)(?:\.d)?', part) for part in parts):
+        fail('Refusing a legacy Signalbox unit target.')
+    if inspect:
+        no_links(path)
+    if inspect and os.geteuid() == 0 and not fake_root and publication:
+        for parent in path.parents:
+            if parent.exists():
+                info = parent.stat()
+                if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+                    fail('Deployment parents must be root-owned and not writable by others.')
+    return path
+
+
+def metadata(path):
+    no_links(path)
+    if path.is_symlink():
+        info = path.lstat()
+        return link_metadata(path, os.readlink(path), {'uid': info.st_uid, 'gid': info.st_gid})
+    if not path.exists():
+        return None
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) and not stat.S_ISDIR(info.st_mode):
+        fail('Deployment paths must be regular files or directories.')
+    return {'kind': 'directory' if path.is_dir() else 'file',
+            'hash': None if path.is_dir() else digest(path.read_bytes()),
+            'mode': format(stat.S_IMODE(info.st_mode), '04o'),
+            'owner': {'uid': info.st_uid, 'gid': info.st_gid}}
+
+
+def trusted_file(path):
+    no_links(path)
+    for item in [path, *path.parents]:
+        info = item.stat()
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+            fail('Installer files and their ancestors must be root-owned and not writable by others.')
+    if not path.is_file():
+        fail('Installer input must be a regular file.')
+
+
+def credential_source(path):
+    for item in [*reversed(path.parents), path]:
+        try:
+            info = item.lstat()
+        except OSError:
+            fail('Credential source and its ancestors must exist.')
+        if stat.S_ISLNK(info.st_mode):
+            fail('Credential source and its ancestors must not be symlinks.')
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+            fail('Credential source and its ancestors must be root-owned and not writable by others.')
+        if not (stat.S_ISREG(info.st_mode) if item == path else stat.S_ISDIR(info.st_mode)):
+            fail('Credential source must be a regular file under directories.')
+
+
+def helper_runtime(prefix):
+    directory = prefix / 'bin'
+
+    def check(path):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            fail('Helper runtime paths must not be symlinks.')
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+            fail('Helper runtime files and their ancestors must be root-owned and not writable by others.')
+        if not stat.S_ISREG(info.st_mode) and not stat.S_ISDIR(info.st_mode):
+            fail('Helper runtime paths must be regular files or directories.')
+        return info.st_mode
+
+    for path in [*reversed(directory.parents), directory]:
+        if not stat.S_ISDIR(check(path)):
+            fail('Helper runtime ancestors must be directories.')
+    for name in ['signalbox-helper.py', 'signalbox_skills.py', 'wayroost_runtime.py',
+                 'signalbox_mail_trigger.py', 'wayroost-role.json']:
+        if not stat.S_ISREG(check(directory / name)):
+            fail('Helper runtime inputs must be regular files.')
+    pending = [directory]
+    while pending:
+        for path in pending.pop().iterdir():
+            if stat.S_ISDIR(check(path)):
+                pending.append(path)
+
+
+def systemd_words(text, specifiers=True):
+    words = []
+    index = 0
+    escapes = {'a': '\a', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r',
+               't': '\t', 'v': '\v', 's': ' ', '\\': '\\', '"': '"', "'": "'"}
+    while index < len(text):
+        while index < len(text) and text[index] in systemd_whitespace:
+            index += 1
+        if index == len(text):
+            break
+        quote = text[index] if text[index] in ['"', "'"] else None
+        if quote:
+            index += 1
+        word = bytearray()
+        closed = not quote
+        while index < len(text):
+            char = text[index]
+            index += 1
+            if quote and char == quote:
+                closed = True
+                if index < len(text) and text[index] not in systemd_whitespace:
+                    fail('Unsupported systemd quoting.')
+                break
+            if not quote and char in systemd_whitespace:
+                break
+            if not quote and char in ['"', "'"]:
+                fail('Unsupported systemd quoting.')
+            if char == '\\':
+                if index == len(text):
+                    fail('Unsupported systemd escape.')
+                escape = text[index]
+                index += 1
+                if escape in escapes:
+                    char = escapes[escape]
+                else:
+                    length = {'x': 2, 'u': 4, 'U': 8}.get(escape)
+                    if length:
+                        number = text[index:index + length]
+                        if len(number) != length or not re.fullmatch(r'[0-9a-fA-F]+', number):
+                            fail('Unsupported systemd escape.')
+                        index += length
+                        value = int(number, 16)
+                    elif escape in '01234567':
+                        number = escape + text[index:index + 2]
+                        if len(number) != 3 or not re.fullmatch(r'[0-7]{3}', number):
+                            fail('Unsupported systemd escape.')
+                        index += 2
+                        value = int(number, 8)
+                    else:
+                        fail('Unsupported systemd escape.')
+                    byte_escape = escape == 'x' or escape in '01234567'
+                    if value == 0 or value > (0xff if byte_escape else 0x10ffff) or 0xd800 <= value <= 0xdfff:
+                        fail('Unsupported systemd escape.')
+                    if byte_escape:
+                        word.append(value)
+                        continue
+                    char = chr(value)
+            word.extend(char.encode())
+        try:
+            word = word.decode()
+        except UnicodeDecodeError:
+            fail('Environment byte escapes must form valid UTF-8.')
+        if not closed or '\0' in word:
+            fail('Unsupported systemd quoting or value.')
+        if specifiers:
+            if re.search(r'%(?!%)', word.replace('%%', '')):
+                fail('Environment specifiers must be escaped as literal percent signs.')
+            word = word.replace('%%', '%')
+        words.append(word)
+    return words
+
+
+def systemd_lines(text):
+    pending = None
+    bom_stripped = False
+    for line in text.split('\n'):
+        if line.lstrip(systemd_whitespace).startswith(('#', ';')):
+            if pending is not None:
+                fail('Commented systemd continuations are unsupported.')
+            yield line
+            continue
+        if not bom_stripped and line.startswith('\ufeff'):
+            line = line[1:]
+            bom_stripped = True
+        if pending is not None:
+            pending += line
+        else:
+            pending = line
+        backslashes = len(line) - len(line.rstrip('\\'))
+        if line.strip(systemd_whitespace) and backslashes % 2:
+            pending = pending[:-1] + ' '
+            continue
+        yield pending
+        pending = None
+    if pending is not None:
+        yield pending
+
+
+def systemd_path_quote(value):
+    value = value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
+    return '"' + value + '"'
+
+
+def systemd_quote(value):
+    value = systemd_path_quote(value)
+    for char, escape in [('\a', 'a'), ('\b', 'b'), ('\f', 'f'), ('\n', 'n'),
+                         ('\r', 'r'), ('\t', 't'), ('\v', 'v')]:
+        value = value.replace(char, '\\' + escape)
+    return value
+
+
+def server_node(value, inspect=True):
+    path = absolute(value)
+    if re.search(r'[\s%"\'\\:$]', str(path)):
+        fail('Node executable paths cannot contain whitespace or systemd delimiters.')
+    if inspect:
+        pending, current, hops = list(path.parts[1:]), Path('/'), 0
+        while True:
+            info = current.lstat()
+            if info.st_uid != 0 or not stat.S_ISLNK(info.st_mode) and stat.S_IMODE(info.st_mode) & 0o022:
+                fail('The Node executable and its ancestors must be root-owned and not writable by others.')
+            if current.is_symlink():
+                hops += 1
+                if hops > 40:
+                    fail('Too many symlinks in the Node executable path.')
+                link = Path(os.readlink(current))
+                current = Path('/') if link.is_absolute() else current.parent
+                pending = list(link.parts[1:] if link.is_absolute() else link.parts) + pending
+                continue
+            if not pending:
+                break
+            part = pending.pop(0)
+            current = current.parent if part == '..' else current / part
+        if not current.is_file():
+            fail('The Node executable must be a regular file.')
+        if not os.access(path, os.X_OK):
+            fail('The Node executable must be executable.')
+        result = subprocess.run([str(path), '-p', 'process.versions.node.split(".")[0]'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if result.returncode or not re.fullmatch(rb'[0-9]+\s*', result.stdout) or int(result.stdout) < 22:
+            fail('Node.js 22 or newer is required.')
+    return path
+
+
+def substitute(text, replacements):
+    pattern = '|'.join(re.escape(key) for key in replacements)
+    return re.sub(pattern, lambda match: replacements[match[0]], text)
+
+
+def atomic(path, data, mode, owner, temporary=None):
+    no_links(path)
+    if temporary is None:
+        handle, temporary = tempfile.mkstemp(prefix='.wayroost-', dir=path.parent)
+    else:
+        handle = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(handle, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fchown(stream.fileno(), owner['uid'], owner['gid'])
+            os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def atomic_link(path, value, owner, temporary=None):
+    no_links(path)
+    temporary = Path(temporary) if temporary else path.parent / ('.wayroost-' + uuid.uuid4().hex)
+    try:
+        os.symlink(value, temporary)
+        os.chown(temporary, owner['uid'], owner['gid'], follow_symlinks=False)
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary.is_symlink():
+            temporary.unlink()
+
+
+def atomic_directory(path, owner, temporary):
+    no_links(path)
+    temporary = Path(temporary)
+    try:
+        temporary.mkdir(mode=0o700)
+        os.chown(temporary, owner['uid'], owner['gid'])
+        temporary.chmod(0o755)
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary.exists():
+            temporary.rmdir()
+
+
+def recover_temporaries(receipt, undo, owner):
+    for entry in receipt['paths']:
+        path = Path(entry['path'])
+        backup_version = {'kind': 'file', 'mode': '0600', 'owner': owner}
+        for key, version, parent_path in [('temporary', entry['new'], path.parent),
+                                         ('reverseTemporary', entry['old'], path.parent),
+                                         ('backupTemporary', backup_version, undo)]:
+            if not entry.get(key):
+                continue
+            temporary = Path(entry[key])
+            if temporary.parent != parent_path or not re.fullmatch(r'\.wayroost-[0-9a-f]{32}', temporary.name):
+                fail('Invalid transaction temporary path.')
+            no_links(temporary.parent)
+            if not temporary.exists() and not temporary.is_symlink():
+                continue
+            info = temporary.lstat()
+            parent = temporary.parent.stat()
+            creation_group = parent.st_gid if parent.st_mode & stat.S_ISGID else owner['gid']
+            owners = {(version['owner']['uid'], version['owner']['gid']), (owner['uid'], creation_group)}
+            if (info.st_uid, info.st_gid) not in owners:
+                fail('Transaction temporary ownership changed.')
+            if version['kind'] == 'symlink':
+                if not temporary.is_symlink() or str(link_target(temporary, os.readlink(temporary))) != version['target']:
+                    fail('Transaction temporary no longer matches its receipt.')
+            elif version['kind'] == 'directory':
+                modes = [0o700, 0o755, 0o700 | (parent.st_mode & stat.S_ISGID)]
+                if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) not in modes or any(temporary.iterdir()):
+                    fail('Transaction temporary no longer matches its receipt.')
+            elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) not in [0o600, int(version['mode'], 8)]:
+                fail('Transaction temporary no longer matches its receipt.')
+            if version['kind'] == 'directory':
+                temporary.rmdir()
+            else:
+                temporary.unlink()
+
+
+def private_directory(path, owner):
+    no_links(path)
+    created = not path.exists()
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if created:
+        os.chown(path, owner['uid'], owner['gid'])
+        path.chmod(0o700)
+    info = path.stat()
+    if not path.is_dir() or stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != owner['uid'] or info.st_gid != owner['gid']:
+        fail('Receipt and undo directories must be private (0700) and owned by the installer.')
+
+
+def canonical_receipt(receipt):
+    receipt['root'] = str(absolute(receipt['root']))
+    receipt['intent']['prefix'] = str(absolute(receipt['intent']['prefix']))
+    paths = {}
+    for entry in receipt['paths']:
+        for key in ['path', 'temporary', 'reverseTemporary', 'backupTemporary']:
+            if key in entry:
+                entry[key] = str(absolute(entry[key]))
+        for key in ['old', 'new']:
+            version = entry[key]
+            if version and version['kind'] == 'symlink':
+                if key == 'old':
+                    entry.setdefault('oldTarget', version['target'])
+                entry[key] = link_metadata(Path(entry['path']), version['target'], version['owner'])
+        previous = paths.get(entry['path'])
+        if previous is not None:
+            if (entry['new']['kind'] != 'directory' or previous['new'] != entry['new'] or
+                    previous['old'] != entry['old'] or entry.get('enablement') or previous.get('enablement')):
+                fail('Receipt contains conflicting path identities.')
+        else:
+            paths[entry['path']] = entry
+    receipt['paths'] = list(paths.values())
+    return receipt
+
+
+def main():
+    global fake_root, deployment_root
+    os.umask(0o077)
+    repo, kind = Path(sys.argv[1]), sys.argv[2]
+    parser = argparse.ArgumentParser(description='Publish prepared files with a reversible receipt.')
+    parser.add_argument('--mode', choices=['plan', 'forward', 'verify', 'reverse'], default='plan')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--root', help='Absolute fake root for offline tests; all unit calls use --root.')
+    parser.add_argument('--receipts', required=True)
+    parser.add_argument('--receipt', help='Transaction id; reuse it to resume or reverse.')
+    parser.add_argument('--prefix')
+    if kind in ['runtime', 'server']:
+        parser.add_argument('--from', dest='source')
+        parser.add_argument('--manifest-sha256')
+        parser.add_argument('--role', choices=['primary', 'shadow'])
+    if kind in ['helper', 'server']:
+        parser.add_argument('--unit-dir', default='/etc/systemd/system')
+        parser.add_argument('--enable', action='store_true')
+    if kind == 'helper':
+        parser.add_argument('--owner')
+        parser.add_argument('--home')
+        parser.add_argument('--hermes-home')
+        parser.add_argument('--token-file', default='/etc/wayroost/helper.token')
+        parser.add_argument('--port', type=int, default=19013)
+        parser.add_argument('--drop-ins')
+        parser.add_argument('--allow-environment', action='append', default=[])
+        parser.add_argument('--writable-path', action='append', default=[])
+        parser.add_argument('--start', action='store_true')
+    if kind == 'server':
+        parser.add_argument('--primary', action='store_true')
+        parser.add_argument('--update-artifacts', action='store_true')
+        parser.add_argument('--publish-config', action='store_true')
+        parser.add_argument('--config-source')
+        parser.add_argument('--config-path', default='/etc/wayroost/config.json')
+        parser.add_argument('--publish-unit', action='store_true')
+        parser.add_argument('--restart', action='store_true')
+    args = parser.parse_args(sys.argv[3:])
+    fake_root = bool(args.root)
+    if args.dry_run:
+        if args.mode != 'plan':
+            fail('--dry-run requires plan mode.')
+    root = absolute(args.root) if args.root else None
+    deployment_root = root
+    if root:
+        if not root.is_dir() or root.samefile('/'):
+            fail('--root requires an existing fake-root directory, not /.')
+        protected(root)
+    elif os.geteuid() != 0:
+        fail('Run as root, or use --root for offline tests.')
+    receipt_only = args.mode in ['verify', 'reverse']
+    if args.prefix is None and not receipt_only:
+        args.prefix = '/opt/wayroost/runtime' if kind != 'server' else '/opt/wayroost/server'
+    for name in ['prefix', 'receipts', 'unit_dir', 'home', 'hermes_home', 'token_file', 'config_path',
+                 'source', 'config_source', 'drop_ins', 'writable_path']:
+        if receipt_only and name != 'receipts':
+            continue
+        value = getattr(args, name, None)
+        if value is None:
+            continue
+        argument_root = None if name in ['source', 'config_source', 'drop_ins'] else root
+        if isinstance(value, list):
+            value = [str(absolute(item, root=argument_root, inspect=True)) for item in value]
+        else:
+            value = str(absolute(value, root=argument_root, inspect=True))
+        if name == 'prefix' and not Path(value).parts[1:]:
+            fail('The installation prefix must not be /.')
+        setattr(args, name, value)
+    if not root:
+        launcher = {'runtime': 'install-wayroost-runtime.sh', 'helper': 'setup-wayroost-helper.sh',
+                    'server': 'install-wayroost-server.sh'}[kind]
+        for name in [launcher, 'wayroost-lib.sh', 'lib.sh']:
+            trusted_file(repo / 'deploy' / name)
+    owner = {'uid': os.geteuid(), 'gid': os.getegid()}
+
+    def target(value, publication=True):
+        logical = protected(Path(value), inspect=False)
+        path = root / logical.relative_to(logical.anchor) if root else logical
+        return protected(path, publication=publication)
+
+    prefix = None if receipt_only else target(args.prefix)
+    receipts = target(args.receipts)
+    if receipt_only and not args.receipt:
+        fail('Verification and reversal require --receipt.')
+    transaction = args.receipt or uuid.uuid4().hex
+    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}', transaction):
+        fail('Use a simple transaction id for --receipt.')
+    # One lock per deployment root also covers callers using different receipt stores.
+    lock_root = target('/var/lib/wayroost-install')
+    receipt_path = receipts / (transaction + '.json')
+    lock_path = lock_root / '.deployment.lock'
+    pending = receipts / ('.' + transaction + '.pending')
+    undo_root = protected(receipts.parent / (receipts.name + '-undo'))
+    undo = undo_root / transaction
+
+    def publication_path(path):
+        protected(path)
+        if any(overlaps(path, storage) for storage in [receipts, undo_root, lock_path]) or any(
+                re.fullmatch(r'\.wayroost-[0-9a-f]{32}', part) for part in path.parts):
+            fail('Publication overlaps transaction storage.')
+
+    def validate_prefix(path):
+        if overlaps(receipts, path):
+            fail('Receipts must be outside the installation prefix.')
+        publication_path(path)
+
+    # Reserve storage before creating the lock, journal or undo directories.
+    if prefix is not None:
+        validate_prefix(prefix)
+    if not receipt_only and kind == 'server' and args.publish_config:
+        publication_path(target(args.config_path))
+    if kind in ['helper', 'server'] and args.mode in ['plan', 'forward']:
+        logical_unit_dir = Path(args.unit_dir)
+        if str(logical_unit_dir) not in unit_directories:
+            fail('Unit directory must be a supported systemd load path.')
+        unit_name = 'wayroost-' + kind + '.service'
+        unit_path = target(args.unit_dir) / unit_name
+        publish_unit = kind == 'helper' or args.publish_unit
+        if publish_unit or args.enable:
+            publication_path(unit_path)
+            unit_destination(unit_path, root)
+        if kind == 'helper' and args.drop_ins:
+            publication_path(unit_path.parent / 'wayroost-helper.service.d/50-imported-environment.conf')
+        if args.enable:
+            link = target('/etc/systemd/system') / 'multi-user.target.wants' / unit_name
+            link_paths.add(link)
+            publication_path(link)
+
+    private_directory(lock_root, owner)
+    no_links(lock_path)
+    with os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), 'r+') as lock:
+        if metadata(lock_path)['mode'] != '0600' or metadata(lock_path)['owner'] != owner:
+            fail('The receipt lock must be private and owned by the installer.')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if kind in ['helper', 'server'] and args.mode in ['plan', 'forward'] and (publish_unit or args.enable):
+            unit_destination(unit_path, root)
+        private_directory(receipts, owner)
+        receipt = None
+        if receipt_path.exists():
+            if metadata(receipt_path)['mode'] != '0600' or metadata(receipt_path)['owner'] != owner:
+                fail('Receipts must be private (0600) and owned by the installer.')
+            receipt = canonical_receipt(json.loads(receipt_path.read_bytes()))
+            if receipt.get('version') != 1 or receipt.get('installer') != kind or receipt.get('root') != str(root or '/'):
+                fail('Receipt does not belong to this installer and root.')
+            recorded_prefix = protected(Path(receipt['intent']['prefix']))
+            if not recorded_prefix.parts[1:] or root and not recorded_prefix.is_relative_to(root):
+                fail('Receipt prefix is outside the deployment root.')
+            if prefix is not None and prefix != recorded_prefix:
+                fail('Resume options do not match the receipt.')
+            prefix = recorded_prefix
+            validate_prefix(prefix)
+            for entry in receipt['paths']:
+                if (entry['old'] and entry['old']['kind'] == 'symlink') or (entry['new'] and entry['new']['kind'] == 'symlink'):
+                    link_paths.add(Path(entry['path']))
+                publication_path(Path(entry['path']))
+                if root and not Path(entry['path']).is_relative_to(root):
+                    fail('Receipt path is outside the fake root.')
+            if receipt['status'] != 'reversed':
+                for entry in receipt['paths']:
+                    if not entry.get('enablement'):
+                        continue
+                    path = Path(entry['path'])
+                    if entry['new']['kind'] == 'symlink':
+                        path = link_target(path, entry['new']['target'])
+                    unit_destination(path, root)
+        if pending.exists() or pending.is_symlink():
+            info = metadata(pending)
+            if info['kind'] != 'file' or info['mode'] != '0600' or info['owner'] != owner or pending.stat().st_nlink != 1:
+                fail('The pending receipt must be private and owned by the installer.')
+            pending.unlink()
+
+        def save():
+            atomic(receipt_path, (json.dumps(receipt, indent=2) + '\n').encode(), 0o600, owner, pending)
+
+        def systemctl(*words, query=False):
+            command = ['systemctl' if root else '/usr/bin/systemctl', *(['--root', str(root)] if root else []), *words]
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                                    env={**os.environ, 'LC_ALL': 'C'})
+            if query:
+                state = result.stdout.decode().strip()
+                codes = {'enabled': [0], 'disabled': [1], 'static': [0], 'indirect': [0],
+                         'masked': [1], 'not-found': [4]}
+                if state in codes and result.returncode in codes[state] and not result.stderr:
+                    return state
+                missing = 'Failed to get unit file state for ' + words[-1] + ': No such file or directory'
+                if not state and result.returncode in [1, 4] and result.stderr.decode().strip() == missing:
+                    return 'not-found'
+                fail('Cannot determine unit enablement state.')
+            if result.returncode:
+                fail('The requested systemctl operation failed.')
+
+        if args.mode in ['verify', 'reverse']:
+            if receipt is None or receipt['status'] == 'planned':
+                fail('No forward publication exists for this receipt.')
+            if receipt['status'] == 'reversed':
+                for entry in receipt['paths']:
+                    if metadata(Path(entry['path'])) != entry['old']:
+                        fail('Reversed path no longer matches its receipt.')
+                for unit in receipt['units']:
+                    if systemctl('is-enabled', unit['name'], query=True) != unit['old']:
+                        fail('Reversed enablement no longer matches its receipt.')
+                print('PASS reversed receipt ' + transaction)
+                return
+            reversing = args.mode == 'reverse'
+            for entry in receipt['paths']:
+                current = metadata(Path(entry['path']))
+                expected = [entry['new']]
+                if reversing and receipt['status'] in ['applying', 'reversing']:
+                    expected.append(entry['old'])
+                if current not in expected:
+                    fail('Current path does not match the receipt; refusing changes.')
+                if reversing and current != entry['old'] and entry['old'] and entry['old']['kind'] == 'file':
+                    if not re.fullmatch(r'[0-9]+', entry.get('backup', '')):
+                        fail('Invalid undo copy name.')
+                    backup = protected(undo / entry['backup'])
+                    if not backup.is_file() or digest(backup.read_bytes()) != entry['old']['hash']:
+                        fail('Undo copy does not match the receipt.')
+            for unit in receipt['units']:
+                state = systemctl('is-enabled', unit['name'], query=True)
+                expected = [unit['new']]
+                if reversing and receipt['status'] in ['applying', 'reversing']:
+                    expected.append(unit['old'])
+                    if unit['old'] == 'not-found':
+                        expected.append('disabled')
+                if state not in expected:
+                    fail('Unit enablement no longer matches the receipt.')
+                if reversing and unit['old'] != 'enabled' and unit['new'] == 'enabled' and not args.enable:
+                    fail('Restoring enablement requires --enable on reverse.')
+            if not reversing:
+                if receipt['status'] != 'applied':
+                    fail('Forward publication is incomplete; resume it first.')
+                print('PASS verify receipt ' + transaction)
+                return
+            recover_temporaries(receipt, undo, owner)
+            paths = {entry['path'] for entry in receipt['paths']}
+            for entry in receipt['paths']:
+                path = Path(entry['path'])
+                if entry['old'] is None and path.is_dir():
+                    for child in path.rglob('*'):
+                        if str(child) not in paths:
+                            fail('Unreceipted files prevent reversal.')
+            receipt['status'] = 'reversing'
+            save()
+            for entry in reversed(receipt['paths']):
+                path = Path(entry['path'])
+                current = metadata(path)
+                if current == entry['old']:
+                    if current and current['kind'] == 'symlink' and os.readlink(path) != entry['oldTarget']:
+                        atomic_link(path, entry['oldTarget'], current['owner'], entry.get('reverseTemporary'))
+                    continue
+                if current != entry['new']:
+                    fail('Publication changed after preflight; refusing reversal.')
+                if entry['old'] is None:
+                    if path.is_dir():
+                        path.rmdir()
+                    else:
+                        path.unlink()
+                else:
+                    if entry['old']['kind'] == 'symlink':
+                        atomic_link(path, entry.get('oldTarget', entry['old']['target']), entry['old']['owner'], entry.get('reverseTemporary'))
+                    else:
+                        atomic(path, (undo / entry['backup']).read_bytes(), int(entry['old']['mode'], 8), entry['old']['owner'], entry.get('reverseTemporary'))
+            if receipt['units']:
+                systemctl('daemon-reload')
+            receipt['status'] = 'reversed'
+            save()
+            print('PASS reverse receipt ' + transaction)
+            return
+
+        payloads = {}
+        links = {}
+        publication_files = set()
+        publication_parents = set()
+        environment = []
+
+        def template(name):
+            path = repo / 'deploy' / name
+            if not root:
+                trusted_file(path)
+            return path.read_text()
+
+        def claim_publication(path):
+            publication_path(path)
+            identity = filesystem_path(path)
+            if identity in publication_files or identity in publication_parents or any(
+                    parent in publication_files for parent in identity.parents):
+                fail('Publication paths overlap.')
+            publication_files.add(identity)
+            publication_parents.update(identity.parents)
+
+        def publish(path, data, mode):
+            claim_publication(path)
+            payloads[path] = (data, mode)
+
+        if kind in ['runtime', 'server']:
+            if not args.source or not args.manifest_sha256 or not re.fullmatch(r'[0-9a-f]{64}', args.manifest_sha256):
+                fail('Supply --from and the trusted --manifest-sha256 of SHA256SUMS.')
+            source = Path(args.source)
+            no_links(source)
+            manifest = source / 'SHA256SUMS'
+            no_links(manifest)
+            raw = manifest.read_bytes()
+            if digest(raw) != args.manifest_sha256:
+                fail('Prepared manifest hash mismatch.')
+            names = set()
+            for line in raw.decode().splitlines():
+                match = re.fullmatch(r'([0-9a-f]{64})  ([^\r\n]+)', line)
+                if not match:
+                    fail('Invalid SHA256SUMS entry.')
+                expected, name = match.groups()
+                relative = Path(name)
+                if relative.is_absolute() or '..' in relative.parts or str(relative) != name or name in names:
+                    fail('Unsafe or duplicate prepared path.')
+                allowed = name.startswith('bin/') if kind == 'runtime' else name.startswith(('dist/server/', 'dist/web/', 'node_modules/')) or name in ['package.json', 'package-lock.json']
+                if not allowed or name == 'bin/wayroost-role.json':
+                    fail('Prepared path is outside the artifact allowlist.')
+                path = absolute(str(source / relative))
+                no_links(path)
+                if not path.is_file():
+                    fail('Prepared artifact is not a regular file.')
+                data = path.read_bytes()
+                if digest(data) != expected:
+                    fail('Prepared artifact hash mismatch.')
+                names.add(name)
+                executable = bool(path.stat().st_mode & 0o111) or kind == 'runtime' and name in ['bin/signalbox-bridge.mjs', 'bin/signalbox-claude-hook.py', 'bin/signalbox-helper.py']
+                publish(prefix / relative, data, 0o755 if executable else 0o644)
+            for path in source.rglob('*'):
+                no_links(path)
+                if not path.is_dir() and path.relative_to(source).as_posix() not in names | {'SHA256SUMS'}:
+                    fail('Unhashed file in the prepared directory.')
+            required = {'bin/signalbox-bridge.mjs', 'bin/signalbox-claude-hook.py', 'bin/signalbox-helper.py', 'bin/signalbox_mail_trigger.py', 'bin/signalbox_skills.py', 'bin/wayroost_runtime.py'} if kind == 'runtime' else {'dist/server/index.js', 'dist/web/index.html', 'package.json'}
+            if not required.issubset(names):
+                fail('Prepared artifacts are incomplete.')
+            if kind == 'runtime':
+                if not args.role:
+                    fail('Runtime publication requires --role primary|shadow.')
+                publish(prefix / 'bin/wayroost-role.json', (json.dumps({'role': args.role}) + '\n').encode(), 0o644)
+
+        units = []
+        if kind in ['helper', 'server']:
+            unit_dir = target(args.unit_dir)
+            logical_unit_dir = Path(args.unit_dir)
+            if str(logical_unit_dir) not in unit_directories:
+                fail('Unit directory must be a supported systemd load path.')
+            unit_name = 'wayroost-' + kind + '.service'
+            unit_path = unit_dir / unit_name
+            if kind == 'helper':
+                if not args.owner or not re.fullmatch(r'[a-z_][a-z0-9_-]*', args.owner) or args.owner == 'root':
+                    fail('Supply a non-root Unix --owner.')
+                if not 1 <= args.port <= 65535:
+                    fail('Helper port must be between 1 and 65535.')
+                if args.home:
+                    home = Path(args.home)
+                else:
+                    home = absolute(pwd.getpwnam(args.owner).pw_dir, root=root, inspect=True)
+                if not root and pwd.getpwnam(args.owner).pw_uid == 0:
+                    fail('Helper owner must not have uid 0.')
+                hermes = Path(args.hermes_home) if args.hermes_home else absolute(str(home / '.hermes'), root=root, inspect=True)
+                token = Path(args.token_file)
+                # Credentials are referenced by path only; their bytes are never read.
+                for path in [home, hermes, token, Path(args.prefix)]:
+                    if re.search(r'[\s%"\'\\:$]', str(path)):
+                        fail('Unit paths cannot contain whitespace or systemd delimiters.')
+                if not root:
+                    credential_source(token)
+                if not root:
+                    helper_runtime(prefix)
+                replacements = {'USER': args.owner, 'HOME': str(home), 'HERMES_HOME': str(hermes),
+                                'TOKEN': str(token), 'RUNTIME': args.prefix, 'PORT': str(args.port)}
+                text = substitute(template('wayroost-helper.service'),
+                                  {'@' + key + '@': value for key, value in replacements.items()})
+                publish(unit_path, text.encode(), 0o644)
+                allowed = set(','.join(args.allow_environment).split(',')) - {''}
+                controlled = {'HOME', 'HERMES_HOME', 'WAYROOST_HELPER_ROLE_CONFIG', 'SIGNALBOX_HELPER_ROLE_CONFIG', 'WAYROOST_HELPER_PORT', 'SIGNALBOX_HELPER_PORT', 'WAYROOST_ROLE', 'SIGNALBOX_ROLE', 'WAYROOST_CONFIG', 'SIGNALBOX_CONFIG'}
+                if any(not re.fullmatch(r'[A-Z_][A-Z0-9_]*', key) or key in controlled for key in allowed):
+                    fail('Environment allowlist contains an invalid or installer-controlled key.')
+                if bool(args.drop_ins) != bool(allowed):
+                    fail('Drop-in translation requires both --drop-ins and --allow-environment.')
+                if args.writable_path and 'SIGNALBOX_SKILLS_WINDOWS_HOME' not in allowed:
+                    fail('Writable skill paths require an allowlisted Windows home.')
+                if args.drop_ins:
+                    drop_ins = Path(args.drop_ins)
+                    no_links(drop_ins)
+                    if not drop_ins.is_dir():
+                        fail('Drop-in source must be a directory.')
+                    values = {}
+                    for path in sorted(drop_ins.glob('*.conf')):
+                        no_links(path)
+                        section = ''
+                        for line in systemd_lines(path.read_text()):
+                            line = line.strip(systemd_whitespace)
+                            if line.startswith('['):
+                                section = line
+                            directive, separator, value = line.partition('=')
+                            if section != '[Service]' or not separator or directive.strip(systemd_whitespace) != 'Environment':
+                                continue
+                            words = systemd_words(value)
+                            if not words:
+                                values.clear()
+                            for word in words:
+                                key, separator, value = word.partition('=')
+                                if separator and key in allowed:
+                                    values[key] = value
+                    lines = ['[Service]']
+                    for key, value in sorted(values.items()):
+                        environment.append({'key': key, 'hash': digest(value.encode())})
+                        lines.append('Environment=' + systemd_quote(key + '=' + value))
+                    if args.writable_path:
+                        windows_home = absolute(values.get('SIGNALBOX_SKILLS_WINDOWS_HOME', ''))
+                        skill_roots = {windows_home / suffix for suffix in ['.agents/skills', '.claude/skills',
+                                       '.codex/skills', '.pi/agent/skills', '.config/opencode/skills',
+                                       'AppData/Local/hermes/skills']}
+                        for value in sorted(set(args.writable_path)):
+                            path = Path(value)
+                            if path not in skill_roots:
+                                fail('Writable paths must select individual skill roots under the imported Windows home.')
+                            target(value, publication=False)
+                            lines.append('ReadWritePaths=' + systemd_path_quote('-' + str(path)))
+                    publish(unit_dir / 'wayroost-helper.service.d/50-imported-environment.conf', ('\n'.join(lines) + '\n').encode(), 0o600)
+            else:
+                if args.primary and args.role and args.role != 'primary':
+                    fail('--primary conflicts with --role shadow.')
+                role = 'primary' if args.primary else args.role
+                if args.config_source and not args.publish_config:
+                    fail('--config-source requires --publish-config.')
+                config_path = target(args.config_path)
+                if args.publish_config:
+                    if not args.config_source or not role:
+                        fail('Config publication requires --config-source and an explicit role.')
+                    config_source = Path(args.config_source)
+                    no_links(config_source)
+                    data = config_source.read_bytes()
+                    config = json.loads(data)
+                    if config.get('role') != role:
+                        fail('Prepared config must already declare the selected role.')
+                    publish(config_path, data, 0o600)
+                if args.publish_unit:
+                    if not role:
+                        fail('Unit publication requires an explicit role.')
+                    if any(re.search(r'[\s%"\'\\:$]', value) for value in [args.prefix, args.config_path]):
+                        fail('Unit paths cannot contain whitespace or systemd delimiters.')
+                    node = None
+                    wiring = {'LoadCredential': [], 'SupplementaryGroups': []}
+                    if unit_path.exists():
+                        if not root:
+                            trusted_file(unit_path)
+                        section = ''
+                        for line in systemd_lines(unit_path.read_text()):
+                            stripped = line.strip(systemd_whitespace)
+                            if stripped.startswith('['):
+                                section = stripped
+                            key, separator, value = stripped.partition('=')
+                            key = key.strip(systemd_whitespace)
+                            if section == '[Service]' and separator and key == 'ExecStart':
+                                words = systemd_words(value, specifiers=False)
+                                node = words[0] if words else None
+                            if section == '[Service]' and separator and key in wiring:
+                                if key == 'LoadCredential':
+                                    words = systemd_words(value, specifiers=False)
+                                    if words and words[0].partition(':')[0] == 'config.json':
+                                        continue
+                                wiring[key].append(stripped)
+                    node = server_node(node or shutil.which('node') or '', inspect=not root)
+                    text = template('wayroost-server.service')
+                    if role == 'primary':
+                        text = text.replace('(shadow)', '(primary)').replace('WAYROOST_ROLE=shadow', 'WAYROOST_ROLE=primary').replace('StateDirectory=wayroost-shadow', 'StateDirectory=wayroost')
+                    text = substitute(text, {'ExecStart=/usr/bin/node ': 'ExecStart=' + str(node) + ' ',
+                                             '/opt/wayroost/server': args.prefix,
+                                             '/etc/wayroost/config.json': args.config_path})
+                    for key, lines in wiring.items():
+                        if not lines:
+                            for line in text.split('\n'):
+                                directive, separator, value = line.partition('=')
+                                if directive == key and separator:
+                                    if key == 'LoadCredential' and value.partition(':')[0] == 'config.json':
+                                        continue
+                                    lines.append(line)
+                    wiring['LoadCredential'].append('LoadCredential=config.json:' + args.config_path)
+                    for key, lines in wiring.items():
+                        if lines:
+                            text = re.sub(r'^' + key + r'=.*\n', '', text, flags=re.MULTILINE)
+                            text = re.sub(r'^Restart=on-failure$', lambda match: '\n'.join(lines) + '\n' + match[0],
+                                          text, flags=re.MULTILINE)
+                    publish(unit_path, text.encode(), 0o644)
+            publish_unit = kind == 'helper' or args.publish_unit
+            action = args.start if kind == 'helper' else args.restart
+            if args.enable or action or publish_unit:
+                old = systemctl('is-enabled', unit_name, query=True)
+                if args.enable and old not in ['enabled', 'disabled', 'not-found']:
+                    fail('Refusing to change special unit enablement state.')
+                new = 'enabled' if args.enable else 'disabled' if publish_unit and old == 'not-found' else old
+                units = [{'name': unit_name, 'old': old, 'new': new}]
+                if args.enable:
+                    if unit_path not in payloads and not unit_path.is_file():
+                        fail('Enablement requires an installed unit or --publish-unit.')
+                    enablement_dir = target('/etc/systemd/system')
+                    link = enablement_dir / 'multi-user.target.wants' / unit_name
+                    link_paths.add(link)
+                    claim_publication(link)
+                    previous = metadata(link)
+                    if previous and previous['kind'] != 'symlink':
+                        fail('The enablement path must be absent or a symlink.')
+                    if previous:
+                        if Path(previous['target']) != filesystem_path(unit_path):
+                            fail('Existing enablement link points outside the unit directory.')
+                    links[link] = '../' + unit_name if unit_dir == enablement_dir else str(logical_unit_dir / unit_name)
+
+        entries = []
+        directories = set()
+        for path in [*payloads, *links]:
+            for parent in path.parents:
+                if parent.exists():
+                    if not parent.is_dir():
+                        fail('Publication parent is not a directory.')
+                    break
+                directories.add(parent)
+        for path in sorted(directories, key=lambda path: (len(path.parts), str(path))):
+            entries.append({'path': str(path), 'old': None, 'new': {'kind': 'directory', 'hash': None, 'mode': '0755', 'owner': owner}, 'enablement': None})
+        for path, (data, mode) in sorted(payloads.items()):
+            old = metadata(path)
+            if old and old['kind'] != 'file':
+                fail('Cannot replace a directory with a file.')
+            entries.append({'path': str(path), 'old': old, 'new': {'kind': 'file', 'hash': digest(data), 'mode': format(mode, '04o'), 'owner': owner},
+                            'enablement': units[0] if units and path == unit_path else None})
+        for path, value in sorted(links.items()):
+            entries.append({'path': str(path), 'old': metadata(path),
+                            'new': link_metadata(path, value, owner),
+                            'enablement': units[0]})
+            if path.is_symlink():
+                entries[-1]['oldTarget'] = os.readlink(path)
+        intent = {'prefix': str(prefix), 'environment': environment, 'enable': getattr(args, 'enable', False),
+                  'start': getattr(args, 'start', False), 'restart': getattr(args, 'restart', False)}
+        if receipt is not None:
+            if receipt['status'] in ['reversing', 'reversed']:
+                fail('Use a new receipt after reversal.')
+            if receipt['intent'] != intent:
+                fail('Resume options do not match the receipt.')
+            desired = {entry['path']: entry['new'] for entry in entries if entry['new']['kind'] != 'directory'}
+            recorded = {entry['path']: entry['new'] for entry in receipt['paths'] if entry['new']['kind'] != 'directory'}
+            if desired != recorded:
+                fail('Prepared files changed since this receipt was created.')
+            entries = receipt['paths']
+            units = receipt['units']
+        else:
+            for entry in entries:
+                path = Path(entry['path'])
+                entry['temporary'] = str(path.parent / ('.wayroost-' + uuid.uuid4().hex))
+                if entry['old'] is not None:
+                    entry['reverseTemporary'] = str(path.parent / ('.wayroost-' + uuid.uuid4().hex))
+            receipt = {'version': 1, 'installer': kind, 'root': str(root or '/'), 'id': transaction,
+                       'status': 'planned', 'intent': intent, 'paths': entries, 'units': units, 'actionsDone': False}
+        for entry in entries:
+            expected = [entry['new']] if receipt['status'] == 'applied' else [entry['old'], entry['new']]
+            if metadata(Path(entry['path'])) not in expected:
+                fail('Completed publication no longer matches its receipt.' if receipt['status'] == 'applied' else 'Current path differs from both receipted versions.')
+            if not root and entry['old'] and (entry['old']['owner']['uid'] != 0 or entry['old']['kind'] != 'symlink' and int(entry['old']['mode'], 8) & 0o022):
+                fail('Existing publications must be root-owned and not writable by others.')
+        for unit in units:
+            expected = [unit['new']] if receipt['status'] == 'applied' else [unit['old'], unit['new']]
+            if receipt['status'] == 'applying' and unit['old'] == 'not-found':
+                expected.append('disabled')
+            if systemctl('is-enabled', unit['name'], query=True) not in expected:
+                fail('Completed enablement no longer matches its receipt.' if receipt['status'] == 'applied' else 'Current enablement differs from both receipted states.')
+        if args.mode == 'plan':
+            save()
+            for entry in entries:
+                print('PLAN ' + entry['path'] + ' hash=' + str(entry['new']['hash']) + ' mode=' + entry['new']['mode'])
+            for item in environment:
+                print('ENV ' + item['key'] + ' sha256=' + item['hash'])
+            print('Receipt ' + transaction)
+            return
+        private_directory(undo_root, owner)
+        private_directory(undo, owner)
+        for index, entry in enumerate(entries):
+            if entry['old'] and entry['old']['kind'] == 'file':
+                entry['backup'] = str(index)
+                entry.setdefault('backupTemporary', str(undo / ('.wayroost-' + uuid.uuid4().hex)))
+        if receipt['status'] == 'applied':
+            print('PASS forward receipt ' + transaction)
+            return
+        recover_temporaries(receipt, undo, owner)
+        receipt['status'] = 'applying'
+        save()
+        for entry in entries:
+            if entry['old'] and entry['old']['kind'] == 'file':
+                backup = protected(undo / entry['backup'])
+                if backup.exists():
+                    if digest(backup.read_bytes()) != entry['old']['hash']:
+                        fail('Undo copy hash mismatch.')
+                else:
+                    current = Path(entry['path']).read_bytes()
+                    if digest(current) != entry['old']['hash']:
+                        fail('Original bytes unavailable for undo.')
+                    atomic(backup, current, 0o600, owner, entry['backupTemporary'])
+        for entry in entries:
+            path = Path(entry['path'])
+            current = metadata(path)
+            if current == entry['new']:
+                if current['kind'] != 'symlink' or os.readlink(path) == links[path]:
+                    continue
+            elif current != entry['old']:
+                fail('Publication changed after preflight; refusing replacement.')
+            if entry['new']['kind'] == 'directory':
+                atomic_directory(path, owner, entry['temporary'])
+            elif entry['new']['kind'] == 'symlink':
+                atomic_link(path, links[path], owner, entry.get('temporary'))
+            else:
+                data, mode = payloads[path]
+                atomic(path, data, mode, owner, entry.get('temporary'))
+        if not receipt['actionsDone']:
+            if units:
+                if publish_unit or args.enable:
+                    unit_destination(unit_path, root)
+                systemctl('daemon-reload')
+            if getattr(args, 'start', False):
+                if not root:
+                    helper_runtime(prefix)
+                unit_destination(unit_path, root)
+                systemctl('start', unit_name)
+            if getattr(args, 'restart', False):
+                if publish_unit or args.enable:
+                    unit_destination(unit_path, root)
+                systemctl('restart', unit_name)
+            receipt['actionsDone'] = True
+        receipt['status'] = 'applied'
+        save()
+        print('PASS forward receipt ' + transaction)
+
+
+try:
+    main()
+except Exception as exception:
+    # Avoid echoing file contents from parse errors or external commands.
+    print(str(exception) if isinstance(exception, DeploymentError) else 'Deployment failed; check paths, permissions and prepared input.', file=sys.stderr)
+    sys.exit(1)
+PY
 }

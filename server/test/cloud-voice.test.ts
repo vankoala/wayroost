@@ -1,7 +1,9 @@
+import { useIsolatedStateDirectories } from './state-directory-fixture.js';
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
+import { hostPaths } from './host-path-fixture.js';
 import { once } from 'node:events';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, request, type Server, type ServerResponse } from 'node:http';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { apiUrl, credential, CloudVoiceError, ElevenLabs, type CloudTransport } from '../../speech/cloud-api.js';
@@ -14,12 +16,14 @@ import type { AppVoice, CloudVoiceErrorCode, SpeechFrame } from '../../shared/vo
 
 async function collect<T>(source: AsyncIterable<T>): Promise<T[]> { const result: T[] = []; for await (const value of source) result.push(value); return result; }
 
+useIsolatedStateDirectories();
+
 const KEY = 'obviously-fake-elevenlabs-secret';
 const CHOICE: AppVoice = { provider: 'elevenlabs', voiceId: 'fake-cloned-voice', modelId: 'fake-model' };
 const WAV = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(60)]);
 const cleanups: Array<() => Promise<unknown> | void> = [];
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!(); });
-function fixture() { const dir = mkdtempSync(join(tmpdir(), 'wayroost-cloud-')); cleanups.push(() => rmSync(dir, { recursive: true, force: true })); return dir; }
+function fixture() { const dir = temporaryDirectory('wayroost-cloud-'); cleanups.push(() => rmSync(dir, { recursive: true, force: true })); return dir; }
 function keep(server: Server) { cleanups.push(() => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); })); }
 const json = (res: ServerResponse, status: number, value: unknown) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
 async function fake(handler?: (res: ServerResponse) => void, timeout = 1000) {
@@ -142,7 +146,7 @@ describe('isolated cloud voice process', () => {
     const unit = file('wayroost-voice-cloud.service');
     for (const line of ['DynamicUser=yes', 'ProtectHome=yes', 'ProtectSystem=strict', 'NoNewPrivileges=yes',
       'CapabilityBoundingSet=', 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6', 'SystemCallFilter=@system-service',
-      'LoadCredential=elevenlabs-api-key:/etc/wayroost/elevenlabs-api-key', 'ReadWritePaths=/run/wayroost-voice-cloud']) expect(unit).toContain(line);
+      `LoadCredential=elevenlabs-api-key:${hostPaths.config}/elevenlabs-api-key`, 'ReadWritePaths=/run/wayroost-voice-cloud']) expect(unit).toContain(line);
     expect(unit).not.toContain('StateDirectory=');
     expect(unit).not.toContain('ListenStream=');
   });

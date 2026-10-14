@@ -13,7 +13,7 @@ Environment=WAYROOST_HELPER_ROLE_CONFIG=/opt/signalbox/bin/wayroost-role.json
 User=@USER@
 Environment=HERMES_HOME=@HERMES_HOME@
 Environment=SIGNALBOX_HELPER_PORT=@PORT@
-# Optional: the shopping Chrome's DevTools address (for example http://<windows-host>:9227), set in a drop-in.
+# Optional: the shopping Chrome's DevTools address (for example http://<windows-host>:<CDP_PORT>), set in a drop-in.
 # Only /json/version is asked, to show whether it's running.
 # The shared secret Signalbox sends; the same file reaches Signalbox the same way.
 LoadCredential=token:/etc/signalbox/helper.token

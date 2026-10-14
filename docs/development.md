@@ -67,7 +67,12 @@ Every environment variable is listed in
 ## Tests
 
 `npm test` runs every `*.test.ts` under `supervisor/test/`, `server/test/`,
-`web/src/` and `scripts/`.
+`web/src/`, `scripts/`, `gateway/test/` and `desktop/test/`, except
+`desktop/test/fuses.test.ts`, `desktop/test/main.test.ts` and
+`desktop/test/tray.test.ts`.
+
+Those three need the desktop package's own dependencies; install them in
+`desktop/` and run `npm --prefix desktop test`.
 
 | Suite | What it covers |
 | --- | --- |
@@ -135,12 +140,16 @@ An interpreter without Hermes can run the hook tests, but the plugin-manager
 integration checks are skipped. A complete plugin acceptance run has no skips.
 
 The helper's tests (`helper/test_*.py`: skill syncing, the phone line status
-the busy counts rely on, and the shadow role) are plain `unittest` as well, and `npm test` doesn't run
-them either:
+the busy counts rely on, the shadow role, and job transitions) use plain `unittest`.
+`npm test` runs the jobs-transition checks through a Vitest wrapper. Run all
+helper checks directly with:
 
 ```bash
-python3 -m unittest discover -s helper -p 'test_*.py'
+NODE_BIN="$(node -p 'process.execPath')" python3 -m unittest discover -s helper -p 'test_*.py'
 ```
+
+The jobs-transition browser tests capture `NODE_BIN` before clearing their
+environment; their Vitest wrapper supplies the runner's own Node executable.
 
 ### Paseo compatibility
 

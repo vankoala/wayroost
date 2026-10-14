@@ -1,10 +1,11 @@
+import { useIsolatedStateDirectories } from './state-directory-fixture.js';
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
 import { BackgroundGate } from '../src/background.js';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, rmSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   bridgeEnvelope,
   parseBridgeEnvelope,
@@ -52,6 +53,8 @@ import { FakeHermes, FakePaseo, apiHeaders, makeConfig, makeKeys, makeToken, pos
 // The project bridge against fake sources: scoping, delivery, limits, the loop
 // breaker, starting chats, the kill switch, and the loopback listener's guards.
 // Nothing here talks to a real Hermes or Paseo.
+
+useIsolatedStateDirectories();
 
 const APP = '/home/me/code/app';
 const OTHER = '/home/me/code/other';
@@ -1531,10 +1534,13 @@ describe('app: /api/bridge', () => {
 // ---- config and token ---------------------------------------------------------------------
 
 describe('bridge config and token', () => {
+  let configState: string;
+  beforeEach(() => { configState = temporaryDirectory('wayroost-bridge-config-'); });
+  afterEach(() => { rmSync(configState, { recursive: true, force: true }); });
   const valid = {
     publicOrigin: 'https://wayroost.example.com',
     access: { teamDomain: 'https://myteam.cloudflareaccess.com', aud: 'abc123', allowedEmails: ['me@example.com'] },
-    stateDir: '/var/lib/signalbox',
+    get stateDir() { return configState; },
   };
 
   it('is off by default on port 19012, and validated strictly', () => {
@@ -1555,7 +1561,7 @@ describe('bridge config and token', () => {
   });
 
   it('creates a private random token once and keeps it', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'sb-bridge-'));
+    const dir = temporaryDirectory('sb-bridge-');
     const token = readOrCreateBridgeToken(dir, new BackgroundGate('primary'));
     expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
     const file = join(dir, 'bridge-token');

@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -87,9 +88,15 @@ def main() -> None:
     known = set(seen)
     fresh = [m for m in messages if m.get("id") and m["id"] not in known]
     seen.extend(m["id"] for m in fresh)
-    tmp = state_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"seen": seen[-MAX_SEEN:]}))
-    os.replace(tmp, state_path)
+    fd, name = tempfile.mkstemp(dir=state_path.parent, prefix=f".{state_path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(json.dumps({"seen": seen[-MAX_SEEN:]}))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, state_path)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
     passed = [m for m in fresh if not SENSITIVE.search(f"{m.get('subject', '')} {m.get('snippet', '')}")]
     if first_run or not passed:

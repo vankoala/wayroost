@@ -1,6 +1,7 @@
 import { checkDeviceSignal } from '../security/device-signal.js';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { readLegacySafetyCommands } from '../../../shared/legacy-settings.js';
 
 // Settings → Security → "Hermes safety commands": whether Signalbox lets
 // /approve, /approvals, /yolo, /memory approval, /skills approval and /debug
@@ -23,7 +24,7 @@ export class SafetyCommandsSetting {
 
   private load(): boolean {
     try {
-      return (JSON.parse(readFileSync(this.path, 'utf8')) as { enabled?: unknown }).enabled === true;
+      return readLegacySafetyCommands(readFileSync(this.path, 'utf8')).value;
     } catch {
       return false;
     }

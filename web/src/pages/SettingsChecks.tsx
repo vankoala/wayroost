@@ -3,11 +3,12 @@ import { settingsChecksResponseSchema, type CheckFix, type SettingsCheckRow, typ
 import { operationLevel, operationSpec, operationTarget, type KeyTimingRule } from '../../../shared/settings-ops.js';
 import type { Timing } from '../../../shared/settings.js';
 import { api } from '../api.js';
-import { Page } from '../components/common.js';
+import { Link, Page } from '../components/common.js';
 import { SettingsRestart } from '../components/SettingsRestart.js';
 import { SettingsConfirmPrompt, SettingsReadNotice, SettingsSectionGuard, TimingNotes, LevelChip, accessForValue, useSettingsChange, useSettingsReadOnly, useSettingsSection, useSettingsStatus, type SettingsReadState } from '../components/SettingsRows.js';
 import { settingsErrorText } from '../settingsModel.js';
-import { setState } from '../store.js';
+import { setState, useStore } from '../store.js';
+import { settingsPath } from '../router.js';
 
 function isChecks(value: unknown): value is SettingsChecksResponse {
   return settingsChecksResponseSchema.safeParse(value).success;
@@ -57,6 +58,7 @@ const STATE_TEXT: Record<SettingsCheckRow['state'], string> = { ok: 'OK', warn: 
 
 /** Server rows are ordered for attention without deriving any check result. */
 export function CheckRows({ rows, read, refresh }: { rows: readonly SettingsCheckRow[]; read: SettingsReadState; refresh: () => void }) {
+  const desktop = useStore(state => state.device?.kind === 'desktop');
   const ordered = [...rows].sort((a, b) => Number(b.priority === 'high') - Number(a.priority === 'high')
     || Number(b.state === 'fail') - Number(a.state === 'fail'));
   return <div className="group settings-checks">
@@ -66,6 +68,9 @@ export function CheckRows({ rows, read, refresh }: { rows: readonly SettingsChec
         <div>{row.sentence}</div>
         <div className="muted">{STATE_TEXT[row.state]}{row.priority && <> · Priority: {row.priority}</>} · <code>{row.id}</code></div>
         {row.details?.map((detail, index) => <div className="muted" key={index}>{detail}</div>)}
+        {row.id === 'phone.voice' && row.state === 'warn' && row.sentence === 'Phone voice not updated; re-save the voice.' && (desktop
+          ? <Link to={settingsPath('voice')}>Open voice settings</Link>
+          : <div className="muted">Re-save the voice from a paired desktop.</div>)}
         {row.fix && <Fix key={JSON.stringify(row.fix)} id={row.id} fix={row.fix} read={read} refresh={refresh} />}
       </div>
     </div>)}

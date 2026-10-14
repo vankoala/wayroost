@@ -55,8 +55,9 @@ const views: Record<SettingsSection, readonly ReadViewId[]> = {
 };
 const hash = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
 const changeId = () => `ch_${randomBytes(12).toString('hex')}`;
-const FEED_WORK_FILE = 'settings-consumers.jsonl';
-const feedWorkSchema = z.object({ change: z.string().regex(CHANGE_ID), pending: z.boolean() }).strict();
+const CONSUMER_WORK_FILE = 'settings-consumers.jsonl';
+const consumerWorkSchema = z.object({ change: z.string().regex(CHANGE_ID), pending: z.boolean() }).strict();
+type ConsumerWorkType = 'settings-feed-work' | 'settings-phone-voice';
 const refused = (code: SettingsErrorCode): SettingsApplyResponse => ({ status: 'refused', code });
 const legacyOperations = new Set(['paseo.provider-enabled', 'wayroost.safety-commands', 'paseo.worker-approvals']);
 const modelStatusSchema = z.array(z.object({ role: z.enum(['main', 'coder', 'fast']), health: z.enum(['up', 'down', 'unmapped', 'owner_mismatch', 'unknown']), inFlight: z.number().int().nonnegative() }));
@@ -224,9 +225,11 @@ class SettingsPipeline {
   private settingsRetryAt = 0;
   private settingsRetryDelay = 1000;
   private retryingSettings = false;
-  private feedWorkJournal?: EventJournal;
-  private feedWorkIdentity?: { dev: number; ino: number };
-  private feedWorkFailed = false;
+  private consumerWorkJournal?: EventJournal;
+  private consumerWorkIdentity?: { dev: number; ino: number };
+  private consumerWorkFailed = false;
+  private phoneVoicePending = false;
+  private phoneVoiceChange?: string;
   private readonly settingsUncertain = new Set<string>();
   readonly legacyRoutesViaPipeline: boolean;
 
@@ -284,7 +287,7 @@ class SettingsPipeline {
           if (entry.result === 'outcome_unknown' && !entry.observed) this.settingsUncertain.add(entry.id);
           if (entry.result === 'consumer_refused' && entry.pulse?.required) this.feedPreferencesPending = true;
         }
-        this.verifyFeedWork();
+        this.verifyConsumerWork();
       }
       catch { /* The audit check keeps safety commands blocked. */ }
       await this.read('wayroost.settings');
@@ -310,41 +313,50 @@ class SettingsPipeline {
   }
 
   private get audit(): SettingsAudit { return this.auditStore ??= new SettingsAudit(this.config.stateDir, this.now); }
-  close(): void { this.closed = true; clearInterval(this.timer); this.auditStore?.close(); this.feedWorkJournal?.close(); }
+  close(): void { this.closed = true; clearInterval(this.timer); this.auditStore?.close(); this.consumerWorkJournal?.close(); }
 
-  private verifyFeedWork(): void {
+  private verifyConsumerWork(): void {
     if (!this.legacyRoutesViaPipeline) return;
-    if (this.feedWorkFailed) throw new SettingsAuditError();
-    if (!this.feedWorkJournal && !existsSync(join(this.config.stateDir, FEED_WORK_FILE))) return;
+    if (this.consumerWorkFailed) throw new SettingsAuditError();
+    if (!this.consumerWorkJournal && !existsSync(join(this.config.stateDir, CONSUMER_WORK_FILE))) return;
     try {
-      const journal = this.feedWorkJournal ??= new EventJournal(this.config.stateDir, this.now, FEED_WORK_FILE);
+      const journal = this.consumerWorkJournal ??= new EventJournal(this.config.stateDir, this.now, CONSUMER_WORK_FILE);
       const stat = lstatSync(journal.path);
-      this.feedWorkIdentity ??= stat;
-      if (!stat.isFile() || stat.nlink !== 1 || stat.dev !== this.feedWorkIdentity.dev || stat.ino !== this.feedWorkIdentity.ino) throw new Error('audit_unavailable');
+      this.consumerWorkIdentity ??= stat;
+      if (!stat.isFile() || stat.nlink !== 1 || stat.dev !== this.consumerWorkIdentity.dev || stat.ino !== this.consumerWorkIdentity.ino) throw new Error('audit_unavailable');
       for (const event of journal.load()) {
-        if (event.type !== 'settings-feed-work') throw new Error('audit_unavailable');
-        this.feedPreferencesPending = feedWorkSchema.parse(event.data).pending;
+        if (event.type !== 'settings-feed-work' && event.type !== 'settings-phone-voice') throw new Error('audit_unavailable');
+        const { change, pending } = consumerWorkSchema.parse(event.data);
+        if (event.type === 'settings-feed-work') this.feedPreferencesPending = pending;
+        else { this.phoneVoicePending = pending; this.phoneVoiceChange = change; }
       }
     } catch {
-      this.feedWorkFailed = true;
+      this.consumerWorkFailed = true;
       this.store.invalidate();
       throw new SettingsAuditError();
     }
   }
 
-  private recordFeedWork(change: string, pending: boolean): void {
+  private recordConsumerWork(type: ConsumerWorkType, change: string, pending: boolean): void {
     this.audit.verify();
-    this.verifyFeedWork();
+    this.verifyConsumerWork();
+    if (type === 'settings-phone-voice' && this.phoneVoiceChange === change && this.phoneVoicePending === pending) return;
     try {
-      this.feedWorkJournal ??= new EventJournal(this.config.stateDir, this.now, FEED_WORK_FILE);
-      this.feedWorkIdentity ??= lstatSync(this.feedWorkJournal.path);
-      this.feedWorkJournal.append({ type: 'settings-feed-work', data: feedWorkSchema.parse({ change, pending }) });
-      this.feedPreferencesPending = pending;
+      this.consumerWorkJournal ??= new EventJournal(this.config.stateDir, this.now, CONSUMER_WORK_FILE);
+      this.consumerWorkIdentity ??= lstatSync(this.consumerWorkJournal.path);
+      this.consumerWorkJournal.append({ type, data: consumerWorkSchema.parse({ change, pending }) });
+      if (type === 'settings-feed-work') this.feedPreferencesPending = pending;
+      else { this.phoneVoicePending = pending; this.phoneVoiceChange = change; }
     } catch {
-      this.feedWorkFailed = true;
+      this.consumerWorkFailed = true;
       this.store.invalidate();
       throw new SettingsAuditError();
     }
+  }
+
+  private recordPhoneVoiceWork(record: SettingsWriteRecord): void {
+    if (this.legacyRoutesViaPipeline && record.target === 'wayroost-settings' && record.keys.includes('voice') && this.options.applyPhoneVoice)
+      this.recordConsumerWork('settings-phone-voice', record.id, true);
   }
   notificationSource(request: object) { return this.notificationSources.get(request); }
   notificationOutcome(request: object) { return this.notificationOutcomes.get(request); }
@@ -368,6 +380,8 @@ class SettingsPipeline {
     }
     catch (error) {
       if (error instanceof SettingsAuditError && this.legacyRoutesViaPipeline) this.store.invalidate();
+      if (error instanceof SettingsAuditError && this.consumerWorkFailed && !request.deviceSignal?.aborted
+        && request.method === 'GET' && request.routeOptions.url === SETTINGS_ROUTES.checks) return action();
       return refused(request.deviceSignal?.aborted ? 'not_permitted' : error instanceof SettingsAuditError ? 'audit_unavailable' : 'failed');
     }
   }
@@ -415,10 +429,11 @@ class SettingsPipeline {
       if (outcome === 'applied' && row.result !== 'ok' || outcome === 'refused' && (row.result === 'ok' || row.result === 'outcome_unknown' || row.writtenSha256)) continue;
       this.audit.event('settings-write-resolved', { id: entry.id, requestId, outcome });
       if (outcome === 'applied' && entry.target === 'wayroost-settings' && this.legacyRoutesViaPipeline
-        && this.options.consumers?.feed && entry.pulse?.required) this.recordFeedWork(entry.id, true);
+        && this.options.consumers?.feed && entry.pulse?.required) this.recordConsumerWork('settings-feed-work', entry.id, true);
       let verifiedSettings: Record<string, unknown> | undefined;
       let verificationCode: SettingsErrorCode | undefined;
       if (outcome === 'applied' && entry.target === 'wayroost-settings' && this.legacyRoutesViaPipeline) {
+        this.recordPhoneVoiceWork(record);
         const current = await this.read('wayroost.settings', false);
         if (!current.ok) verificationCode = current.code;
         else if (!row.writtenSha256 || current.sha256 !== row.writtenSha256) verificationCode = 'verify_mismatch';
@@ -464,7 +479,9 @@ class SettingsPipeline {
     checkDeviceSignal(request.deviceSignal);
     const { requestId: _requestId, notes, undoOf, ...record } = entry;
     this.audit.event('settings-resolved-by-user', { id: entry.id, target: entry.target, device: request.device!.id, level: 'confirm' });
-    if (entry.target === 'wayroost-settings' && this.legacyRoutesViaPipeline && entry.pulse?.required) this.recordFeedWork(entry.id, true);
+    if (entry.target === 'wayroost-settings' && this.legacyRoutesViaPipeline && entry.pulse?.required) this.recordConsumerWork('settings-feed-work', entry.id, true);
+    if (entry.target === 'wayroost-settings' && this.legacyRoutesViaPipeline && entry.keys.includes('voice') && this.options.applyPhoneVoice)
+      this.recordConsumerWork('settings-phone-voice', entry.id, true);
     const resolved = { ...record, observed: 'resolved-by-user' as const };
     this.complete(resolved, notes, 'outcome_unknown', undoOf);
     this.settingsUncertain.delete(entry.id);
@@ -495,11 +512,13 @@ class SettingsPipeline {
     if (record.pulse?.required && this.feedPreferencesPending && this.options.consumers?.feed) {
       try { await this.options.consumers.feed.applyPreferences(); }
       catch { return { code: 'consumer_refused' }; }
-      this.recordFeedWork(record.id, false);
+      this.recordConsumerWork('settings-feed-work', record.id, false);
     }
     if (record.keys.includes('voice') && this.options.applyPhoneVoice) {
+      this.recordConsumerWork('settings-phone-voice', record.id, true);
       try { await this.options.applyPhoneVoice(this.store.voice().voice); }
       catch { return { calls: 'failed', callsMessage: 'App voice saved. The phone and car lines could not be updated; try saving the voice again.' }; }
+      this.recordConsumerWork('settings-phone-voice', record.id, false);
       return { calls: 'updated' };
     }
     return {};
@@ -537,7 +556,7 @@ class SettingsPipeline {
             wayroostSettingsSchema.parse(document);
             try {
               this.audit.verify();
-              this.verifyFeedWork();
+              this.verifyConsumerWork();
               if (this.settingsUncertain.size || this.expectedSettingsHash && this.expectedSettingsHash !== result.data.sha256) this.store.invalidate();
               else if (publish && !this.settingsPending) this.store.update(document);
             } catch { return failure('audit_unavailable'); }
@@ -600,8 +619,17 @@ class SettingsPipeline {
         !certified && row.fix && 'restart' in row.fix && row.fix.restart.component === 'hermes' && row.fix.restart.when === 'idle'
           ? { ...row, fix: { restart: { component: 'hermes', when: 'now' } } } : row) };
       const entries = this.audit.unresolved().filter(entry => entry.target && !(entry.action === 'restart' && entry.runId));
+      if (this.legacyRoutesViaPipeline && (this.phoneVoicePending || this.options.applyPhoneVoice || this.options.consumers?.feed)) {
+        let consumerWorkAvailable = true;
+        try { this.verifyConsumerWork(); } catch { consumerWorkAvailable = false; }
+        if (this.phoneVoicePending || this.options.applyPhoneVoice) result.rows.unshift({ id: 'phone.voice', state: !consumerWorkAvailable ? 'unknown' : this.phoneVoicePending ? 'warn' : 'ok',
+          ...(consumerWorkAvailable && this.phoneVoicePending ? { priority: 'high' as const } : {}),
+          sentence: !consumerWorkAvailable ? 'Phone voice status is unavailable.' : this.phoneVoicePending
+            ? this.options.applyPhoneVoice ? 'Phone voice not updated; re-save the voice.' : 'Pair the phone again and re-save the voice.' : 'No saved voice change is waiting for the phone.',
+          ...(consumerWorkAvailable && this.phoneVoicePending && this.phoneVoiceChange ? { details: [this.phoneVoiceChange] } : {}),
+        });
+      }
       if (this.legacyRoutesViaPipeline && this.options.consumers?.feed) {
-        this.verifyFeedWork();
         const applied = this.options.consumers.feed.appliedLevel();
         const drift = this.feedPreferencesPending || applied !== undefined && applied !== this.store.feed().level;
         result.rows.unshift({ id: 'wayroost.pulse-drift', state: !this.store.available() ? 'unknown' : drift ? 'fail' : 'ok',
@@ -1025,7 +1053,10 @@ class SettingsPipeline {
     if (record.target === 'wayroost-settings') { this.store.invalidate(); this.settingsUncertain.add(record.id); this.settingsPending = false; }
     if (record.runId && record.action === 'restart') this.drains.set(record.runId, { record, timing });
     const response: SettingsApplyResponse = { status: 'refused', code: 'outcome_unknown', backupId: record.backupId ?? null };
-    try { this.finish(record, timing, response, undoOf); }
+    try {
+      if (record.writtenSha256) this.recordPhoneVoiceWork(record);
+      this.finish(record, timing, response, undoOf);
+    }
     catch { /* The failed audit blocks later writes without replacing the uncertain outcome or backup id. */ }
     return response;
   }
@@ -1102,6 +1133,11 @@ class SettingsPipeline {
     if (record.target === 'wayroost-settings' && !this.legacyRoutesViaPipeline) this.settingsPending = false;
     if (token) {
       Object.assign(record, { backupId: token.backupId, backupSha256: token.backupSha256, writtenSha256: token.writtenSha256 });
+      try { this.recordPhoneVoiceWork(record); }
+      catch (error) {
+        if (error instanceof SettingsAuditError) this.settingsPending = false;
+        throw error;
+      }
       try {
         if (record.target === 'wayroost-settings') this.expectedSettingsHash = token.writtenSha256;
         const current = await this.target(spec, { target: token.target }, !this.legacyRoutesViaPipeline);
@@ -1152,7 +1188,8 @@ class SettingsPipeline {
       // Persist consumer work before owner completion can survive a restart or a lost reply.
       const applyFeed = result.ok && verifiedSettings && this.legacyRoutesViaPipeline && this.options.consumers?.feed
         && record.pulse?.required;
-      if (applyFeed) this.recordFeedWork(record.id, true);
+      if (applyFeed) this.recordConsumerWork('settings-feed-work', record.id, true);
+      if (result.ok) this.recordPhoneVoiceWork(record);
       response = this.finish(record, timing, result.ok ? { status: 'applied', change } : { status: 'refused', code: result.code, change }, undoOf);
       if (record.target === 'wayroost-settings') {
         this.settingsPending = false;

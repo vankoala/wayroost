@@ -2,6 +2,7 @@ import type { ListenerTls } from '../../lib/loopback-tls.js';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { parseLegacyJson } from '../../shared/legacy-settings.js';
 import { rolloutSchema, type Rollout } from '../../shared/rollout.js';
 import { SUPERVISOR_DEFAULTS } from '../../shared/supervisor.js';
 import { isLoopbackHost as isLoopback } from '../../shared/gateway.js';
@@ -587,7 +588,23 @@ export function parseConfig(input: unknown, options: ParseOptions = {}): AppConf
 }
 
 export function configPath(env: NodeJS.ProcessEnv = process.env): string {
-  return wayroostEnv('CONFIG', env) ?? '/etc/wayroost/config.json';
+  return wayroostEnv('CONFIG', env) ?? configCredentialPath('config.json', env) ?? '/etc/wayroost/config.json';
+}
+
+/** A config credential takes precedence over the root-only installed source. */
+export function configCredentialPath(credential: 'config.json' | 'safety-helper.json', env: NodeJS.ProcessEnv): string | undefined {
+  const directory = env.CREDENTIALS_DIRECTORY;
+  if (directory === undefined) return undefined;
+  if (!absolutePath(4096).safeParse(directory).success) {
+    throw new ConfigError('CREDENTIALS_DIRECTORY must be an absolute path without control characters');
+  }
+  const path = join(directory, credential);
+  try {
+    return statSync(path).isFile() ? path : undefined;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new ConfigError(`Cannot inspect the systemd config credential ${credential}`);
+  }
 }
 
 export function loadConfig(path: string, options: ParseOptions = {}): AppConfig {
@@ -620,7 +637,7 @@ function readConfigFile(path: string): unknown {
   }
   let json: unknown;
   try {
-    json = JSON.parse(text);
+    json = parseLegacyJson(text);
   } catch {
     throw new ConfigError(`Config at ${path} is not valid JSON`);
   }

@@ -1,3 +1,4 @@
+import { hostPaths } from '../server/test/host-path-fixture.js';
 import { readFileSync } from 'node:fs';
 import { expect, it } from 'vitest';
 
@@ -29,8 +30,11 @@ it('pins every documented Signalbox recovery command to its explicit config and 
   const docs = readFileSync('docs/configuration.md', 'utf8');
   const commands = docs.split('\n').filter(line => line.includes('sudo node /opt/signalbox/dist/server/pair-code.js'));
   expect(commands).toHaveLength(2);
-  for (const command of commands) expect(command).toContain('--config /etc/signalbox/config.json');
-  expect(docs).toContain('`SIGNALBOX_CONFIG` or `/etc/wayroost/config.json`');
+  for (const command of commands) expect(command).toContain(`--config ${hostPaths.legacyConfig}/config.json`);
+  expect(docs.replace(/\s+/g, ' ')).toContain(
+    'It reads the config from `--config <path>`, `WAYROOST_CONFIG`, `SIGNALBOX_CONFIG`, '
+    + `\`$CREDENTIALS_DIRECTORY/config.json\` (when present) or \`${hostPaths.config}/config.json\`, in that order`,
+  );
   expect(docs).toContain('shown once by `install-supervisor.sh`');
   expect(docs).toContain('**device pairing codes**');
 });

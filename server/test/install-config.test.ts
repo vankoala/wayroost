@@ -1,6 +1,8 @@
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
+import { hostPaths } from './host-path-fixture.js';
+import { useIsolatedStateDirectories, withHostileStateDirectories } from './state-directory-fixture.js';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/app.js';
@@ -10,10 +12,12 @@ import { Devices } from '../src/devices.js';
 import { FakeHermes, FakePaseo } from './helpers.js';
 import { loopbackTlsFixtures } from '../../tests/loopback-tls-fixtures.js';
 
+useIsolatedStateDirectories();
+
 const roots: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), 'wayroost-install-config-'));
+  const root = temporaryDirectory('wayroost-install-config-');
   roots.push(root);
   mkdirSync(join(root, 'etc/wayroost'), { recursive: true });
   return root;
@@ -22,11 +26,22 @@ function plan(root: string, args: string[] = []) {
   return execFileSync('bash', ['deploy/install-wayroost-server.sh', '--dry-run', '--root', root, ...args], { encoding: 'utf8' });
 }
 function generated(output: string) {
-  const line = output.split('\n').findIndex(line => line.includes('/etc/wayroost/config.json mode='));
+  const line = output.split('\n').findIndex(line => line.includes(`${hostPaths.config}/config.json mode=`));
   const json = output.split('\n').slice(line + 1).join('\n');
   const end = json.indexOf('\n}\n');
   return JSON.parse(json.slice(0, end + 2)) as Record<string, unknown>;
 }
+
+it('validates generated shadow state against an isolated private-state layout', () => {
+  const root = fixture();
+  writeFileSync(join(root, 'etc/wayroost/config.json'), JSON.stringify({ publicOrigin: 'https://wayroost.example.com' }));
+  const raw = generated(plan(root));
+  const options = { env: {}, withoutSupervisor: true };
+  withHostileStateDirectories(() => {
+    expect(() => parseConfig(raw, options)).toThrow('Cannot resolve stateDir; state ownership is unresolved');
+  });
+  expect(parseConfig(raw, options).stateDir).toBe(`${hostPaths.privateState}/wayroost-shadow`);
+});
 
 it('generates an explicitly paired desktop origin while preserving public Access and custom origins', async () => {
   const root = fixture();
@@ -46,11 +61,11 @@ it('generates an explicitly paired desktop origin while preserving public Access
   expect(installed.role).toBe('shadow');
   expect(installed.listen).toEqual({ host: '127.0.0.1', port: 8881 });
   expect(installed.localListener).toEqual({ host: '127.0.0.1', port: 8883, pcOnlyWrites: false });
-  expect(installed.stateDir).toBe('/var/lib/wayroost-shadow');
+  expect(installed.stateDir).toBe(hostPaths.shadowState);
   expect(installed.supervisor?.socket).toBe('/run/wayroost/supervisor.sock');
   expect(installed.origins.map((o) => o.origin)).toEqual(expect.arrayContaining(['https://127.0.0.1:8881', 'https://127.0.0.1:8883']));
   // A shadow never takes the primary's state, whatever the config says.
-  expect(() => parseConfig({ ...raw, stateDir: '/var/lib/wayroost' }, credential)).toThrow(/primary-owned/);
+  expect(() => parseConfig({ ...raw, stateDir: hostPaths.primaryState }, credential)).toThrow(/primary-owned/);
   // Pairing the desktop on the local origin, in an empty state directory of the shadow's own.
   const config = parseConfig({ ...raw, stateDir: join(root, 'shadow-state') }, { ...credential, env: {} });
   expect(config.role).toBe('shadow');
@@ -78,11 +93,11 @@ it('supplies exactly paseo-password only when the protected source exists, witho
   const password = 'obviously-fake-paseo-password';
   writeFileSync(join(root, 'etc/wayroost/paseo-password'), password, { mode: 0o600 });
   const output = plan(root);
-  expect(output).toContain('LoadCredential=paseo-password:/etc/wayroost/paseo-password');
+  expect(output).toContain(`LoadCredential=paseo-password:${hostPaths.config}/paseo-password`);
   expect(output).toContain('ProtectHome=yes');
   expect(output).not.toContain(password);
-  const custom = plan(root, ['--paseo-password-file', '/etc/wayroost/paseo-password']);
-  expect(custom).toContain('LoadCredential=paseo-password:/etc/wayroost/paseo-password');
+  const custom = plan(root, ['--paseo-password-file', `${hostPaths.config}/paseo-password`]);
+  expect(custom).toContain(`LoadCredential=paseo-password:${hostPaths.config}/paseo-password`);
 });
 
 it('plans the scoped owner helper and credential without opening the server home sandbox', () => {
@@ -91,7 +106,7 @@ it('plans the scoped owner helper and credential without opening the server home
   expect(output).toContain('User=demo-owner');
   expect(output).toContain('ReadWritePaths=/home/me/demo-paseo');
   expect(output).toContain('"safetyHelper"');
-  expect(output).toContain('LoadCredential=safety-helper-key:/etc/wayroost/safety-helper-key');
+  expect(output).toContain(`LoadCredential=safety-helper-key:${hostPaths.config}/safety-helper-key`);
   expect(output).toContain('ProtectHome=yes');
   expect(readFileSync('deploy/wayroost-server.service', 'utf8')).toContain('ProtectHome=yes');
   expect(output).toContain('safety-helper.js');
@@ -105,6 +120,6 @@ it('validates the configured Unix socket and retains helper credentials on reins
   writeFileSync(join(root, 'etc/wayroost/safety-helper.json'), '{"configPath":"/home/me/demo-paseo/config.json","url":"ws://127.0.0.1:8896"}');
   writeFileSync(join(root, 'etc/wayroost/config.json'), JSON.stringify({ publicOrigin: 'https://wayroost.example.com', safetyHelper: { socket: '/run/wayroost-paseo-safety/helper.sock' } }));
   const output = plan(root);
-  expect(output).toContain('LoadCredential=safety-helper-key:/etc/wayroost/safety-helper-key');
+  expect(output).toContain(`LoadCredential=safety-helper-key:${hostPaths.config}/safety-helper-key`);
   expect(generated(output).safetyHelper).toEqual({ socket: '/run/wayroost-paseo-safety/helper.sock' });
 });

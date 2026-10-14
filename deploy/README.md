@@ -1,8 +1,35 @@
 # Wayroost M1 install plans
 
+For the isolated runtime, owner helper and server artifact publication, see the
+[primary installation guide](../docs/primary-install.md). Those explicit modes
+use reversible receipts and require flags for service actions. The legacy flows
+below retain their original behavior.
+
 These scripts install the supervisor and Wayroost server under an admin's control.
 Development and tests run them only with `--dry-run`. They do not build from
 source, use the legacy app's config/state, or change its units.
+
+Installed services require **systemd 249 or newer** (including Ubuntu 22.04).
+Config credentials use `/run/credentials/%n/<credential>` in system units;
+`%n` expands to the full unit name, including any instance and the `.service`
+suffix. For example, the server reads
+`/run/credentials/wayroost-server.service/config.json`. Renamed and instanced
+units therefore use their own credentials directory. The installers preserve
+this expansion when rendering units. Credential files are supplied by
+`LoadCredential`, available since systemd 247; the root-owned source files
+remain under `/etc/wayroost`.
+
+The deployment unit and drop-in specifier allowlist is deliberately small:
+
+| Specifier | Meaning | Usage |
+| --- | --- | --- |
+| `%n` | Full unit name | Server and Safety helper config credential paths |
+| `%%` | Literal percent sign | Allowed for escaping; currently unused |
+
+Both are documented in the [systemd 249 unit specifiers](https://github.com/systemd/systemd/blob/v249/man/systemd.unit.xml).
+`scripts/systemd-compat.test.ts` checks every deployment unit and drop-in
+template, including installer heredocs, against this allowlist. Other
+specifiers require checking compatibility with systemd 249 before adding them.
 
 Build the artifacts in a root-owned checkout with Node 22 or newer before
 the admin installs them:
@@ -102,8 +129,16 @@ Systemd supplies these credentials:
 | Credential name | Source | Consumer path |
 | --- | --- | --- |
 | `supervisor-server-key` | `/etc/wayroost/server-key` | `$CREDENTIALS_DIRECTORY/supervisor-server-key` |
-| `config.json` | `/etc/wayroost/config.json` | `%d/config.json`, selected by `WAYROOST_CONFIG` and M1's `SIGNALBOX_CONFIG` fallback |
+| `config.json` | `/etc/wayroost/config.json` | `/run/credentials/wayroost-server.service/config.json`, selected by `WAYROOST_CONFIG` and the `SIGNALBOX_CONFIG` fallback |
 | `paseo-password` (when its protected source exists) | `/etc/wayroost/paseo-password`, or `--paseo-password-file` | `$CREDENTIALS_DIRECTORY/paseo-password` |
+
+The Safety helper selects
+`/run/credentials/wayroost-paseo-safety.service/safety-helper.json` through
+`WAYROOST_SAFETY_CONFIG`. If the explicit config variables are unset, the
+server and Safety helper look for `config.json` and `safety-helper.json`
+respectively in `CREDENTIALS_DIRECTORY` before using their `/etc/wayroost`
+defaults. Explicit paths always take precedence, including `SIGNALBOX_CONFIG`
+for the server.
 
 Generated config includes `https://127.0.0.1:8881` and `https://127.0.0.1:8883`
 in `origins` and enables device pairing, while retaining the public HTTPS origin,
@@ -220,3 +255,5 @@ included in Vitest. `--root /fake-root` is strictly test-only: it requires
 installation. A bare dry run uses templates instead of reading host config or
 keys. The checks stub out host-changing commands and confirm the fake root's
 files are unchanged; shellcheck runs if it is installed.
+
+See [moving triggers and scheduled jobs](../docs/jobs-transition.md) for the owner-run transition tool.

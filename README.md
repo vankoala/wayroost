@@ -2,7 +2,7 @@
 
 Your own AI team, on your own PC: one open-source home for your personal and coding agents, reachable from your phone.
 
-**Status: early development.** The current Wayroost app is a self-hosted web app that puts [Hermes Agent](https://github.com/NousResearch/hermes-agent) chats and [Paseo](https://github.com/getpaseo/paseo) coding agents into one phone-friendly interface. The code here is that app today. Its guide is in [docs/signalbox.md](docs/signalbox.md). This page describes where Wayroost is going. Wayroost was previously called Signalbox; service, path, variable and label names that start with signalbox keep that name so existing installs keep working.
+**Status: early development.** The current Wayroost app is a self-hosted web app that puts [Hermes Agent](https://github.com/NousResearch/hermes-agent) chats and [Paseo](https://github.com/getpaseo/paseo) coding agents into one phone-friendly interface. The code here is that app today. Its guide is in [docs/signalbox.md](docs/signalbox.md). This page describes where Wayroost is going. Wayroost was previously called Signalbox; existing paths, service units and historical labels remain compatible, and `SIGNALBOX_*` variables are deprecated fallbacks. New bridge registrations use `wayroost`; see [bridge names](docs/bridge-names.md) for the transition and cutoff.
 
 <p>
   <img src="docs/images/01-phone-inbox-dark.png" alt="The inbox on a phone: Hermes chats and Paseo agents in one list" width="260">
@@ -36,7 +36,7 @@ Your own AI team, on your own PC: one open-source home for your personal and cod
 | M3 | The installer and Wayroost's own Linux distro |
 | M4 | Importing an existing Hermes and Paseo setup |
 | M5 | Windows-only mode |
-| M6 | Remote access: Tailscale and Cloudflare |
+| M6 | Remote access: Cloudflare Tunnel and Access are available today; Tailscale integration is planned |
 | M7 | Channels and add-ons: WhatsApp, Telegram, phone line |
 | M8 | The remaining settings: connectors, memory, devices, projects |
 | M9 | Look and feel; signed 1.0 release |

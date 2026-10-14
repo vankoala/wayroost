@@ -1,12 +1,13 @@
+import { hostPaths } from './host-path-fixture.js';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { configPath } from '../src/config.js';
 import { wayroostEnv } from '../src/environment.js';
 
 describe('Wayroost names and environment compatibility', () => {
-  it('defaults to /etc/wayroost/config.json and accepts both config variables', () => {
+  it(`defaults to ${hostPaths.config}/config.json and accepts both config variables`, () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    expect(configPath({})).toBe('/etc/wayroost/config.json');
+    expect(configPath({})).toBe(`${hostPaths.config}/config.json`);
     expect(configPath({ WAYROOST_CONFIG: '/home/me/wayroost.json', SIGNALBOX_CONFIG: '/home/me/legacy.json' })).toBe('/home/me/wayroost.json');
     expect(configPath({ SIGNALBOX_CONFIG: '/home/me/legacy.json' })).toBe('/home/me/legacy.json');
     expect(configPath({ SIGNALBOX_CONFIG: '/home/me/legacy.json' })).toBe('/home/me/legacy.json');

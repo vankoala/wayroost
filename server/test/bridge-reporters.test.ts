@@ -426,10 +426,10 @@ assert status == "3", status
 it('keeps both launch reporters on the configured bridge port after an upgrade', () => {
   check(String.raw`
 config = home / "config.json"
-config.write_text(json.dumps({"bridge": {"enabled": True, "port": 8792}}))
+config.write_text(json.dumps({"bridge": {"enabled": True, "port": 19112}}))
 port_script = re.search(r'PORT="\$\(python3 -I - "\$ETC/config.json" <<\x27PY\x27\n(.*?)\nPY\n', script, re.S).group(1)
 port = subprocess.check_output([sys.executable, "-I", "-B", "-c", port_script, str(config)], text=True).strip()
-assert port == "8792"
+assert port == "19112"
 url = "http://127.0.0.1:" + port
 assert 'helper bridge-url "$MODE" "$UHOME/.config/wayroost/bridge-url" "http://127.0.0.1:$PORT"' in script
 result = install_url("add", url)
@@ -449,13 +449,13 @@ assert report_urls() == [default_url + "/bridge/v1/note_run", default_url + "/br
 it('prefers explicit bridge URL aliases and refuses remote or malformed reporter URLs', () => {
   check(String.raw`
 for environ, url in [({}, "http://127.0.0.1:19012"),
-                     ({"SIGNALBOX_BRIDGE_URL": "http://127.0.0.1:8792"}, "http://127.0.0.1:8792"),
-                     ({"SIGNALBOX_BRIDGE_URL": "http://127.0.0.1:8792", "WAYROOST_BRIDGE_URL": "http://127.0.0.1:19022"}, "http://127.0.0.1:19022")]:
+                     ({"SIGNALBOX_BRIDGE_URL": "http://127.0.0.1:19112"}, "http://127.0.0.1:19112"),
+                     ({"SIGNALBOX_BRIDGE_URL": "http://127.0.0.1:19112", "WAYROOST_BRIDGE_URL": "http://127.0.0.1:19022"}, "http://127.0.0.1:19022")]:
     with patch.dict(os.environ, environ):
         assert report_urls() == [url + "/bridge/v1/note_run", url + "/bridge/v1/note_launch"]
-for url in ("http://example.com:8792", "http://127.0.0.1.example.com:8792", "https://127.0.0.1:8792",
-            "http://me:fake@127.0.0.1:8792", "http://127.0.0.1:0", "http://127.0.0.1:65536",
-            "http://127.0.0.1:8792/other", "http://127.0.0.1:8792?other", "http://127.0.0.1:8792#other", ""):
+for url in ("http://example.com:19112", "http://127.0.0.1.example.com:19112", "https://127.0.0.1:19112",
+            "http://me:fake@127.0.0.1:19112", "http://127.0.0.1:0", "http://127.0.0.1:65536",
+            "http://127.0.0.1:19112/other", "http://127.0.0.1:19112?other", "http://127.0.0.1:19112#other", ""):
     with patch.dict(os.environ, {"WAYROOST_BRIDGE_URL": url}), patch("urllib.request.build_opener") as opener:
         try:
             runtime.bridge_url()
@@ -469,22 +469,22 @@ for url in ("http://example.com:8792", "http://127.0.0.1.example.com:8792", "htt
 
 it('keeps bridge URL dry runs read-only and rejects invalid saved configuration', () => {
   check(String.raw`
-url = "http://127.0.0.1:8792"
+url = "http://127.0.0.1:19112"
 target = home / ".config/wayroost/bridge-url"
 assert install_url("add", url, dry=True).returncode == 0
 assert not target.exists()
 assert install_url("add", url).returncode == 0
 assert install_url("remove", url, dry=True).returncode == 0
 assert target.read_text().strip() == url
-target.write_text("http://example.com:8792")
+target.write_text("http://example.com:19112")
 try:
     runtime.bridge_url()
 except ValueError:
     pass
 else:
     raise AssertionError("Invalid saved URL was accepted")
-assert install_url("add", "http://example.com:8792").returncode == 1
-assert target.read_text() == "http://example.com:8792"
+assert install_url("add", "http://example.com:19112").returncode == 1
+assert target.read_text() == "http://example.com:19112"
 `);
 });
 

@@ -1,5 +1,9 @@
 # Supervisor core
 
+Installed services require systemd 249 or newer. Config credential paths use
+`/run/credentials/%n/<credential>`, with the full unit name in place of `%n`;
+see the [deployment credentials convention](../deploy/README.md).
+
 The supervisor runs fixed verbs on registry components only. It never takes a
 command line, a path or a shell string from a caller. In adopt mode it calls
 the existing launcher and systemd; those stay the source of truth until M4.

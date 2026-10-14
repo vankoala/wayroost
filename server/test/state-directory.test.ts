@@ -1,12 +1,16 @@
+import { isolatedStateRoot, useIsolatedStateDirectories } from './state-directory-fixture.js';
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
+import { hostPaths } from './host-path-fixture.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ConfigError, parseConfig } from '../src/config.js';
 import { FeedStore } from '../src/feed/store.js';
 import { claimStateDirectory, StateDirectoryError } from '../src/state-directory.js';
+
+useIsolatedStateDirectories();
 
 const input = {
   listen: { port: 8890 },
@@ -16,7 +20,7 @@ const input = {
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
 const dir = () => {
-  const path = mkdtempSync(join(tmpdir(), 'wayroost-state-test-'));
+  const path = temporaryDirectory('wayroost-state-test-');
   dirs.push(path);
   return path;
 };
@@ -26,7 +30,7 @@ afterEach(() => {
 });
 
 describe('state directory isolation', () => {
-  it.each(['/var/lib/wayroost', '/var/lib/signalbox'])('refuses shadow sharing primary default %s', (stateDir) => {
+  it.each([hostPaths.primaryState, hostPaths.legacyState])('refuses shadow sharing primary default %s', (stateDir) => {
     const primary = parseConfig({ ...input, stateDir }, { env: {} });
     expect(() => parseConfig({ ...input, role: 'shadow', stateDir: primary.stateDir }, { env: {} })).toThrow(ConfigError);
   });
@@ -49,10 +53,12 @@ describe('state directory isolation', () => {
     expect(refusal).toBeInstanceOf(ConfigError);
   });
 
-  it.each(['/var/lib/wayroost', '/var/lib/signalbox', '/etc/signalbox'])('refuses symlink aliases of %s', (target) => {
+  it.each([hostPaths.primaryState, hostPaths.legacyState, hostPaths.legacyConfig])('refuses symlink aliases of %s', (target) => {
+    mkdirSync(target, { recursive: true });
     const alias = join(dir(), 'alias');
     symlinkSync(target, alias);
-    expect(() => parseConfig({ ...input, role: 'shadow', stateDir: join(alias, 'new-child') }, { env: {} })).toThrow(ConfigError);
+    expect(() => parseConfig({ ...input, role: 'shadow', stateDir: join(alias, 'new-child') }, { env: {} }))
+      .toThrow('Shadow stateDir must not use a primary-owned directory');
   });
 
   it('uses the resolved isolated path, including a not-yet-created child', () => {
@@ -147,7 +153,10 @@ describe('state directory isolation', () => {
   it('atomically admits only one role when two processes claim the same empty directory', async () => {
     const stateDir = dir();
     const module = new URL('../src/state-directory.ts', import.meta.url).href;
-    const script = `import { claimStateDirectory } from ${JSON.stringify(module)};
+    const fixtureModule = new URL('./host-path-fixture.ts', import.meta.url).href;
+    const script = `import { isolateChildStateFilesystem } from ${JSON.stringify(fixtureModule)};
+      await isolateChildStateFilesystem(${JSON.stringify(isolatedStateRoot())});
+      const { claimStateDirectory } = await import(${JSON.stringify(module)});
       process.once('message', ({ path, role }) => {
         try { claimStateDirectory(path, role); process.send({ role, ok: true }); }
         catch { process.send({ role, ok: false }); }

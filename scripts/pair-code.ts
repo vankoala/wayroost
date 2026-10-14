@@ -19,7 +19,7 @@ const USAGE = 'Usage: pair-code [--phone | --desktop] [--config <path>]';
 
 function parseArgs(argv: string[]): { kind: DeviceKind; config: string } {
   let kind: DeviceKind = 'desktop';
-  let config = configPath();
+  let config: string | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
     if (arg === '--phone') kind = 'phone';
@@ -27,7 +27,7 @@ function parseArgs(argv: string[]): { kind: DeviceKind; config: string } {
     else if (arg === '--config' && argv[i + 1]) config = argv[(i += 1)]!;
     else throw new Error(USAGE);
   }
-  return { kind, config };
+  return { kind, config: config ?? configPath() };
 }
 
 try {

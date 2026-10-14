@@ -1,8 +1,12 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
+import { hostPaths } from './host-path-fixture.js';
+import { useIsolatedStateDirectories, withHostileStateDirectories } from './state-directory-fixture.js';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ConfigError, parseConfig, supervisorKeyCredential } from '../src/config.js';
+
+useIsolatedStateDirectories();
 
 const valid = {
   publicOrigin: 'https://wayroost.example.com',
@@ -11,7 +15,7 @@ const valid = {
     aud: 'abc123',
     allowedEmails: ['Me@Example.com'],
   },
-  stateDir: '/var/lib/signalbox',
+  stateDir: hostPaths.legacyState,
 };
 
 const withPatch = (patch: Record<string, unknown>) => ({ ...valid, ...patch });
@@ -39,15 +43,29 @@ describe('config', () => {
 
   it('defaults each resolved role to its own Wayroost state directory', () => {
     const { stateDir: _stateDir, ...input } = valid;
-    expect(parseConfig(input, { env: {} }).stateDir).toBe('/var/lib/wayroost');
+    expect(parseConfig(input, { env: {} }).stateDir).toBe(hostPaths.primaryState);
     expect(parseConfig({ ...input, role: 'shadow', listen: { port: 8890 } }, { env: {} }))
-      .toMatchObject({ role: 'shadow', stateDir: '/var/lib/wayroost-shadow' });
+      .toMatchObject({ role: 'shadow', stateDir: hostPaths.shadowState });
     expect(parseConfig({ ...input, listen: { port: 8890 } }, { env: { WAYROOST_ROLE: 'shadow' } }).stateDir)
-      .toBe('/var/lib/wayroost-shadow');
+      .toBe(hostPaths.shadowState);
     expect(parseConfig({ ...input, role: 'shadow', listen: { port: 8890 } }, { env: { WAYROOST_ROLE: 'primary' } }).stateDir)
-      .toBe('/var/lib/wayroost-shadow');
+      .toBe(hostPaths.shadowState);
     expect(() => parseConfig({ ...valid, role: 'standby' })).toThrow(ConfigError);
-    expect(parseConfig(valid).stateDir).toBe('/var/lib/signalbox');
+    expect(parseConfig(valid).stateDir).toBe(hostPaths.legacyState);
+  });
+
+  it('keeps shadow ownership checks fail-closed for inaccessible private state links', () => {
+    const { stateDir: _stateDir, ...input } = valid;
+    const shadow = { ...input, role: 'shadow', listen: { port: 8890 } };
+    const dir = temporaryDirectory('wayroost-shadow-state-');
+    try {
+      withHostileStateDirectories(() => {
+        expect(() => parseConfig(shadow, { env: {} })).toThrow('Cannot resolve stateDir; state ownership is unresolved');
+        expect(parseConfig({ ...shadow, stateDir: dir }, { env: {} }).stateDir).toBe(dir);
+      });
+      expect(parseConfig(shadow, { env: {} }).stateDir).toBe(`${hostPaths.privateState}/wayroost-shadow`);
+      expect(() => parseConfig({ ...shadow, stateDir: `${hostPaths.privateState}/wayroost` }, { env: {} })).toThrow(/primary-owned/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it.each([
@@ -83,16 +101,16 @@ describe('config', () => {
   });
 
   it.each(['WAYROOST_ROLE', 'SIGNALBOX_ROLE'])('refuses explicit primary state when %s narrows the role to shadow', (name) => {
-    expect(() => parseConfig({ ...valid, role: 'primary', listen: { port: 8890 }, stateDir: '/var/lib/wayroost' },
+    expect(() => parseConfig({ ...valid, role: 'primary', listen: { port: 8890 }, stateDir: hostPaths.primaryState },
       { env: { [name]: 'shadow' } })).toThrow(ConfigError);
   });
 
   it.each([
     {}, { stateDir: '/home/me/wayroost-state' },
     ...[19010, 19011, 19012, 19013].map((port) => ({ listen: { port }, stateDir: '/home/me/wayroost-state' })),
-    ...['/var/lib/signalbox', '/var/lib/signalbox/child', '/etc/signalbox', '/etc/signalbox/state',
-      '/var/lib/wayroost', '/var/lib/wayroost/child', '/var/lib/wayroost/', '/var/lib/wayroost-shadow/../wayroost',
-      '/home/me/../../var/lib/signalbox'].map((stateDir) => ({ listen: { port: 8890 }, stateDir })),
+    ...[hostPaths.legacyState, `${hostPaths.legacyState}/child`, hostPaths.legacyConfig, `${hostPaths.legacyConfig}/state`,
+      hostPaths.primaryState, `${hostPaths.primaryState}/child`, `${hostPaths.primaryState}/`, `${hostPaths.shadowState}/../wayroost`,
+      `/home/me/../..${hostPaths.legacyState}`].map((stateDir) => ({ listen: { port: 8890 }, stateDir })),
   ])('rejects shadow collisions or missing explicit isolation: %j', (isolation) => {
     const { stateDir: _stateDir, ...base } = valid;
     expect(() => parseConfig({ ...base, role: 'shadow', ...isolation })).toThrow(ConfigError);
@@ -123,12 +141,12 @@ describe('config', () => {
     ['Hermes secret prompts turned on with a non-boolean', withPatch({ hermes: { secretPrompts: 'yes' } })],
     ['a misspelled Hermes secret prompts switch', withPatch({ hermes: { secretPrompt: true } })],
     ['a supervisor block with no key file', withPatch({ supervisor: { socket: '/run/wayroost/supervisor.sock' } })],
-    ['a supervisor socket that is not absolute', withPatch({ supervisor: { socket: 'supervisor.sock', keyFile: '/etc/wayroost/supervisor-key' } })],
+    ['a supervisor socket that is not absolute', withPatch({ supervisor: { socket: 'supervisor.sock', keyFile: `${hostPaths.config}/supervisor-key` } })],
     ['a supervisor key file that is relative', withPatch({ supervisor: { socket: '/run/wayroost/supervisor.sock', keyFile: 'supervisor-key' } })],
     // sun_path is 108 bytes with its NUL, so the whole path gets 107 — in bytes.
-    ['a supervisor socket path one byte too long', withPatch({ supervisor: { socket: `/${'a'.repeat(107)}`, keyFile: '/etc/wayroost/supervisor-key' } })],
-    ['a supervisor socket path that fits in characters but not in bytes', withPatch({ supervisor: { socket: `/s${'ön'.repeat(60)}`, keyFile: '/etc/wayroost/supervisor-key' } })],
-    ['a supervisor block with a typo in it', withPatch({ supervisor: { socket: '/run/wayroost/supervisor.sock', keyFile: '/etc/wayroost/supervisor-key', rescuuePort: 8880 } })],
+    ['a supervisor socket path one byte too long', withPatch({ supervisor: { socket: `/${'a'.repeat(107)}`, keyFile: `${hostPaths.config}/supervisor-key` } })],
+    ['a supervisor socket path that fits in characters but not in bytes', withPatch({ supervisor: { socket: `/s${'ön'.repeat(60)}`, keyFile: `${hostPaths.config}/supervisor-key` } })],
+    ['a supervisor block with a typo in it', withPatch({ supervisor: { socket: '/run/wayroost/supervisor.sock', keyFile: `${hostPaths.config}/supervisor-key`, rescuuePort: 8880 } })],
     ['a supervisor block that is not an object', withPatch({ supervisor: '/run/wayroost/supervisor.sock' })],
   ])('rejects %s', (_name, input) => {
     expect(() => parseConfig(input)).toThrow(ConfigError);
@@ -145,19 +163,19 @@ describe('config', () => {
 
   it('talks to the supervisor only when the config names it', () => {
     expect(parseConfig(valid).supervisor).toBeUndefined();
-    expect(parseConfig(withPatch({ supervisor: { keyFile: '/etc/wayroost/supervisor-key' } })).supervisor).toEqual({
+    expect(parseConfig(withPatch({ supervisor: { keyFile: `${hostPaths.config}/supervisor-key` } })).supervisor).toEqual({
       socket: '/run/wayroost/supervisor.sock',
-      keyFile: '/etc/wayroost/supervisor-key',
+      keyFile: `${hostPaths.config}/supervisor-key`,
       expectedStatusOnly: true,
     });
-    expect(parseConfig(withPatch({ supervisor: { socket: '/run/wayroost/supervisor.sock', keyFile: '/etc/wayroost/supervisor-key' } })).supervisor).toEqual({
+    expect(parseConfig(withPatch({ supervisor: { socket: '/run/wayroost/supervisor.sock', keyFile: `${hostPaths.config}/supervisor-key` } })).supervisor).toEqual({
       socket: '/run/wayroost/supervisor.sock',
-      keyFile: '/etc/wayroost/supervisor-key',
+      keyFile: `${hostPaths.config}/supervisor-key`,
       expectedStatusOnly: true,
     });
     // Exactly at the limit, and a short path with accents in it, both pass.
-    expect(parseConfig(withPatch({ supervisor: { socket: `/${'a'.repeat(106)}`, keyFile: '/etc/wayroost/supervisor-key' } })).supervisor?.socket).toBe(`/${'a'.repeat(106)}`);
-    expect(parseConfig(withPatch({ supervisor: { socket: '/run/wayroost/σöck.sock', keyFile: '/etc/wayroost/supervisor-key' } })).supervisor?.socket).toBe('/run/wayroost/σöck.sock');
+    expect(parseConfig(withPatch({ supervisor: { socket: `/${'a'.repeat(106)}`, keyFile: `${hostPaths.config}/supervisor-key` } })).supervisor?.socket).toBe(`/${'a'.repeat(106)}`);
+    expect(parseConfig(withPatch({ supervisor: { socket: '/run/wayroost/σöck.sock', keyFile: `${hostPaths.config}/supervisor-key` } })).supervisor?.socket).toBe('/run/wayroost/σöck.sock');
   });
 
   it('takes the supervisor key from the systemd credential first, and keyFile only without one', () => {
@@ -184,7 +202,7 @@ describe('config', () => {
   });
 
   it('finds the supervisor credential only where systemd put it', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'sb-credentials-'));
+    const dir = temporaryDirectory('sb-credentials-');
     try {
       expect(() => supervisorKeyCredential({ CREDENTIALS_DIRECTORY: dir })).toThrow(ConfigError);
       writeFileSync(join(dir, 'supervisor-server-key'), 'obviously-fake-test-key\n', { mode: 0o600 });
@@ -206,7 +224,7 @@ describe('config', () => {
   it('uses the dev key only with no configured credential directory', () => {
     const input = withPatch({ supervisor: { keyFile: '/demo/dev/supervisor-key' } });
     expect(parseConfig(input, { supervisorKeyCredential: supervisorKeyCredential({}) }).supervisor?.keyFile).toBe('/demo/dev/supervisor-key');
-    const dir = mkdtempSync(join(tmpdir(), 'sb-credentials-'));
+    const dir = temporaryDirectory('sb-credentials-');
     try {
       for (const directory of [dir, join(dir, 'missing')]) {
         expect(() => parseConfig(input, { supervisorKeyCredential: supervisorKeyCredential({ CREDENTIALS_DIRECTORY: directory }) })).toThrow(ConfigError);
@@ -217,7 +235,7 @@ describe('config', () => {
   });
 
   it.each(['', 'too-short', 'obviously fake invalid key', 'x'.repeat(257), 'fake-key-with-control\u0000'])('refuses a malformed production credential %j', (key) => {
-    const dir = mkdtempSync(join(tmpdir(), 'sb-credentials-'));
+    const dir = temporaryDirectory('sb-credentials-');
     try {
       writeFileSync(join(dir, 'supervisor-server-key'), key, { mode: 0o600 });
       expect(() => supervisorKeyCredential({ CREDENTIALS_DIRECTORY: dir })).toThrow(ConfigError);
@@ -227,7 +245,7 @@ describe('config', () => {
   });
 
   it('refuses a credential path that is a directory', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'sb-credentials-'));
+    const dir = temporaryDirectory('sb-credentials-');
     try {
       mkdirSync(join(dir, 'supervisor-server-key'));
       expect(() => supervisorKeyCredential({ CREDENTIALS_DIRECTORY: dir })).toThrow(ConfigError);
@@ -246,7 +264,7 @@ describe('config', () => {
   });
 
   describe('sign-in and origins', () => {
-    const base = { stateDir: '/var/lib/signalbox' };
+    const base = { stateDir: hostPaths.legacyState };
 
     it('never starts without sign-in: devices off and no Access is refused', () => {
       expect(() => parseConfig({ ...base, publicOrigin: 'https://wayroost.example.com', devices: { enabled: false } })).toThrow(

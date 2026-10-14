@@ -1,3 +1,4 @@
+import { hostPaths } from './host-path-fixture.js';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import type { ServerEvent } from '../../shared/protocol.js';
 import { MediaLinks, localImagePath, mediaPathProblem } from '../src/media.js';
@@ -60,7 +61,7 @@ describe('where images may come from', () => {
     for (const blocked of [
       '/etc/ssl/logo.png',
       '/root/x.png',
-      '/var/lib/signalbox/x.png',
+      `${hostPaths.legacyState}/x.png`,
       '/proc/self/x.png',
       '~/.ssh/id.png',
       '/home/me/.config/app/icon.png',

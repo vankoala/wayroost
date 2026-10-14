@@ -12,7 +12,7 @@ WorkingDirectory=/opt/wayroost/server
 Environment=NODE_ENV=production
 # It serves the shadow server: only deliberate setting writes apply policy.
 Environment=WAYROOST_ROLE=shadow
-Environment=WAYROOST_SAFETY_CONFIG=%d/safety-helper.json
+Environment=WAYROOST_SAFETY_CONFIG=/run/credentials/%n/safety-helper.json
 Environment=WAYROOST_SAFETY_SOCKET=/run/wayroost-paseo-safety/helper.sock
 LoadCredential=safety-helper.json:/etc/wayroost/safety-helper.json
 LoadCredential=safety-helper-key:/etc/wayroost/safety-helper-key

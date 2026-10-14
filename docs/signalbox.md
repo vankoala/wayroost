@@ -159,7 +159,7 @@ Read more in [docs/how-it-works.md](how-it-works.md).
 
 | Requirement | Notes |
 | --- | --- |
-| Linux with systemd | The machine your agents run on. Tested on Ubuntu 22.04, including WSL2 with systemd enabled. |
+| Linux with systemd 249 or newer | The machine your agents run on. Tested on Ubuntu 22.04, including WSL2 with systemd enabled. |
 | Node.js 22 or newer, installed system-wide | The installer checks the version, and refuses a `node` or `npm` that anyone but root could modify, such as one from nvm in your home directory. |
 | `cloudflared` | From [Cloudflare's downloads](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/). The scripts also use `git`, `rsync`, `curl` and `python3`. |
 | A Cloudflare account and a domain on Cloudflare | The free plan works. Cloudflare Access (Zero Trust) is free for up to 50 users. |
@@ -274,7 +274,7 @@ npm run build:web && npm run demo    # http://127.0.0.1:8890
 | `npm run build` | Runs `build:web` and `build:server`. |
 | `npm run build:web` | Builds the web app with Vite into `dist/web`. |
 | `npm run build:server` | Bundles the server with esbuild into `dist/server/index.js`. |
-| `npm start` | Runs the built server with the config at `SIGNALBOX_CONFIG` (default `/etc/signalbox/config.json`). |
+| `npm start` | Runs the built server with the config at `WAYROOST_CONFIG` (default `/etc/wayroost/config.json`; `SIGNALBOX_CONFIG` is accepted as a deprecated fallback). |
 | `npm run dev:web` | Starts the Vite dev server for the web app alone. It has no API proxy, so use the demo for a working local stack. |
 | `npm run demo` | Runs the real server with demo data behind a local stand-in for Cloudflare Access, at `http://127.0.0.1:8890` (set `PORT` to move it). Build the web app first. Open it in any browser. |
 | `npm run check:ui` | Builds the web app, drives headless Chrome at phone and desktop sizes, and saves screenshots to `ui-shots/`. Fails on any page error or CSP violation. Needs Chrome at `/usr/bin/google-chrome`, or set `CHROME`. |

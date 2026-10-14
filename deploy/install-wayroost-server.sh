@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the built Wayroost server beside Signalbox, in shadow mode only.
+# Install the server with either the legacy shadow flow or explicit publication.
 set -euo pipefail
 set +x
 
@@ -8,6 +8,13 @@ REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)"
 source "$REPO/deploy/lib.sh"
 # shellcheck source=deploy/wayroost-lib.sh
 source "$REPO/deploy/wayroost-lib.sh"
+for option in "$@"; do
+  case "$option" in
+    --mode|--mode=*|--primary|--role|--role=*|--update-artifacts|--from|--from=*|--receipts|--receipts=*|--receipt|--receipt=*|--publish-config|--publish-unit|--config-source|--prefix|--enable|--restart)
+      wayroost_transaction server "$@"
+      exit 0 ;;
+  esac
+done
 DRY_RUN=0 REMOVE=0 PURGE=0 ROOT_PREFIX=''
 PASSWORD_FILE=/etc/wayroost/paseo-password SAFETY_OWNER='' SAFETY_CONFIG=''
 usage() { echo "Usage: $0 [--dry-run] [--remove] [--paseo-password-file /protected/file] [--safety-owner USER --safety-paseo-config /owner/config.json] [--root /fake-root (dry-run tests only)]"; }

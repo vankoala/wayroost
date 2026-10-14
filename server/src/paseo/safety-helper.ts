@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { BackgroundGate } from '../background.js';
 import { parseConfig, resolveRole } from '../config.js';
 import { createSafetyDaemon } from './safety-daemon.js';
+import { safetyHelperConfigPath } from './safety-helper-config.js';
 import { startSafetyRpc } from './safety-rpc.js';
 import { WorkerApprovalsSetting } from './safety-setting.js';
 
@@ -14,7 +15,7 @@ function path(name: string): string {
   return value;
 }
 const helperConfig = z.object({ configPath: z.string().refine(isAbsolute), url: z.string() }).strict()
-  .parse(JSON.parse(readFileSync(path('WAYROOST_SAFETY_CONFIG'), 'utf8')));
+  .parse(JSON.parse(readFileSync(safetyHelperConfigPath(), 'utf8')));
 const configPath = helperConfig.configPath;
 const stateDir = path('STATE_DIRECTORY');
 const socketPath = path('WAYROOST_SAFETY_SOCKET');

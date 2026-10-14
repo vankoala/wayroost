@@ -1,20 +1,24 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
+import { hostPaths, temporaryBases } from './host-path-fixture.js';
+import { useIsolatedStateDirectories, withHostileStateDirectories, withVirtualConfigFile } from './state-directory-fixture.js';
+import { rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConfigError, loadStartupConfig, parseConfig } from '../src/config.js';
+
+useIsolatedStateDirectories();
 
 const valid = {
   publicOrigin: 'https://wayroost.example.com',
   origins: ['https://127.0.0.1:19014'],
   localListener: { port: 19014 },
-  stateDir: '/var/lib/signalbox',
+  stateDir: hostPaths.legacyState,
 };
 
 let folder: string | undefined;
 afterEach(() => { if (folder) rmSync(folder, { recursive: true, force: true }); folder = undefined; });
 function startup(body: unknown, env: NodeJS.ProcessEnv = {}) {
-  folder ??= mkdtempSync(join(tmpdir(), 'wayroost-local-config-'));
+  folder ??= temporaryDirectory('wayroost-local-config-');
   const path = join(folder, 'startup.json');
   writeFileSync(path, JSON.stringify(body));
   return loadStartupConfig(path, env);
@@ -87,14 +91,61 @@ describe('the local listener', () => {
     expect(startup({ ...valid, tls: { certFile: '/home/me/cert.pem', keyFile: '/home/me/key.pem' } }, { WAYROOST_DEV_ALLOW_LOOPBACK: '1' }).tls?.keyFile).toBe('/home/me/key.pem');
   });
 
+  it.each(temporaryBases)('allocates startup configs and shadow state independently of TMPDIR=%s', directory => {
+    vi.stubEnv('TMPDIR', directory);
+    try {
+      folder = temporaryDirectory('wayroost-local-config-');
+      const bodies = ['primary', 'shadow'].map(role => ({ ...valid, role, listen: { port: 8890 },
+        stateDir: join(folder!, `${role}-state`), tls: { certFile: '/home/me/cert.pem' } }));
+      for (const body of bodies) {
+        expect(startup(body)).toMatchObject({ role: body.role, stateDir: body.stateDir, localListener: { port: 19014 }, tls: body.tls });
+      }
+      withHostileStateDirectories(() => {
+        for (const body of bodies) {
+          expect(startup(body)).toMatchObject({ role: body.role, stateDir: body.stateDir });
+          if (body.role === 'shadow') expect(() => startup({ ...body, stateDir: hostPaths.shadowState }))
+            .toThrow('Cannot resolve stateDir; state ownership is unresolved');
+        }
+      });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(temporaryBases)('reads virtual startup configs with TMPDIR=%s without visiting the host tree', directory => {
+    vi.stubEnv('TMPDIR', directory);
+    try {
+      const path = join(directory, 'wayroost-local-config-demo', 'startup.json');
+      for (const role of ['primary', 'shadow']) {
+        const body = { ...valid, role, listen: { port: 8890 },
+          stateDir: role === 'shadow' ? hostPaths.shadowState : valid.stateDir,
+          tls: { certFile: '/home/me/cert.pem' } };
+        withVirtualConfigFile(path, JSON.stringify(body), () => {
+          expect(loadStartupConfig(path, {})).toMatchObject({ role, stateDir: body.stateDir,
+            localListener: { port: 19014 }, tls: body.tls });
+          if (role === 'shadow') withHostileStateDirectories(() => {
+            expect(() => loadStartupConfig(path, {})).toThrow('Cannot resolve stateDir; state ownership is unresolved');
+          });
+        });
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('refuses unknown fields', () => {
     expect(() => parseConfig({ ...valid, localListener: { port: 19014, tunnel: true } })).toThrow(ConfigError);
   });
 
   it('keeps clear of the primary\'s ports in shadow', () => {
-    const shadow = { ...valid, role: 'shadow', listen: { port: 8890 }, stateDir: '/var/lib/wayroost-shadow' };
+    const shadow = { ...valid, role: 'shadow', listen: { port: 8890 }, stateDir: hostPaths.shadowState };
     expect(parseConfig({ ...shadow, origins: ['https://127.0.0.1:8891'], localListener: { port: 8891 } }, { env: {} }).localListener?.port).toBe(8891);
     expect(() => parseConfig({ ...shadow, origins: ['https://127.0.0.1:19010'], localListener: { port: 19010 } }, { env: {} })).toThrow(/Shadow/);
+  });
+
+  it('checks shadow startup ownership before accepting a local listener', () => {
+    const shadow = { ...valid, role: 'shadow', listen: { port: 8890 }, stateDir: hostPaths.shadowState,
+      tls: { certFile: '/home/me/cert.pem' } };
+    withHostileStateDirectories(() => {
+      expect(() => startup(shadow)).toThrow('Cannot resolve stateDir; state ownership is unresolved');
+    });
+    expect(startup(shadow).localListener?.port).toBe(19014);
   });
 });
 

@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { wayroostSettingsSchema } from '../../shared/wayroost-settings.js';
 import { NOTIFICATION_EVENTS, settingsApplyResponseSchema } from '../../shared/settings.js';
+import { settingsChecksResponseSchema } from '../../shared/settings-checks.js';
 import type { ScheduleJob } from '../../shared/protocol.js';
 import { settingsTargetsSchema } from '../../shared/settings-targets.js';
 import { executeConfig } from '../../supervisor/src/config-executor.js';
@@ -14,6 +15,7 @@ import { buildApp, type AppDeps } from '../src/app.js';
 import { BackgroundGate } from '../src/background.js';
 import { EventHub } from '../src/hub.js';
 import { EventJournal } from '../src/hub/journal.js';
+import { WayroostSettingsStore } from '../src/settings/store.js';
 import { Feed, BRIEF_JOB, SCOUT_JOB, SCOUT_SCHEDULES, type FeedDeps } from '../src/feed/service.js';
 import { SafetyCommandsSetting } from '../src/hermes/safety.js';
 import { NotificationSettingsStore, WAYROOST_SETTINGS_FILE } from '../src/notifications/settings.js';
@@ -53,7 +55,7 @@ const initial = { version: 1, safetyCommandsEnabled: false, quietHours: null, ru
   feed: { level: 'off', lessLike: [] }, voice: { appReadAloud: { provider: 'local' } } };
 
 async function fixture(document: unknown = initial, pipeline = true, unavailable = false, schedules: FeedDeps['schedules'] | null = pulseSchedules().schedules,
-  extra: Pick<AppDeps, 'speech' | 'cloudSpeech' | 'phone'> = {}) {
+  extra: Pick<AppDeps, 'speech' | 'cloudSpeech' | 'phone' | 'feed' | 'settings'> = {}) {
   const config = makeConfig(undefined, { settings: { legacyRoutesViaPipeline: pipeline },
     localListener: { port: 19014, pcOnlyWrites: true }, origins: ['https://127.0.0.1:19014'] });
   roots.push(config.stateDir);
@@ -836,6 +838,147 @@ it('validates direct voice choices and propagates verified applies and undo to p
   expect(setPhoneVoice).toHaveBeenCalledTimes(3);
 });
 
+it.each(['apply', 'undo'].flatMap(action => ['ordinary', 'startup'].flatMap(resolution =>
+  ['hash', 'read'].map(failure => ({ action, resolution, failure })))))
+('retains committed phone work when $resolution $action verification fails at $failure', async ({ action, resolution, failure }) => {
+  const setPhoneVoice = vi.fn(async () => {});
+  const f = await fixture({ ...initial, voice: { voice: 'af_bella', appReadAloud: { provider: 'local' } } }, true, false, undefined,
+    { phone: { setPhoneVoice } as unknown as NonNullable<AppDeps['phone']> });
+  const save = () => f.request('POST', '/api/settings/apply', { operation: 'wayroost.voice', params: { voice: { voice: 'af_heart' } } });
+  const previous = action === 'undo' ? (await save()).json().change.id : undefined;
+  setPhoneVoice.mockClear();
+  const receipt = async <T extends ConfigApplyRequest | ConfigUndoRequest>(request: T, write: (request: T) => Promise<ConfigWriteResult>) => {
+    const result = await write(request);
+    if (!result.ok || !('undo' in result)) throw new Error('missing receipt');
+    if (failure === 'hash') writeFileSync(f.path, JSON.stringify({ ...JSON.parse(readFileSync(f.path, 'utf8')), timeZone: 'Etc/UTC' }));
+    else f.supervisor.configRead.mockRejectedValue(new Error('invented verification outage'));
+    if (resolution === 'startup') {
+      f.supervisor.configRequestStatus.mockResolvedValue({ ok: true, requestId: request.requestId, state: 'terminal', outcome: 'applied', row: {
+        id: request.requestId, time: '2026-01-01T00:00:00.000Z', caller: 'server', verb: action === 'apply' ? 'config.apply' : 'config.undo',
+        operation: result.operation, target: result.target, keys: result.keys, change: request.origin!.change, result: 'ok',
+        backupId: result.backupId, backupSha256: result.backupSha256, writtenSha256: result.writtenSha256,
+      } });
+      throw new Error('invented lost reply');
+    }
+    return result;
+  };
+  if (action === 'apply') {
+    const write = f.supervisor.configApply.getMockImplementation()!;
+    f.supervisor.configApply.mockImplementationOnce(request => receipt(request, write));
+  } else {
+    const write = f.supervisor.configUndo.getMockImplementation()!;
+    f.supervisor.configUndo.mockImplementationOnce(request => receipt(request, write));
+  }
+  const changed = (await (action === 'apply' ? save() : f.request('POST', '/api/settings/undo', { change: previous }))).json();
+  expect(changed).toMatchObject({ status: 'refused', code: resolution === 'startup' || failure === 'read' ? 'outcome_unknown' : 'verify_mismatch' });
+  if (resolution === 'startup') await f.restart();
+  expect(JSON.parse(readFileSync(f.path, 'utf8')).voice.voice).toBe(action === 'apply' ? 'af_heart' : 'af_bella');
+  expect(setPhoneVoice).not.toHaveBeenCalled();
+  const phoneRow = async () => settingsChecksResponseSchema.parse((await f.request('GET', '/api/settings/checks')).json())
+    .rows.find(row => row.id === 'phone.voice');
+  expect(await phoneRow()).toMatchObject({ state: 'warn', priority: 'high' });
+  await f.restart();
+  expect(await phoneRow()).toMatchObject({ state: 'warn', priority: 'high' });
+  expect(setPhoneVoice).not.toHaveBeenCalled();
+});
+
+it('records each phone transition once and marks an outage high priority', async () => {
+  const setPhoneVoice = vi.fn(async () => {});
+  const f = await fixture(initial, true, false, undefined, { phone: { setPhoneVoice } as unknown as NonNullable<AppDeps['phone']> });
+  const consumerPath = join(f.config.stateDir, 'settings-consumers.jsonl');
+  const events = () => readFileSync(consumerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    .filter(event => event.type === 'settings-phone-voice').map(event => event.data);
+  const save = () => f.request('POST', '/api/settings/apply', { operation: 'wayroost.voice', params: { voice: { voice: 'af_heart' } } });
+  const changed = (await save()).json();
+  expect(changed).toMatchObject({ status: 'applied', calls: 'updated' });
+  expect(events()).toEqual([{ change: changed.change.id, pending: true }, { change: changed.change.id, pending: false }]);
+  setPhoneVoice.mockRejectedValueOnce(new Error('invented phone outage'));
+  const failed = (await save()).json();
+  expect(failed).toMatchObject({ status: 'applied', calls: 'failed' });
+  expect(events().slice(2)).toEqual([{ change: failed.change.id, pending: true }]);
+  const snapshot = settingsChecksResponseSchema.parse((await f.request('GET', '/api/settings/checks')).json());
+  expect(snapshot.rows.find(row => row.id === 'phone.voice')).toMatchObject({ state: 'warn', priority: 'high', details: [failed.change.id] });
+  await f.restart();
+  const restarted = settingsChecksResponseSchema.parse((await f.request('GET', '/api/settings/checks')).json());
+  expect(restarted.rows.find(row => row.id === 'phone.voice')).toMatchObject({ state: 'warn', details: [failed.change.id] });
+});
+
+it.each(['verify_mismatch', 'unavailable', 'outcome_unknown'] as const)('retains phone work when the executor reports a committed %s', async code => {
+  const setPhoneVoice = vi.fn(async () => {});
+  const f = await fixture(initial, true, false, undefined, { phone: { setPhoneVoice } as unknown as NonNullable<AppDeps['phone']> });
+  const write = f.supervisor.configApply.getMockImplementation()!;
+  f.supervisor.configApply.mockImplementationOnce(async request => {
+    const result = await write(request);
+    if (!result.ok || !('undo' in result)) throw new Error('missing receipt');
+    return { ok: false, code, committed: true, undo: result.undo };
+  });
+  expect((await f.request('PUT', '/api/voice', { voice: 'af_heart' })).json()).toMatchObject({ status: 'refused', code });
+  expect(JSON.parse(readFileSync(f.path, 'utf8')).voice.voice).toBe('af_heart');
+  expect(setPhoneVoice).not.toHaveBeenCalled();
+  const phoneRow = async () => settingsChecksResponseSchema.parse((await f.request('GET', '/api/settings/checks')).json())
+    .rows.find(row => row.id === 'phone.voice');
+  expect(await phoneRow()).toMatchObject({ state: 'warn', priority: 'high' });
+  await f.restart();
+  expect(await phoneRow()).toMatchObject({ state: 'warn', priority: 'high' });
+  if (code !== 'outcome_unknown') {
+    expect((await f.request('PUT', '/api/voice', { voice: 'af_heart' })).json()).toMatchObject({ calls: 'updated' });
+    expect(await phoneRow()).toMatchObject({ state: 'ok' });
+  }
+});
+
+it.each(['none', 'phone', 'feed'].flatMap(consumer => ['missing', 'corrupt', 'locked'].map(journal => ({ consumer, journal }))))
+('keeps Checks available with $consumer consumers and a $journal consumer journal', async ({ consumer, journal }) => {
+  const row = { id: 'example.health', state: 'ok' as const, sentence: 'Example check is available.' };
+  const f = await fixture(initial, true, false, undefined, {
+    ...(consumer !== 'feed' ? { feed: undefined } : {}),
+    ...(consumer === 'phone' ? { phone: { setPhoneVoice: vi.fn(async () => {}) } as unknown as NonNullable<AppDeps['phone']> } : {}),
+    settings: { checks: { rows: async () => ({ generatedAt: 0, rows: [row] }) } },
+  });
+  const consumerPath = join(f.config.stateDir, 'settings-consumers.jsonl');
+  if (journal !== 'missing') writeFileSync(consumerPath, journal === 'corrupt' ? '{bad journal}\n' : '');
+  if (journal === 'locked') mkdirSync(consumerPath + '.lock');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await f.request('GET', '/api/settings/checks');
+    expect(response.statusCode).toBe(200);
+    const snapshot = settingsChecksResponseSchema.parse(response.json());
+    expect(snapshot.rows).toContainEqual(row);
+    expect(snapshot.unavailable).toBeUndefined();
+    if (consumer === 'none') expect(snapshot.rows).toEqual([row]);
+    else expect(snapshot.rows.find(entry => entry.id === (consumer === 'phone' ? 'phone.voice' : 'wayroost.pulse-drift')))
+      .toMatchObject({ state: journal === 'missing' ? 'ok' : 'unknown' });
+  }
+});
+
+it.each([false, true])('keeps Checks available when recovery cannot record phone work (restart: %s)', async restart => {
+  const row = { id: 'example.health', state: 'ok' as const, sentence: 'Example check is available.' };
+  const setPhoneVoice = vi.fn(async () => {});
+  const f = await fixture(initial, true, false, undefined, {
+    feed: undefined, phone: { setPhoneVoice } as unknown as NonNullable<AppDeps['phone']>,
+    settings: { checks: { rows: async () => ({ generatedAt: 0, rows: [row] }) } },
+  });
+  const write = f.supervisor.configApply.getMockImplementation()!;
+  f.supervisor.configApply.mockImplementationOnce(async request => {
+    const result = await write(request);
+    if (!result.ok || !('undo' in result)) throw new Error('missing receipt');
+    f.supervisor.configRequestStatus.mockResolvedValue({ ok: true, requestId: request.requestId, state: 'terminal', outcome: 'applied', row: {
+      id: request.requestId, time: '2026-01-01T00:00:00.000Z', caller: 'server', verb: 'config.apply',
+      operation: result.operation, target: result.target, keys: result.keys, change: request.origin!.change, result: 'ok',
+      backupId: result.backupId, backupSha256: result.backupSha256, writtenSha256: result.writtenSha256,
+    } });
+    throw new Error('invented lost reply');
+  });
+  expect((await f.request('PUT', '/api/voice', { voice: 'af_heart' })).json()).toMatchObject({ code: 'outcome_unknown' });
+  writeFileSync(join(f.config.stateDir, 'settings-consumers.jsonl'), '{bad journal}\n');
+  if (restart) await f.restart();
+  const response = await f.request('GET', '/api/settings/checks');
+  expect(response.statusCode).toBe(200);
+  const snapshot = settingsChecksResponseSchema.parse(response.json());
+  expect(snapshot.rows).toContainEqual(row);
+  expect(snapshot.rows.find(entry => entry.id === 'phone.voice')).toMatchObject({ state: 'unknown', sentence: 'Phone voice status is unavailable.' });
+  expect(snapshot.rows.find(entry => entry.id === 'settings.blocked-wayroost-settings')).toMatchObject({ state: 'fail' });
+  expect(setPhoneVoice).not.toHaveBeenCalled();
+});
+
 it.each([false, true])('reports verified voice applies and undo as applied when phone propagation fails (pulse pending: %s)', async pending => {
   const setPhoneVoice = vi.fn(async () => { throw new Error('invented phone outage'); });
   const f = await fixture({ ...initial, voice: { voice: 'af_bella', appReadAloud: { provider: 'local' } } }, true, false, null,
@@ -865,7 +1008,7 @@ it.each([false, true])('reports verified voice applies and undo as applied when 
   for (const spy of f.writes) expect(spy).not.toHaveBeenCalled();
 });
 
-it.each(['automatic', 'manual'].flatMap(resolution => ['apply', 'undo'].flatMap(action => [false, true].map(fail => ({ resolution, action, fail })))))
+it.each(['automatic', 'startup', 'manual'].flatMap(resolution => ['apply', 'undo'].flatMap(action => [false, true].map(fail => ({ resolution, action, fail })))))
 ('propagates $resolution voice $action resolution and reports phone failure: $fail', async ({ resolution, action, fail }) => {
   const setPhoneVoice = vi.fn(async () => {});
   const f = await fixture({ ...initial, voice: { voice: 'af_bella', appReadAloud: { provider: 'local' } } }, true, false, undefined,
@@ -895,8 +1038,9 @@ it.each(['automatic', 'manual'].flatMap(resolution => ['apply', 'undo'].flatMap(
   expect(setPhoneVoice).not.toHaveBeenCalled();
   if (fail) setPhoneVoice.mockRejectedValueOnce(new Error('invented phone outage'));
   let response;
-  if (resolution === 'automatic') {
+  if (resolution !== 'manual') {
     f.supervisor.configRequestStatus.mockResolvedValue(status);
+    if (resolution === 'startup') await f.restart();
     response = await f.request('GET', '/api/settings/notifications');
   } else {
     const accept = (confirm?: string) => f.request('POST', '/api/settings/apply', { operation: 'settings.accept-current',
@@ -913,7 +1057,194 @@ it.each(['automatic', 'manual'].flatMap(resolution => ['apply', 'undo'].flatMap(
     change: { effective: 'verified' }, calls: fail ? 'failed' : 'updated' });
   expect((await f.request('GET', '/api/settings/changes')).json().changes[0]).toMatchObject({ result: resolution === 'manual' ? 'outcome_unknown' : 'ok' });
   expect((await f.request('GET', '/api/voice')).json().defaultVoice).toBe(voice);
+  const phoneRow = async () => settingsChecksResponseSchema.parse((await f.request('GET', '/api/settings/checks')).json())
+    .rows.find(row => row.id === 'phone.voice');
+  expect(await phoneRow()).toMatchObject({ state: fail ? 'warn' : 'ok', ...(fail ? { sentence: 'Phone voice not updated; re-save the voice.' } : {}) });
+  await f.restart();
+  expect(await phoneRow()).toMatchObject({ state: fail ? 'warn' : 'ok' });
+  expect(setPhoneVoice).toHaveBeenCalledTimes(1);
+  expect((await f.request('PUT', '/api/safety-commands', { enabled: true })).json()).toMatchObject({ enabled: true });
+  expect(await phoneRow()).toMatchObject({ state: fail ? 'warn' : 'ok' });
+  setPhoneVoice.mockRejectedValueOnce(new Error('invented phone outage'));
+  expect((await save()).json()).toMatchObject({ status: 'applied', calls: 'failed' });
+  expect(await phoneRow()).toMatchObject({ state: 'warn' });
+  setPhoneVoice.mockResolvedValue(undefined);
+  expect((await f.request('PUT', '/api/voice', { voice })).json()).toMatchObject({ calls: 'updated' });
+  expect(await phoneRow()).toMatchObject({ state: 'ok' });
+  await f.restart();
+  expect(await phoneRow()).toMatchObject({ state: 'ok' });
   for (const spy of f.writes) expect(spy).not.toHaveBeenCalled();
+});
+
+it.each(['creation', 'append', 'completion'].flatMap(failure => ['ordinary', 'automatic', 'manual'].flatMap(resolution =>
+  ['apply', 'undo'].map(action => ({ failure, resolution, action })))))
+('retains phone work after journal $failure failure during $resolution $action', async ({ failure, resolution, action }) => {
+  const setPhoneVoice = vi.fn(async () => {});
+  const f = await fixture({ ...initial, voice: { voice: 'af_bella', appReadAloud: { provider: 'local' } } }, true, false, undefined,
+    { phone: { setPhoneVoice } as unknown as NonNullable<AppDeps['phone']> });
+  const save = () => f.request('POST', '/api/settings/apply', { operation: 'wayroost.voice', params: { voice: { voice: 'af_heart' } } });
+  const previous = action === 'undo' ? (await save()).json().change.id : undefined;
+  const consumerPath = join(f.config.stateDir, 'settings-consumers.jsonl');
+  if (action === 'undo') await f.restart(() => rmSync(consumerPath));
+  setPhoneVoice.mockClear();
+  let status!: Extract<ConfigRequestStatusResult, { state: 'terminal' }>;
+  const receipt = async <T extends ConfigApplyRequest | ConfigUndoRequest>(request: T, write: (request: T) => Promise<ConfigWriteResult>) => {
+    const result = await write(request);
+    if (!result.ok || !('undo' in result)) throw new Error('missing receipt');
+    status = { ok: true, requestId: request.requestId, state: 'terminal', outcome: 'applied', row: {
+      id: request.requestId, time: '2026-01-01T00:00:00.000Z', caller: 'server', verb: action === 'apply' ? 'config.apply' : 'config.undo',
+      operation: result.operation, target: result.target, keys: result.keys, change: request.origin!.change, result: 'ok',
+      backupId: result.backupId, backupSha256: result.backupSha256, writtenSha256: result.writtenSha256,
+    } };
+    if (resolution !== 'ordinary') throw new Error('invented lost reply');
+    return result;
+  };
+  if (action === 'apply') {
+    const write = f.supervisor.configApply.getMockImplementation()!;
+    f.supervisor.configApply.mockImplementationOnce(request => receipt(request, write));
+  } else {
+    const write = f.supervisor.configUndo.getMockImplementation()!;
+    f.supervisor.configUndo.mockImplementationOnce(request => receipt(request, write));
+  }
+  const change = () => action === 'apply' ? save() : f.request('POST', '/api/settings/undo', { change: previous });
+  if (resolution !== 'ordinary') expect((await change()).json()).toMatchObject({ code: 'outcome_unknown' });
+  if (resolution === 'automatic') f.supervisor.configRequestStatus.mockResolvedValue(status);
+  const accept = (confirm?: string) => f.request('POST', '/api/settings/apply', { operation: 'settings.accept-current',
+    params: { target: 'wayroost-settings', change: status.row.change }, ...(confirm ? { confirm } : {}) });
+  const challenge = resolution === 'manual' ? (await accept()).json() : undefined;
+  if (challenge) expect(challenge.status).toBe('confirm');
+  const append = EventJournal.prototype.append;
+  const journal = vi.spyOn(EventJournal.prototype, 'append').mockImplementation(function (this: EventJournal, input) {
+    if (failure === 'append' && input.type === 'settings-phone-voice' && (input.data as { pending: boolean }).pending)
+      throw new Error('invented pending work append failure');
+    const event = append.call(this, input);
+    if (failure === 'completion' && input.type === 'settings-change' && (input.data as { id: string }).id === status.row.change)
+      throw new Error('invented interruption after durable completion');
+    return event;
+  });
+  if (failure === 'creation') mkdirSync(consumerPath + '.lock');
+  const response = await (resolution === 'ordinary' ? change() : resolution === 'automatic'
+    ? f.request('GET', '/api/settings/notifications') : accept(challenge.confirm));
+  expect(response.json()).toMatchObject({ code: 'audit_unavailable' });
+  expect(setPhoneVoice).not.toHaveBeenCalled();
+  expect(JSON.parse(readFileSync(f.path, 'utf8')).voice.voice).toBe(action === 'apply' ? 'af_heart' : 'af_bella');
+  const changes = readFileSync(join(f.config.stateDir, 'settings-audit.jsonl'), 'utf8').trim().split('\n')
+    .map(line => JSON.parse(line)).filter(event => event.type === 'settings-change' && event.data.id === status.row.change);
+  if (failure === 'completion') {
+    expect(changes.at(-1).data).toMatchObject(resolution === 'manual'
+      ? { result: 'outcome_unknown', observed: 'resolved-by-user' } : { result: 'ok' });
+    const pending = readFileSync(consumerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      .filter(event => event.type === 'settings-phone-voice');
+    expect(pending.at(-1).data).toEqual({ change: status.row.change, pending: true });
+  } else if (resolution === 'ordinary') expect(changes).toEqual([]);
+  else expect(changes.at(-1).data).toMatchObject({ result: 'outcome_unknown' });
+  if (failure === 'creation') expect(existsSync(consumerPath)).toBe(false);
+  journal.mockRestore();
+  f.supervisor.configRequestStatus.mockResolvedValue(status);
+  if (failure !== 'completion') setPhoneVoice.mockRejectedValueOnce(new Error('invented phone outage'));
+  await f.restart(() => { if (failure === 'creation') rmSync(consumerPath + '.lock', { recursive: true }); });
+  const phoneRow = async () => settingsChecksResponseSchema.parse((await f.request('GET', '/api/settings/checks')).json())
+    .rows.find(row => row.id === 'phone.voice');
+  expect(await phoneRow()).toMatchObject({ state: 'warn', sentence: 'Phone voice not updated; re-save the voice.' });
+  expect(setPhoneVoice).toHaveBeenCalledTimes(failure !== 'completion' ? 1 : 0);
+  await f.restart();
+  expect(await phoneRow()).toMatchObject({ state: 'warn' });
+  expect(setPhoneVoice).toHaveBeenCalledTimes(failure !== 'completion' ? 1 : 0);
+  setPhoneVoice.mockResolvedValue(undefined);
+  expect((await save()).json()).toMatchObject({ status: 'applied', calls: 'updated' });
+  expect(await phoneRow()).toMatchObject({ state: 'ok' });
+});
+
+it.each(['apply', 'undo'] as const)('releases the pending settings gate after a phone marker append failure during %s', async action => {
+  const setPhoneVoice = vi.fn(async () => {});
+  const f = await fixture({ ...initial, safetyCommandsEnabled: true,
+    voice: { voice: 'af_bella', appReadAloud: { provider: 'local' } } }, true, false, undefined,
+    { phone: { setPhoneVoice } as unknown as NonNullable<AppDeps['phone']> });
+  const save = () => f.request('POST', '/api/settings/apply', { operation: 'wayroost.voice', params: { voice: { voice: 'af_heart' } } });
+  const previous = action === 'undo' ? (await save()).json().change.id : undefined;
+  expect(f.safety.enabled()).toBe(true);
+  setPhoneVoice.mockClear();
+  const append = EventJournal.prototype.append;
+  vi.spyOn(EventJournal.prototype, 'append').mockImplementation(function (this: EventJournal, input) {
+    if (input.type === 'settings-phone-voice' && (input.data as { pending: boolean }).pending)
+      throw new Error('invented pending work append failure');
+    return append.call(this, input);
+  });
+  expect((await (action === 'apply' ? save() : f.request('POST', '/api/settings/undo', { change: previous }))).json())
+    .toMatchObject({ status: 'refused', code: 'audit_unavailable' });
+  expect(JSON.parse(readFileSync(f.path, 'utf8')).voice.voice).toBe(action === 'apply' ? 'af_heart' : 'af_bella');
+  expect(setPhoneVoice).not.toHaveBeenCalled();
+  const safetySnapshot = vi.spyOn(WayroostSettingsStore.prototype, 'safetyCommandsEnabled');
+  expect(f.safety.enabled()).toBe(false);
+  expect(safetySnapshot).toHaveBeenCalledOnce();
+  expect(settingsChecksResponseSchema.parse((await f.request('GET', '/api/settings/checks')).json())
+    .rows.find(row => row.id === 'phone.voice')).toMatchObject({ state: 'unknown' });
+});
+
+it.each(['apply', 'undo'] as const)('clears interrupted phone %s work when the restart retry succeeds', async action => {
+  const setPhoneVoice = vi.fn(async () => {});
+  const f = await fixture({ ...initial, voice: { voice: 'af_bella', appReadAloud: { provider: 'local' } } }, true, false, undefined,
+    { phone: { setPhoneVoice } as unknown as NonNullable<AppDeps['phone']> });
+  const save = () => f.request('POST', '/api/settings/apply', { operation: 'wayroost.voice', params: { voice: { voice: 'af_heart' } } });
+  const previous = action === 'undo' ? (await save()).json().change.id : undefined;
+  setPhoneVoice.mockClear();
+  const receipt = async <T extends ConfigApplyRequest | ConfigUndoRequest>(request: T, write: (request: T) => Promise<ConfigWriteResult>) => {
+    const result = await write(request);
+    if (!result.ok || !('undo' in result)) throw new Error('missing receipt');
+    f.supervisor.configRequestStatus.mockResolvedValue({ ok: true, requestId: request.requestId, state: 'terminal', outcome: 'applied', row: {
+      id: request.requestId, time: '2026-01-01T00:00:00.000Z', caller: 'server', verb: action === 'apply' ? 'config.apply' : 'config.undo',
+      operation: result.operation, target: result.target, keys: result.keys, change: request.origin!.change, result: 'ok',
+      backupId: result.backupId, backupSha256: result.backupSha256, writtenSha256: result.writtenSha256,
+    } });
+    return result;
+  };
+  if (action === 'apply') {
+    const write = f.supervisor.configApply.getMockImplementation()!;
+    f.supervisor.configApply.mockImplementationOnce(request => receipt(request, write));
+  } else {
+    const write = f.supervisor.configUndo.getMockImplementation()!;
+    f.supervisor.configUndo.mockImplementationOnce(request => receipt(request, write));
+  }
+  const append = EventJournal.prototype.append;
+  const journal = vi.spyOn(EventJournal.prototype, 'append').mockImplementation(function (this: EventJournal, input) {
+    if (input.type === 'settings-phone-voice' && (input.data as { pending: boolean }).pending)
+      throw new Error('invented pending work append failure');
+    return append.call(this, input);
+  });
+  expect((await (action === 'apply' ? save() : f.request('POST', '/api/settings/undo', { change: previous }))).json())
+    .toMatchObject({ code: 'audit_unavailable' });
+  expect(setPhoneVoice).not.toHaveBeenCalled();
+  journal.mockRestore();
+  setPhoneVoice.mockResolvedValue(undefined);
+  await f.restart();
+  expect(setPhoneVoice).toHaveBeenCalledExactlyOnceWith(action === 'apply' ? 'af_heart' : 'af_bella');
+  const phoneRow = async () => settingsChecksResponseSchema.parse((await f.request('GET', '/api/settings/checks')).json())
+    .rows.find(row => row.id === 'phone.voice');
+  expect(await phoneRow()).toMatchObject({ state: 'ok' });
+  await f.restart();
+  expect(await phoneRow()).toMatchObject({ state: 'ok' });
+  expect(setPhoneVoice).toHaveBeenCalledTimes(1);
+});
+
+it('retains the phone voice warning when the phone is absent after restart', async () => {
+  const setPhoneVoice = vi.fn(async (): Promise<void> => { throw new Error('invented phone outage'); });
+  const extra: Pick<AppDeps, 'phone'> = { phone: { setPhoneVoice } as unknown as NonNullable<AppDeps['phone']> };
+  const phone = extra.phone;
+  const f = await fixture(initial, true, false, undefined, extra);
+  const phoneRow = async () => settingsChecksResponseSchema.parse((await f.request('GET', '/api/settings/checks')).json())
+    .rows.find(row => row.id === 'phone.voice');
+  expect((await f.request('PUT', '/api/voice', { voice: 'af_heart' })).json()).toMatchObject({ calls: 'failed' });
+  expect(await phoneRow()).toMatchObject({ state: 'warn', sentence: 'Phone voice not updated; re-save the voice.' });
+  delete extra.phone;
+  await f.restart();
+  expect(await phoneRow()).toMatchObject({ state: 'warn', sentence: 'Pair the phone again and re-save the voice.' });
+  expect((await f.request('PUT', '/api/voice', { voice: 'af_heart' })).json()).toMatchObject({ calls: 'off' });
+  expect(await phoneRow()).toMatchObject({ state: 'warn', sentence: 'Pair the phone again and re-save the voice.' });
+  extra.phone = phone;
+  setPhoneVoice.mockImplementation(async () => {});
+  await f.restart();
+  expect((await f.request('PUT', '/api/voice', { voice: 'af_heart' })).json()).toMatchObject({ calls: 'updated' });
+  expect(await phoneRow()).toMatchObject({ state: 'ok' });
 });
 
 it.each(['shadow', 'rollout', 'snapshot', 'hash'] as const)('holds recovered consumer writes when the %s check refuses', async refusal => {

@@ -1,0 +1,45 @@
+[Unit]
+Description=Wayroost owner helper
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@USER@
+Environment=HOME=@HOME@
+Environment=HERMES_HOME=@HERMES_HOME@
+Environment=WAYROOST_HELPER_PORT=@PORT@
+Environment=WAYROOST_HELPER_ROLE_CONFIG=@RUNTIME@/bin/wayroost-role.json
+LoadCredential=token:@TOKEN@
+ExecStart=/usr/bin/python3 @RUNTIME@/bin/signalbox-helper.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@HERMES_HOME@
+ReadWritePaths=-@HOME@/.agents/skills -@HOME@/.claude/skills -@HOME@/.codex/skills -@HOME@/.pi/agent/skills -@HOME@/.config/opencode/skills
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

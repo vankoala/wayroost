@@ -262,6 +262,49 @@ describe('Safety read dependencies', () => {
 });
 
 describe('Checks', () => {
+  it('shows the phone voice warning with a way to re-save, until checks report success', async () => {
+    const pulse = { id: 'wayroost.pulse-drift', state: 'warn' as const, priority: 'high' as const, sentence: 'Pulse work is pending.' };
+    const engine = { id: 'example.engine', state: 'fail' as const, sentence: 'Example engine is unavailable.' };
+    checks.rows = [engine, { id: 'phone.voice', state: 'warn', priority: 'high', sentence: 'Phone voice not updated; re-save the voice.' }, pulse];
+    await render(createElement(ChecksSettingsPage));
+    expect(container.textContent).toContain('Phone voice not updated; re-save the voice');
+    expect(Array.from(container.querySelectorAll('[data-check-id]')).map(row => row.getAttribute('data-check-id')))
+      .toEqual(['phone.voice', 'wayroost.pulse-drift', 'example.engine']);
+    expect(container.querySelector('[data-check-id="phone.voice"] a[href="/settings/voice"]')?.textContent).toBe('Open voice settings');
+    expect(container.querySelector('[data-check-id="wayroost.pulse-drift"] a')).toBeNull();
+    checks.rows = [engine, { id: 'phone.voice', state: 'ok', sentence: 'No saved voice change is waiting for the phone.' }, pulse];
+    await click('Refresh checks');
+    expect(container.textContent).not.toContain('Phone voice not updated');
+    expect(container.querySelector('a[href="/settings/voice"]')).toBeNull();
+    expect(Array.from(container.querySelectorAll('[data-check-id]')).map(row => row.getAttribute('data-check-id')))
+      .toEqual(['wayroost.pulse-drift', 'example.engine', 'phone.voice']);
+  });
+
+  it('directs phone users to a paired desktop to re-save the voice', async () => {
+    setState(state => ({ ...state, device: phone }));
+    checks.rows = [{ id: 'phone.voice', state: 'warn', priority: 'high', sentence: 'Phone voice not updated; re-save the voice.' }];
+    await render(createElement(ChecksSettingsPage));
+    expect(container.querySelector('a[href="/settings/voice"]')).toBeNull();
+    expect(container.textContent).toContain('Re-save the voice from a paired desktop.');
+    await act(async () => setState(state => ({ ...state, device: desktop })));
+    expect(container.querySelector('a[href="/settings/voice"]')?.textContent).toBe('Open voice settings');
+    expect(container.textContent).not.toContain('Re-save the voice from a paired desktop.');
+  });
+
+  it.each([desktop, phone])('asks $kind users to pair the phone again without offering a voice settings link', async device => {
+    setState(state => ({ ...state, device }));
+    checks.rows = [{ id: 'phone.voice', state: 'warn', priority: 'high', sentence: 'Pair the phone again and re-save the voice.' }];
+    await render(createElement(ChecksSettingsPage));
+    expect(container.textContent).toContain('Pair the phone again and re-save the voice.');
+    expect(container.querySelector('[data-check-id="phone.voice"] a')).toBeNull();
+    expect(container.textContent).not.toContain('Re-save the voice from a paired desktop.');
+    checks.rows = [{ id: 'phone.voice', state: 'warn', priority: 'high', sentence: 'Phone voice not updated; re-save the voice.' }];
+    await click('Refresh checks');
+    if (device.kind === 'desktop')
+      expect(container.querySelector('[data-check-id="phone.voice"] a[href="/settings/voice"]')?.textContent).toBe('Open voice settings');
+    else expect(container.textContent).toContain('Re-save the voice from a paired desktop.');
+  });
+
   it('has a route and shows every server row, with high priority and failures first', async () => {
     expect(parseRoute('/settings/checks')).toEqual({ name: 'settings', page: 'checks' });
     expect(settingsPath('checks')).toBe('/settings/checks');

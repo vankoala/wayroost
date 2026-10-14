@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 from wayroost_runtime import BackgroundGate, env
 import time
@@ -271,9 +272,15 @@ class SkillsService:
 
     def _save_state(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=1))
-        os.replace(tmp, self.state_path)
+        fd, name = tempfile.mkstemp(dir=self.state_dir, prefix=f".{self.state_path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as stream:
+                stream.write(json.dumps(self.state, indent=1))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, self.state_path)
+        finally:
+            Path(name).unlink(missing_ok=True)
 
     def _require_primary(self) -> None:
         if self.background.role != "primary":
@@ -381,22 +388,27 @@ class SkillsService:
         if target.is_symlink():
             raise SkillsError(409, f"{place.label} links {name} somewhere else, so it is left alone.")
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.parent / f".{name}{TMP_MARK}{os.getpid()}"
-        old = target.parent / f".{name}{TMP_MARK}old-{os.getpid()}"
-        for leftover in (tmp, old):
-            if leftover.exists():
-                shutil.rmtree(leftover, ignore_errors=True)
+        staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=f".{name}{TMP_MARK}"))
+        tmp, old = staging / "new", staging / "old"
         try:
             self._copy_tree(src, tmp)
             if target.exists():
                 os.rename(target, old)
             os.rename(tmp, target)
         except OSError as err:
-            shutil.rmtree(tmp, ignore_errors=True)
-            if old.exists() and not target.exists():
-                os.rename(old, target)
-            raise SkillsError(500, f"Couldn't write to {place.label}: {err.strerror or type(err).__name__}.")
-        shutil.rmtree(old, ignore_errors=True)
+            if old.exists() and not target.exists() and not target.is_symlink():
+                try:
+                    os.rename(old, target)
+                except OSError:
+                    pass
+            if old.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
+                recovery = f" The original folder is preserved at {old}."
+            else:
+                shutil.rmtree(staging, ignore_errors=True)
+                recovery = ""
+            raise SkillsError(500, f"Couldn't write to {place.label}: {err.strerror or type(err).__name__}.{recovery}")
+        shutil.rmtree(staging, ignore_errors=True)
 
     def _remove(self, place: Place, path: Path) -> None:
         if path.is_symlink():

@@ -28,7 +28,8 @@ back into the existing stores so the deliberate restart retains those choices.
    delete their helper folders. Recreate wanted triggers after cutover from
    primary. Do not rely on the old shared `signalbox_mail_trigger.py` gate to honour spec roles.
 2. Stop Wayroost before changing its config or unit. Save the shadow config
-   and the server unit overrides for rollback. Set the Wayroost config
+   and the server unit overrides for rollback. Save the tunnel's ingress and
+   origin CA settings as well. Set the Wayroost config
    role to `primary` **and clear the unit's
    `WAYROOST_ROLE=shadow` (or legacy `SIGNALBOX_ROLE=shadow`) override**. Both
    sources must allow primary; an environment value of primary cannot widen
@@ -73,16 +74,47 @@ back into the existing stores so the deliberate restart retains those choices.
    startup role and role source. Check trigger helper health acknowledges the role.
    Verify the Safety settings through the supervisor's catalogue operations.
    New primary mail triggers use `wayroost_mail_trigger.py`.
-5. Move the tunnel to Wayroost, stop the legacy app (`signalbox`) while
-   keeping it installed, and pair the phone.
+5. Move the tunnel and verify access:
+   - Set `publicOrigin` to the protected public hostname and list any other
+     addresses in `origins`, including the desktop's matching local origin.
+     Keep `tls` configured and retain the dedicated `listen.port` (normally
+     8881). Restart Wayroost if its config changed.
+   - Change the tunnel's ingress backend to
+     `service: https://127.0.0.1:<listen.port>` and set `originRequest.caPool`
+     to a readable copy of the server's public certificate, for example
+     `/etc/cloudflared/wayroost-origin-ca.pem`, as described in
+     [Loopback TLS](configuration.md#loopback-tls). Preserve the ingress
+     Access checks and certificate verification. If the hostname changes,
+     protect it with Access before creating its DNS route. Use the tunnel
+     config you just updated (`/etc/signalbox/cloudflared.yml` on the legacy
+     layout) and the UUID in its `tunnel` entry:
+
+     ```bash
+     sudo -H cloudflared tunnel --config <tunnel-config.yml> route dns <tunnel-uuid> <hostname>
+     ```
+
+     Replace the placeholders with that config's path, its tunnel UUID and
+     the protected hostname. This avoids selecting a tunnel from root's
+     default cloudflared config.
+     Restart the tunnel's service (`signalbox-tunnel` on the legacy layout).
+   - Stop the legacy app with `sudo systemctl stop signalbox`, keeping it
+     installed. Verify the public origin reaches Wayroost and enforces sign-in,
+     then use `sudo wayroost pair` to pair the phone.
 
 For rollback, set the config and unit environment back to shadow, restore the
 dedicated shadow state directory (`/var/lib/wayroost-shadow` by default).
 Restore the server unit's `StateDirectory=wayroost-shadow` (reset the directive
 first in a drop-in). Disable the supervisor's `configWrites` switch before
 rolling back to a supervisor without config verbs. With Wayroost stopped,
-reload the units and restart Wayroost, then restore the legacy app (`signalbox`) and its tunnel.
+reload the units and restart Wayroost. Restore the legacy app (`signalbox`) and
+the saved tunnel ingress, including its original backend scheme, port and
+`originRequest` settings. The legacy primary backend may use HTTP; an installed
+Wayroost backend requires HTTPS and its matching origin CA. Restart the tunnel's
+service and verify the restored public origin and sign-in path. Never bypass
+certificate verification to make rollback work.
 If rolling back the supervisor's config verbs as well, undo settings changes
 and turn `configWrites` off before restoring the previous supervisor. Leave
 `SAFETY_OWNER` unset; rollback never installs the Safety helper.
 Do not activate shadow-tagged trigger specs by bulk editing their role.
+
+For the explicit forward, verification and reverse tools, see [migration](migration.md).

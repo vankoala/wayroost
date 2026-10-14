@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 # The tunnel credential is handed over by systemd; the process itself can't read /root.
 LoadCredential=tunnel.json:/etc/signalbox/tunnel-credentials.json
-# systemd 249 has no %d specifier; the shell expands $CREDENTIALS_DIRECTORY at start.
+# For systemd 249, the shell expands $CREDENTIALS_DIRECTORY at start.
 ExecStart=/bin/sh -c 'exec /usr/local/bin/cloudflared tunnel --no-autoupdate --config /etc/signalbox/cloudflared.yml --credentials-file "$CREDENTIALS_DIRECTORY/tunnel.json" run'
 Restart=on-failure
 RestartSec=5

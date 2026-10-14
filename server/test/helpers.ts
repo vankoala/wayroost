@@ -1,8 +1,9 @@
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair, type CryptoKey, type JWTPayload } from 'jose';
+import { afterAll } from 'vitest';
 import type {
   Approval,
   ApprovalAnswer,
@@ -36,6 +37,11 @@ import type { PowerOptions } from '../src/power.js';
 import type { SupervisorApi } from '../src/supervisor-client.js';
 import { createAccessVerifier } from '../src/security/access.js';
 import type { CreatePaseoAgentInput, HermesSource, PaseoSource } from '../src/sources.js';
+
+const stateDirectories: string[] = [];
+afterAll(() => {
+  for (const directory of stateDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
 
 export const ISSUER = 'https://testteam.cloudflareaccess.com';
 export const AUD = 'test-aud-0123456789abcdef';
@@ -97,7 +103,8 @@ export async function makeToken(
 
 /** A config with Access and device sign-in, its state directory seeded with the test devices. */
 export function makeConfig(staticDir?: string, extra: Record<string, unknown> = {}): AppConfig {
-  const stateDir = mkdtempSync(join(tmpdir(), 'sb-state-'));
+  const stateDir = temporaryDirectory('sb-state-');
+  stateDirectories.push(stateDir);
   seedDevices(stateDir);
   return parseConfig({
     rollout: { settingsPages: true, revokes: true, chatFirst: true },
@@ -110,7 +117,7 @@ export function makeConfig(staticDir?: string, extra: Record<string, unknown> = 
 }
 
 export function makeStaticDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'sb-static-'));
+  const dir = temporaryDirectory('sb-static-');
   mkdirSync(join(dir, 'assets'));
   writeFileSync(join(dir, 'index.html'), '<!doctype html><title>Wayroost</title><div id="root"></div>');
   writeFileSync(join(dir, 'assets', 'app.js'), 'console.log(1)');

@@ -3,23 +3,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { ProviderOverridesSchema } from '@getpaseo/protocol/provider-config';
+import { legacyApprovalBackupSchema as Backup, legacyApprovalStateSchema as State, LEGACY_PASEO_MAX_BYTES as CONFIG_MAX_BYTES,
+  LEGACY_APPROVAL_MAX_BYTES as STATE_MAX_BYTES, readLegacyApprovalState, readLegacyPaseo, editableLegacyProviders } from '../../../shared/legacy-settings.js';
 import { pendingWorkerApprovals, type PaseoConfigWriter, type WorkerApprovalsApi, type WorkerApprovalsStatus } from '../../../shared/safety.js';
 import { CLOUD_AGENT_IDS, type CloudAgentId } from '../../../shared/protocol.js';
 import { withPaseoConfigLock } from './config-lock.js';
 import { waitWithAbort } from './abort.js';
 import { applyApprovalsToMe, BUILTIN_PROVIDER_IDS, undoApprovalsToMe, withRoleProviders, type Providers } from './safety-config.js';
 
-const Tools = z.object({ enabled: z.boolean().optional(), disabledTools: z.array(z.string()).optional() }).passthrough();
-const Entry = z.object({ paseoTools: Tools.optional() }).passthrough();
-const ProviderId = z.string().regex(/^[a-z][a-z0-9-]*$/);
-const Backup = z.record(ProviderId, z.object({ entry: z.enum(['existing', 'added']), before: Tools.optional(), applied: Tools }).strict());
-const Prepared = z.object({ beforeRevision: z.string(), afterRevision: z.string(), previousBackup: Backup, committedBackup: Backup }).strict();
-const State = z.object({ version: z.literal(1), enabled: z.boolean(), backup: Backup, reloadPending: z.boolean(), prepared: Prepared.optional() }).strict();
-const Config = z.object({ agents: z.object({ providers: z.record(ProviderId, Entry).optional() }).passthrough().optional() }).passthrough();
-const CONFIG_MAX_BYTES = 2 * 1024 * 1024;
-// Undo records duplicate policies; a recovery journal holds three backups.
-const STATE_MAX_BYTES = 16 * 1024 * 1024;
 
 export interface SafetyDaemon {
   providers(signal?: AbortSignal): Promise<string[]>;
@@ -102,7 +93,6 @@ function privateSnapshot(path: string, maxBytes = CONFIG_MAX_BYTES): { contents:
 const privateContents = (path: string): string => privateSnapshot(path).contents;
 
 const revision = (contents: string): string => createHash('sha256').update(contents).digest('hex');
-const privateJson = (path: string, maxBytes: number): unknown => JSON.parse(privateSnapshot(path, maxBytes).contents);
 
 /** Runs as the Paseo owner, with a fixed config and a separate Wayroost state directory. */
 export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWriter {
@@ -115,7 +105,7 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
   constructor(private readonly configPath: string, private readonly stateDir: string, private readonly daemon: SafetyDaemon) {
     this.statePath = join(stateDir, 'worker-approvals.json');
     try {
-      this.state = State.parse(privateJson(this.statePath, STATE_MAX_BYTES));
+      this.state = readLegacyApprovalState(privateSnapshot(this.statePath, STATE_MAX_BYTES).contents);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('Safety state is invalid; restore its backup before changing the policy.');
       this.state = { version: 1, enabled: true, backup: {}, reloadPending: true };
@@ -143,7 +133,7 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
       this.result = { ...pendingWorkerApprovals(), enabled: this.state.enabled };
       return withPaseoConfigLock(this.configPath, this.stateDir, async () => {
         // Another helper instance may have saved a choice or backup since construction.
-        try { this.state = State.parse(privateJson(this.statePath, STATE_MAX_BYTES)); }
+        try { this.state = readLegacyApprovalState(privateSnapshot(this.statePath, STATE_MAX_BYTES).contents); }
         catch (err) {
           if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('Safety state is invalid; restore its backup before changing the policy.');
         }
@@ -166,7 +156,7 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
       this.state = pending;
       for (let attempt = 0; attempt < 3; attempt++) {
         const snapshot = privateSnapshot(this.configPath);
-        const config = Config.parse(JSON.parse(snapshot.contents));
+        const config = readLegacyPaseo(snapshot.contents);
         const providers = config.agents?.providers ?? {};
         const candidate = { ...config, agents: { ...config.agents, providers: {
           ...providers, [id]: { ...providers[id], enabled },
@@ -266,7 +256,7 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
     try {
       const snapshot = stateSnapshot();
       stateRevision = snapshot?.revision;
-      state = snapshot ? State.parse(JSON.parse(snapshot.contents)) : { version: 1, enabled: true, backup: {}, reloadPending: true };
+      state = snapshot ? readLegacyApprovalState(snapshot.contents) : { version: 1, enabled: true, backup: {}, reloadPending: true };
     }
     catch (err) {
       if (err instanceof SafetyConflictError) return { ...pendingWorkerApprovals(), enabled: state.enabled, message: err.message };
@@ -309,13 +299,13 @@ export class WorkerApprovalsSetting implements WorkerApprovalsApi, PaseoConfigWr
 
   /** Plans the provider policy for one config snapshot without writing anything. */
   private plan(contents: string, offered: string[], chosen: boolean, previous: z.infer<typeof Backup>) {
-    const config = Config.parse(JSON.parse(contents));
+    const config = readLegacyPaseo(contents);
     const current = config.agents?.providers ?? {};
     const builtins = new Set<string>(BUILTIN_PROVIDER_IDS);
-    const valid = (id: string) => Object.hasOwn(current, id) && ProviderOverridesSchema.safeParse({ [id]: current[id] }).success;
+    const editable = editableLegacyProviders(current);
+    const valid = (id: string) => Object.hasOwn(editable, id);
     const uncovered = [...new Set([...offered, ...Object.keys(current)])].filter(id =>
       Object.hasOwn(current, id) ? !valid(id) : !builtins.has(id));
-    const editable: Providers = Object.fromEntries(Object.entries(current).filter(([id]) => valid(id)));
     // A plugin with a reserved role id must stay uncovered, rather than be shadowed.
     const roles = withRoleProviders(editable);
     for (const id of uncovered) delete roles[id];

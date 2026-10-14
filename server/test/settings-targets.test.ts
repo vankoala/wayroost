@@ -1,5 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
+import { hostPaths } from './host-path-fixture.js';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SETTINGS_OPERATIONS, operationTarget, type OperationSpec } from '../../shared/settings-ops.js';
@@ -28,9 +29,9 @@ function siteFile(): Record<string, any> {
         loader: '/usr/lib/node_modules/demo-paseo/dist/exports.js' },
       'wayroost-settings': { path: `${home}/.demo-wayroost/settings.json`, format: 'json', runAs: me, ...store('wayroost-settings'),
         lock: { kind: 'file', path: `${home}/.wayroost-config/locks/wayroost-settings.lock` } },
-      'gateway-role-map': { path: '/var/lib/private/wayroost-gateway/role-map.json', defaultMap: '/usr/lib/wayroost-gateway/role-map.default.json',
+      'gateway-role-map': { path: `${hostPaths.privateState}/wayroost-gateway/role-map.json`, defaultMap: '/usr/lib/wayroost-gateway/role-map.default.json',
         adminSocket: '/run/wayroost-gateway/admin.sock', service: 'wayroost-gateway.service', socket: 'wayroost-gateway.socket' },
-      'gateway-credentials': { directory: '/etc/wayroost/gateway-credentials', dropIn: '/etc/systemd/system/wayroost-gateway.service.d/credentials.conf',
+      'gateway-credentials': { directory: `${hostPaths.config}/gateway-credentials`, dropIn: '/etc/systemd/system/wayroost-gateway.service.d/credentials.conf',
         service: 'wayroost-gateway.service', lockFile: '/var/lib/wayroost-supervisor/gateway-credentials.lock',
         backupDir: '/var/lib/wayroost-supervisor/config-backups/gateway-credentials' },
       'gateway-state': { directory: '/var/lib/wayroost-supervisor/gateway', backupDir: '/var/lib/wayroost-supervisor/config-backups/gateway-state' },
@@ -75,7 +76,7 @@ describe('settings-targets.json', () => {
   });
 
   it('parses a complete site file written as JSON', () => {
-    folder = mkdtempSync(join(tmpdir(), 'wayroost-targets-'));
+    folder = temporaryDirectory('wayroost-targets-');
     const path = join(folder, 'settings-targets.json');
     writeFileSync(path, JSON.stringify(siteFile(), null, 2) + '\n', { mode: 0o600 });
     const parsed = settingsTargetsSchema.parse(JSON.parse(readFileSync(path, 'utf8')));
@@ -274,7 +275,7 @@ describe('settings-targets.json', () => {
     elsewhere.targets['gateway-credentials'].dropIn = '/etc/systemd/system/other.service.d/credentials.conf';
     expect(parses(elsewhere)).toBe(false);
     const inside = siteFile();
-    inside.targets['gateway-credentials'].backupDir = '/etc/wayroost/gateway-credentials/backups';
+    inside.targets['gateway-credentials'].backupDir = `${hostPaths.config}/gateway-credentials/backups`;
     expect(parses(inside)).toBe(false);
   });
 

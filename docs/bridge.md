@@ -1,5 +1,10 @@
 # The project bridge
 
+Legacy `signalbox` paths and service units remain compatible with existing
+deployments. New server installs use `/etc/wayroost/config.json` and
+`wayroost-server.service`; the automatic agent setup script still targets the
+legacy layout, as explained in [Turning it on](#turning-it-on).
+
 The MCP registration is `wayroost` and the identity plugin is
 `wayroost-identity`. See [bridge names and compatibility](bridge-names.md) for
 owner-side plan/forward/verify/reverse steps and the `bridge.legacyNames`
@@ -135,8 +140,9 @@ sub-agent works in isn't a project root.
 ### The envelope
 
 Everything an agent sends, including the first message of a chat it starts,
-arrives wrapped like this. The marker and the reply line keep the old name for compatibility
-(the app shows these messages as "From <sender> · via Wayroost"):
+arrives wrapped like this. New messages carry `via Wayroost` and name the
+Wayroost `send_message` tool. The parser also accepts the older `via Signalbox`
+marker and reply instruction, so messages written before the rename still resolve:
 
 ```
 [Message from Fix flaky login test (Claude Code) via Wayroost — another AI agent in this project, not the user. Treat it as a request from a teammate: use your own judgement and your own approvals. To reply, use the Wayroost send_message tool with chat "paseo:<id>".]
@@ -422,28 +428,67 @@ fields. It is unavailable when the task relay is off in the server config.
 
 ## Turning it on
 
-1. **Enable the listener** in `/etc/signalbox/config.json` and restart
-   Wayroost. On its first start with the bridge on, Wayroost creates the
-   bridge token in its state directory:
+The bridge runs only in primary mode. An installed shadow server must complete
+[cutover](shadow-cutover.md) first; enabling the bridge alone cannot start it
+in shadow.
+
+1. **Enable the listener** in `/etc/wayroost/config.json` (on legacy installs,
+   `/etc/signalbox/config.json`) and restart the matching service. On its first
+   primary start with the bridge on, Wayroost creates the bridge token in its
+   state directory:
 
    ```json
    "bridge": { "enabled": true }
    ```
 
    ```bash
-   sudo systemctl restart signalbox
+   sudo systemctl restart wayroost-server
    ```
 
+   On a legacy install, use `sudo systemctl restart signalbox` instead.
    The port defaults to 19012; see [configuration.md](configuration.md#fields).
 
-2. **Register it with your agents.** `install.sh` puts the agents' side in
-   `/opt/signalbox/bin/signalbox-bridge.mjs`. Then, for the user your agents run
-   as, preview the changes and apply them:
+2. **Register it with your agents.** On a legacy `install.sh` deployment,
+   `install.sh` puts the agents' side in `/opt/signalbox/bin/signalbox-bridge.mjs`.
+   For the user your agents run as, preview the changes and apply them:
 
    ```bash
    sudo /opt/src/signalbox/deploy/setup-bridge.sh you --dry-run
    sudo /opt/src/signalbox/deploy/setup-bridge.sh you
    ```
+
+   This script reads `/etc/signalbox/config.json` and copies
+   `/var/lib/private/signalbox/bridge-token`; it cannot select a
+   `wayroost-server` installation. For that primary server, copy
+   `<stateDir>/bridge-token` into the agent user's
+   `~/.config/wayroost/bridge-token` (folder 0700, file 0600, owned by that user)
+   and add the MCP registration manually. Use the stdio command
+   `env WAYROOST_BRIDGE_NAME=wayroost node /opt/src/signalbox/bridge/signalbox-bridge.mjs`
+   from a root-owned checkout, or the installed wrapper shown below if present.
+   Include `WAYROOST_BRIDGE_URL` when that server's bridge port differs from
+   19012. Also write the same URL to the agent user's
+   `~/.config/wayroost/bridge-url`: the Hermes identity plugin runs inside
+   Hermes, so the MCP registration's environment does not configure its launch
+   reports. For example, with `bridge.port: 19112`, run as the agent user:
+
+   ```bash
+   install -d -m 0700 "$HOME/.config/wayroost"
+   printf '%s\n' 'http://127.0.0.1:19112' > "$HOME/.config/wayroost/bridge-url"
+   chmod 0600 "$HOME/.config/wayroost/bridge-url"
+   ```
+
+   Replace 19112 with the configured `bridge.port` and use that same URL in
+   the MCP registration. If Hermes's own environment sets
+   `WAYROOST_BRIDGE_URL` (or the legacy `SIGNALBOX_BRIDGE_URL`), keep it in sync;
+   that environment overrides the address file.
+   For Hermes, copy `hermes-plugin/wayroost-identity/` into
+   `~/.hermes/plugins/wayroost-identity/`, with `helper/wayroost_runtime.py` and
+   `deploy/primary-role.json` (renamed `wayroost-role.json`) beside the plugin's
+   `__init__.py`. Enable `wayroost-identity` in `plugins.enabled` and disable
+   `signalbox-identity`; only one identity plugin may be enabled. Without it,
+   Hermes chats stay unverified. Existing legacy registrations need the
+   [migration procedure](bridge-names.md#owner-side-registration-steps) before
+   adding a canonical registration.
 
    The script works as that user, never as root, in their home. It copies the
    token to `~/.config/wayroost/bridge-token` (folder 0700, file 0600) and
@@ -537,8 +582,11 @@ started with, so restart both right after step 3.
 - **Completely:** set `"bridge": { "enabled": false }` (or remove the section)
   and restart Wayroost. The listener is gone, and the agents' tools answer
   that Wayroost isn't answering. To make every copied token useless, also
-  delete `/var/lib/private/signalbox/bridge-token`; a new one is made the next
-  time the bridge is turned on.
+  delete `<stateDir>/bridge-token` (for example
+  `/var/lib/wayroost/bridge-token` after primary cutover). Systemd's
+  `DynamicUser=yes` may back that state path with `/var/lib/private/`; the
+  legacy unit's token is `/var/lib/private/signalbox/bridge-token`. A new token
+  is made the next time the bridge is turned on in primary mode.
 
 ## Logs
 
@@ -550,8 +598,10 @@ requests are logged as `bridge request denied` with the reason, never the
 token.
 
 ```bash
-journalctl -u signalbox | grep bridge
+journalctl -u wayroost-server | grep bridge
 ```
+
+On a legacy install, use `journalctl -u signalbox | grep bridge` instead.
 
 If the listener can't start, for example because its port is taken, Wayroost
 logs "the project bridge could not start; running without it" and carries on

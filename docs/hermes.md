@@ -621,7 +621,9 @@ Output:
 
 ### Blocked commands
 
-These never run from Wayroost:
+These forms are refused while **Settings → Safety → Hermes safety commands**
+is off (the default). Turning it on allows every form below and restores these
+commands to the "/" menu.
 
 | Command | Why |
 | --- | --- |
@@ -632,11 +634,12 @@ These never run from Wayroost:
 | `/skills approval`, `/skills approve` | it changes the skill approval gate |
 | `/debug` | it uploads your logs to a shareable link |
 
-You get an error line instead, such as "For safety, /yolo can't be run from
-Wayroost: it turns off approval prompts. Use the Hermes desktop app or
-terminal." `/yolo`, `/approve`, `/debug`, `/approvals`, `/memory` and `/skills`
-are also left out of the menu; typed by hand, only the forms above are
-refused. The same rule is behind Paseo's blocked modes; see
+With the setting off, you get an error line instead, such as "For safety, /yolo
+can't be run from Wayroost: it turns off approval prompts. Turn on Settings →
+Safety → Hermes safety commands, or use the Hermes desktop app or terminal."
+`/yolo`, `/approve`, `/debug`, `/approvals`, `/memory` and `/skills` are also
+left out of the menu while the setting is off; typed by hand, only the forms
+above are refused. For details about safeguards, see
 [SECURITY.md](../SECURITY.md).
 
 ## Connectors

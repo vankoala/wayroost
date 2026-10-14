@@ -1,5 +1,9 @@
 # For you
 
+Legacy `signalbox` paths and service units remain compatible with existing
+deployments; new server installs use the Wayroost paths and unit below.
+Bridge registrations use `wayroost`; see [bridge names](bridge-names.md).
+
 For you is where Hermes brings you things on its own, instead of waiting to be
 asked. A morning brief and short checks during the day look at your calendar,
 mail and the things you said you'd do. They message you on WhatsApp when
@@ -137,7 +141,7 @@ so it never caches pages or sees requests.
 
 | File | In | Contents |
 | --- | --- | --- |
-| `feed.json` | the state folder (`/var/lib/signalbox`), mode 600 | Cards and approval notification bookkeeping. Legacy mode also stores preferences and turned-down topics; pipeline mode preserves those opaque legacy fields without reading them. |
+| `feed.json` | the state folder (default `/var/lib/wayroost`; `/var/lib/wayroost-shadow` in shadow; `/var/lib/signalbox` on legacy installs), mode 600 | Cards and approval notification bookkeeping. Legacy mode also stores preferences and turned-down topics; pipeline mode preserves those opaque legacy fields without reading them. |
 | `wayroost-settings.json` | the state folder, mode 600 | Legacy notification preferences, with `settings-backups/` and `settings-audit/settings.jsonl`. Pipeline mode uses the [owner-held settings target](wayroost-settings.md) for all Wayroost preferences instead. |
 | `push.json` | the state folder, mode 600 | The VAPID key pair and each device's push subscription. An unusable one is set aside as `push.json.bad` and a new key made (phones then turn notifications on again). |
 | `pulse-relay-state.json` | `~/.hermes`, mode 600 | The relay's side: which runs it has handled, and cards Wayroost couldn't take yet (for up to 12 hours). |
@@ -146,8 +150,11 @@ so it never caches pages or sees requests.
 
 1. Turn on the [project bridge](bridge.md) if it isn't already: the pulse posts
    cards through it.
-2. Add `"feed": { "enabled": true }` to `/etc/signalbox/config.json` and restart
-   Wayroost (`sudo systemctl restart signalbox`).
+2. Add `"feed": { "enabled": true }` to `/etc/wayroost/config.json` and restart
+   with `sudo systemctl restart wayroost-server`. On a legacy install, edit
+   `/etc/signalbox/config.json` and use `sudo systemctl restart signalbox` instead.
+   A shadow server never ingests cards or sends unattended notifications;
+   complete [primary cutover](shadow-cutover.md) first.
 3. Phone notifications need `publicOrigin` to be `https://`, as it is behind
    Cloudflare.
 

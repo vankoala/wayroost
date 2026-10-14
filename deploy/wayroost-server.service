@@ -11,9 +11,9 @@ ExecStart=/usr/bin/node /opt/wayroost/server/dist/server/index.js
 WorkingDirectory=/opt/wayroost/server
 Environment=NODE_ENV=production
 Environment=WAYROOST_ROLE=shadow
-Environment=WAYROOST_CONFIG=%d/config.json
+Environment=WAYROOST_CONFIG=/run/credentials/%n/config.json
 # M1 fallback uses the same Wayroost config, never Signalbox's config.
-Environment=SIGNALBOX_CONFIG=%d/config.json
+Environment=SIGNALBOX_CONFIG=/run/credentials/%n/config.json
 LoadCredential=config.json:/etc/wayroost/config.json
 # The server reads it as $CREDENTIALS_DIRECTORY/supervisor-server-key, in
 # preference to a supervisor.keyFile in its config (that is for development).

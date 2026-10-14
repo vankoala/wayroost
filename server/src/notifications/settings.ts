@@ -1,8 +1,8 @@
 import { constants, closeSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readSync, unlinkSync, writeFileSync, type BigIntStats } from 'node:fs';
-import { isUtf8 } from 'node:buffer';
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
+import { readLegacyNotifications, decodeLegacyNotifications, LEGACY_NOTIFICATION_MAX_BYTES as MAX_SETTINGS_BYTES, LEGACY_NOTIFICATION_FORBIDDEN_MODE } from '../../../shared/legacy-settings.js';
 import {
   DEFAULT_NOTIFICATION_RULES,
   DEFAULT_QUIET_HOURS,
@@ -41,7 +41,6 @@ export const WAYROOST_SETTINGS_BACKUPS = 'settings-backups';
 export const WAYROOST_SETTINGS_AUDIT_DIR = 'settings-audit';
 
 const FILE_MODE = 0o600;
-const MAX_SETTINGS_BYTES = 128 * 1024;
 
 export interface NotificationSettings {
   rules: NotificationRule[];
@@ -90,12 +89,7 @@ const render = (settings: NotificationSettings): string =>
 
 /** Defaults fill in what an older or partial file doesn't say; anything malformed is refused. */
 function readSettings(text: string): NotificationSettings {
-  const parsed: unknown = JSON.parse(text);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid settings document.');
-  const { safetyCommandsEnabled, ...notifications } = parsed as Record<string, unknown>;
-  if (safetyCommandsEnabled !== undefined) z.boolean().parse(safetyCommandsEnabled);
-  const body = settingsNotificationsBodySchema.parse({ ...clone(DEFAULT_SETTINGS), ...notifications });
-  return { rules: body.rules, quietHours: body.quietHours, push: body.push };
+  return readLegacyNotifications(text).value;
 }
 
 function parsedInput(input: NotificationSettingsInput): NotificationSettingsInput {
@@ -359,7 +353,7 @@ export class NotificationSettingsStore {
       file = openSync(this.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       const before = fstatSync(file, { bigint: true });
       const mode = Number(before.mode & 0o7777n);
-      if (!before.isFile() || before.nlink !== 1n || Number(before.uid) !== process.getuid?.() || (mode & 0o7027) !== 0) {
+      if (!before.isFile() || before.nlink !== 1n || Number(before.uid) !== process.getuid?.() || (mode & LEGACY_NOTIFICATION_FORBIDDEN_MODE) !== 0) {
         throw new SettingsWriteError('unsafe_target', 'Wayroost settings require a regular file with trusted ownership and permissions.');
       }
       if (before.size > BigInt(MAX_SETTINGS_BYTES)) throw new SettingsWriteError('unsafe_target', 'Wayroost settings are too large.');
@@ -377,10 +371,10 @@ export class NotificationSettingsStore {
         throw new SettingsWriteError('changed_underneath', 'Wayroost settings changed while being read.');
       }
       const content = bytes.subarray(0, length);
-      if (!isUtf8(content)) throw new Error('Invalid UTF-8.');
+      const source = decodeLegacyNotifications(content);
       return {
-        settings: readSettings(content.toString('utf8')),
-        document: JSON.parse(content.toString('utf8')) as Record<string, unknown>,
+        settings: readSettings(source),
+        document: readLegacyNotifications(source).document,
         expected: { uid: Number(before.uid), gid: Number(before.gid), mode },
         hash: createHash('sha256').update(content).digest('hex'),
       };

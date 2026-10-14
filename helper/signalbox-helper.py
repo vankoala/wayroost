@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -215,6 +216,35 @@ def google_disconnect() -> dict:
 
 # ---- Triggers -----------------------------------------------------------------
 
+def atomic_temp_options(target: Path) -> dict:
+    return {"prefix": f".{target.name}.", "suffix": ".tmp"}
+
+
+def atomic_temp_pattern(target: Path) -> re.Pattern:
+    """Match exactly the names produced by this writer's mkstemp call."""
+    options = atomic_temp_options(target)
+    # tempfile's random component is eight lowercase letters, digits or underscores.
+    return re.compile(re.escape(options["prefix"]) + r"[a-z0-9_]{8}" + re.escape(options["suffix"]))
+
+
+def atomic_write(target: Path, data: bytes, mode: int = 0o600) -> None:
+    fd, name = tempfile.mkstemp(dir=target.parent, **atomic_temp_options(target))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            os.fchmod(stream.fileno(), mode)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, target)
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
 def install_gate() -> None:
     """Keep Hermes' copy of the gate script identical to ours."""
     scripts = HERMES_HOME / "scripts"
@@ -222,16 +252,10 @@ def install_gate() -> None:
     runtime = GATE_SOURCE.with_name("wayroost_runtime.py")
     runtime_target = scripts / runtime.name
     if not runtime_target.exists() or runtime_target.read_bytes() != runtime.read_bytes():
-        tmp_runtime = runtime_target.with_suffix(".tmp")
-        shutil.copyfile(runtime, tmp_runtime)
-        os.chmod(tmp_runtime, 0o644)
-        os.replace(tmp_runtime, runtime_target)
+        atomic_write(runtime_target, runtime.read_bytes(), 0o644)
     target = scripts / GATE_NAME
     if not target.exists() or target.read_bytes() != GATE_SOURCE.read_bytes():
-        tmp = target.with_suffix(".tmp")
-        shutil.copyfile(GATE_SOURCE, tmp)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, target)
+        atomic_write(target, GATE_SOURCE.read_bytes(), 0o644)
         log("gate script installed")
 
 
@@ -270,9 +294,7 @@ def put_trigger(trigger_id: str, body: dict, background=None) -> dict:
     folder = trigger_dir(trigger_id)
     folder.mkdir(parents=True, exist_ok=True)
     os.chmod(folder, 0o700)
-    tmp = folder / "spec.json.tmp"
-    tmp.write_text(json.dumps({"query": query, "role": role}))
-    os.replace(tmp, folder / "spec.json")
+    atomic_write(folder / "spec.json", json.dumps({"query": query, "role": role}).encode())
     install_gate()
     return {"workdir": str(folder), "script": GATE_NAME, "role": role}
 
@@ -341,10 +363,7 @@ def wa_put(body: dict) -> dict:
     if type(hours) is not int or hours not in WA_FRESH_HOURS:
         raise HelperError(400, "Unsupported fresh-chat time.")
     data = {"reply_routing": routing, "return_minutes": minutes, "fresh_after_hours": hours}
-    tmp = WA_SETTINGS.with_name(WA_SETTINGS.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, WA_SETTINGS)
+    atomic_write(WA_SETTINGS, (json.dumps(data, indent=2) + "\n").encode())
     log("whatsapp routing settings saved", **data)
     return wa_status()
 

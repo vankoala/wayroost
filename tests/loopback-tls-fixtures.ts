@@ -1,5 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { temporaryDirectory } from './temporary-directory.js';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { selfSignedLoopbackCertificate } from '../lib/self-signed-certificate.js';
 
@@ -20,7 +20,7 @@ export interface LoopbackTlsFixtures {
  * key material is ever committed. Fingerprints are computed from these files by each test.
  */
 export function loopbackTlsFixtures(): LoopbackTlsFixtures {
-  const directory = mkdtempSync(join(tmpdir(), 'wayroost-tls-fixtures-'));
+  const directory = temporaryDirectory('wayroost-tls-fixtures-');
   const certFile = (service: LoopbackService) => join(directory, `${service}-tls-cert.pem`);
   const keyFile = (service: LoopbackService) => join(directory, `${service}-tls-key.pem`);
   for (const service of ['server', 'supervisor'] as const) {

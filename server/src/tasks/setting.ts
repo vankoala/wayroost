@@ -2,6 +2,8 @@ import { checkDeviceSignal } from '../security/device-signal.js';
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { WORKER_TIME_BOXES, type WorkerUpdatesStatus } from '../../../shared/protocol.js';
+import { readLegacyWorkerUpdates, DEFAULT_TIME_BOX_MINUTES } from '../../../shared/legacy-settings.js';
+export { DEFAULT_TIME_BOX_MINUTES } from '../../../shared/legacy-settings.js';
 
 // Settings → Project bridge → "Worker updates": whether Signalbox tells a Hermes
 // chat when a Paseo worker it started finishes, fails, stops, needs you, or runs
@@ -10,7 +12,6 @@ import { WORKER_TIME_BOXES, type WorkerUpdatesStatus } from '../../../shared/pro
 // whole (temp file + rename).
 
 const FILE = 'worker-updates.json';
-export const DEFAULT_TIME_BOX_MINUTES = 60;
 
 export class WorkerUpdatesSetting {
   private readonly path: string;
@@ -28,12 +29,7 @@ export class WorkerUpdatesSetting {
 
   private load(): Omit<WorkerUpdatesStatus, 'timeBoxes'> {
     try {
-      const raw = JSON.parse(readFileSync(this.path, 'utf8')) as { enabled?: unknown; defaultMinutes?: unknown };
-      const minutes = Number(raw.defaultMinutes);
-      return {
-        enabled: raw.enabled !== false,
-        defaultMinutes: (WORKER_TIME_BOXES as readonly number[]).includes(minutes) ? minutes : DEFAULT_TIME_BOX_MINUTES,
-      };
+      return readLegacyWorkerUpdates(readFileSync(this.path, 'utf8')).value;
     } catch {
       return { enabled: true, defaultMinutes: DEFAULT_TIME_BOX_MINUTES };
     }

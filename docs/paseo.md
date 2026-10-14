@@ -26,9 +26,13 @@ fail the build.
 
 ## Connecting
 
-- The client identifies itself with a **stable client id**, kept in
-  `/var/lib/signalbox/paseo-client-id`. Paseo groups sockets into sessions by
-  client id.
+- The client identifies itself with a **client id**. In primary mode, this
+  is a **stable client id**, kept in `<stateDir>/paseo-client-id` (default
+  `/var/lib/wayroost/paseo-client-id`). Shadow mode reuses an existing saved id
+  from that file (default `/var/lib/wayroost-shadow/paseo-client-id`). Without
+  one, it creates no client-id file and keeps a newly generated id only for
+  that process. A restart generates a new id if there is still no saved id.
+  Paseo groups sockets into sessions by client id.
 - It sends its client library's version as its **`appVersion`** (`0.9.2`).
   Without an app version of at least 0.1.45, the daemon hides custom providers
   such as Hermes and Pi.
@@ -39,8 +43,10 @@ fail the build.
 - It never sends Paseo's "I'm looking at this" heartbeat, so it doesn't suppress
   the push notifications of Paseo's own phone app.
 - **A daemon password** (`paseo daemon set-password`) reaches Wayroost as the
-  systemd credential `paseo-password`: `LoadCredential=paseo-password:/etc/signalbox/paseo-password`
-  in a `signalbox.service.d` drop-in, with the file root-only.
+  systemd credential `paseo-password`: `LoadCredential=paseo-password:/etc/wayroost/paseo-password`
+  in the installed `wayroost-server.service`, when the password file exists.
+  The file must be owned by root with mode 0600; the server installer's
+  `--paseo-password-file` option can select a different protected file.
   - The client sends the password as a bearer header and as the WebSocket
     subprotocol `paseo.bearer.<password>`, so it must use HTTP token characters
     only: no spaces, commas, quotes or slashes. Wayroost refuses one that

@@ -22,7 +22,7 @@ This guide takes you from nothing to Wayroost on your phone. Plan on about
 
 | Requirement | Notes |
 | --- | --- |
-| A Linux machine with systemd | Tested on Ubuntu 22.04, including WSL2 with `systemd=true`. This is the machine your agents run on. |
+| A Linux machine with systemd 249 or newer | Tested on Ubuntu 22.04, including WSL2 with `systemd=true`. This is the machine your agents run on. |
 | Node.js 22 or newer, installed system-wide | `node --version`. The installer refuses a `node` or `npm` that anyone but root could modify, such as one from nvm in your home directory. |
 | Hermes Agent and/or Paseo | Either or both. Hermes needs its dashboard running (default `:19006`) with password sign-in. Paseo needs its daemon (default `:19007`). |
 | A Cloudflare account and a domain on Cloudflare | The free plan works. Cloudflare Access (Zero Trust) is free for up to 50 users. |

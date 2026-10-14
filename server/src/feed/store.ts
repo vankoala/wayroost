@@ -3,10 +3,11 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
+import { readLegacyFeed, DEFAULT_FEED_SETTINGS as DEFAULT_SETTINGS } from '../../../shared/legacy-settings.js';
+export { HHMM } from '../../../shared/legacy-settings.js';
 import { INVISIBLE } from '../../../shared/invisible.js';
 import {
   FEED_KINDS,
-  PROACTIVITY_LEVELS,
   type FeedCard,
   type FeedSource,
   type FeedStatus,
@@ -32,13 +33,6 @@ export interface StoredSettings {
   push: { approvals: boolean; cards: boolean };
   lessLike: Array<{ topic: string; example: string; at: number }>;
 }
-
-const DEFAULT_SETTINGS: StoredSettings = {
-  level: 'normal',
-  quietHours: { start: '21:00', end: '07:00' },
-  push: { approvals: true, cards: false },
-  lessLike: [],
-};
 
 interface FeedFile {
   cards: FeedCard[];
@@ -75,17 +69,6 @@ export const CardInput = z.object({
 });
 export type CardInput = z.infer<typeof CardInput>;
 
-export const HHMM = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'use HH:MM');
-
-const SettingsShape = z.object({
-  level: z.enum(PROACTIVITY_LEVELS).catch('normal'),
-  quietHours: z.object({ start: HHMM, end: HHMM }).nullable().catch(DEFAULT_SETTINGS.quietHours),
-  push: z.object({ approvals: z.boolean(), cards: z.boolean() }).catch(DEFAULT_SETTINGS.push),
-  lessLike: z
-    .array(z.object({ topic: z.string(), example: z.string(), at: z.number() }))
-    .catch([]),
-});
-
 const idFor = (key: string) => createHash('sha256').update(key).digest('hex').slice(0, 16);
 
 export class FeedStore {
@@ -107,13 +90,13 @@ export class FeedStore {
 
   private load(): FeedFile {
     try {
-      const raw = JSON.parse(readFileSync(this.path, 'utf8')) as Partial<FeedFile>;
+      const parsed = readLegacyFeed(readFileSync(this.path, 'utf8'));
+      const raw = parsed.document as Partial<FeedFile>;
       if (Object.hasOwn(raw, 'settings')) this.legacySettings = { value: raw.settings };
-      const settings = this.privatePreferencesDisabled ? undefined : SettingsShape.safeParse(raw.settings ?? {});
       return {
         cards: Array.isArray(raw.cards) ? raw.cards.filter((c) => c && typeof c.key === 'string') : [],
         settings: this.privatePreferencesDisabled ? { ...DEFAULT_SETTINGS, level: 'off', lessLike: [] }
-          : settings?.success ? settings.data : { ...DEFAULT_SETTINGS },
+          : parsed.value,
         notified: Array.isArray(raw.notified) ? raw.notified.filter((n) => typeof n === 'string') : [],
       };
     } catch {

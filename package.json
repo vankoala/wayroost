@@ -41,7 +41,8 @@
     "check:paseo-tools": "tsx scripts/paseo-compat/tool-policy.ts",
     "supervisor:dev": "node --import tsx supervisor/src/dev.ts",
     "build:supervisor": "tsc -p tsconfig.supervisor.json",
-    "desktop:dev": "npm --prefix desktop start"
+    "desktop:dev": "npm --prefix desktop start",
+    "migrate:settings": "esbuild scripts/migrate-settings.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/migrate-settings.mjs && node dist/migrate-settings.mjs"
   },
   "dependencies": {
     "@fastify/static": "10.1.5",

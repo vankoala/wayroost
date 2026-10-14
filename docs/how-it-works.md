@@ -336,8 +336,9 @@ The same tiers apply when you switch an agent's mode later. Details are in
 ## The host
 
 - The server runs as a throwaway systemd user (`DynamicUser`) with no home and
-  no access to `/home`, in a sandbox. It keeps its only state (your Hermes
-  sign-in, a client id) in `/var/lib/signalbox`.
+  no access to `/home`, in a sandbox. It keeps its state, including your Hermes
+  sign-in and a client id, under `stateDir` (default `/var/lib/wayroost` in
+  primary mode; `/var/lib/wayroost-shadow` in shadow mode).
 - cloudflared runs as its own throwaway user and gets the tunnel credential from
   systemd.
 - The installed code is root-owned and read-only. The installer and the tunnel

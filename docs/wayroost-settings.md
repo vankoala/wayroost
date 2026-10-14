@@ -147,3 +147,5 @@ The following example is entirely invented:
   "voice": { "voice": "af_heart", "appReadAloud": { "provider": "local" } }
 }
 ```
+
+For the explicit forward, verification and reverse tools, see [migration](migration.md).

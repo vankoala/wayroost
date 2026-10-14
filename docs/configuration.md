@@ -2,9 +2,14 @@
 
 Legacy `signalbox` and `SIGNALBOX_*` names in this document stay unchanged for compatibility with existing deployments.
 
-Wayroost reads one JSON file, `/etc/wayroost/config.json` (or the path in
-`WAYROOST_CONFIG`). `SIGNALBOX_CONFIG` remains a fallback, with one deprecation
-line per process. If both are set, the Wayroost variable wins. It is validated strictly at startup: unknown keys at any
+Wayroost reads one JSON file. `WAYROOST_CONFIG` takes precedence over
+`SIGNALBOX_CONFIG`, which emits one deprecation line per process. If neither
+is set, the server uses `$CREDENTIALS_DIRECTORY/config.json` when present,
+then `/etc/wayroost/config.json`. Installed services require systemd 249 or
+newer. Unit config paths use `/run/credentials/%n/<credential>`, where `%n`
+is the full unit name, including any instance. See the
+[credentials convention and specifier allowlist](../deploy/README.md).
+The config is validated strictly at startup: unknown keys at any
 level, unsafe values and missing fields stop the service with a clear message
 instead of starting in a weaker state.
 
@@ -26,7 +31,7 @@ installed and authenticated flags are returned. Omitted or unreadable sources
 remain unknown. Move any earlier `settings.agentStatus` server entry to this
 supervisor setting; the server entry no longer controls probes.
 
-A minimal config for the new paths:
+A minimal primary config behind a public tunnel, using the new paths:
 
 The local ports below are invented defaults. Set the Hermes, Paseo and model
 addresses to your own installation's endpoints; explicit configuration continues
@@ -38,8 +43,8 @@ to take precedence. Keep local machine layouts in private configuration files.
   "listen": { "host": "127.0.0.1", "port": 19010 },
   "publicOrigin": "https://wayroost.example.com",
   "access": {
-    "teamDomain": "https://YOUR-TEAM.cloudflareaccess.com",
-    "aud": "YOUR-ACCESS-APPLICATION-AUD-TAG",
+    "teamDomain": "https://example-team.cloudflareaccess.com",
+    "aud": "example-access-aud",
     "allowedEmails": ["you@example.com"]
   },
   "hermes": { "enabled": true, "url": "http://127.0.0.1:19006" },
@@ -48,10 +53,16 @@ to take precedence. Keep local machine layouts in private configuration files.
 }
 ```
 
-You set `access.allowedEmails` and turn off whichever of Hermes and Paseo you
-don't run. `deploy/setup-tunnel.sh` fills in `publicOrigin`,
-`access.teamDomain` and `access.aud` for you. Until the `YOUR-` placeholders
-are gone, the installer doesn't start the service.
+Replace the example hostname, Access team, AUD and allowed email with your own
+values, and turn off whichever of Hermes and Paseo you don't run. This primary
+example has no local origins or desktop listener, so its loopback tunnel backend
+can still use HTTP. Installed desktop and shadow listeners need the TLS and
+origins described in [Loopback TLS](#loopback-tls); the
+[server installer](../deploy/README.md) supplies those and starts in shadow mode.
+On legacy installs, `deploy/setup-tunnel.sh` fills in `publicOrigin`,
+`access.teamDomain` and `access.aud` in `/etc/signalbox/config.json`. The legacy
+installer leaves the service stopped while its template still contains `YOUR-`
+placeholders.
 
 ## Fields
 
@@ -62,7 +73,8 @@ are gone, the installer doesn't start the service.
 | `listen.port` | `19010` | 1–65535 | Local port for the app. `setup-tunnel.sh` points the tunnel at it. |
 | `publicOrigin` | `publicOrigin` or `origins` required | `https://` origin, no path, not a loopback host | The address you open on your phone: the main entry of `origins`, and the one pairing QR codes point to. |
 | `origins` | none | up to 16 bare origins: `https://` ones, plus local `http://127.0.0.1:<port>` (or `localhost`) ones | Every other address the app is opened from: a tailnet name, the relay, and the desktop's own `https://127.0.0.1:8883`. Each one's `Host` is allowed, and its requests must carry its own `Origin`; two origins may not share a `Host` (say `http://` and `https://` on the same port), since the server tells sites apart by `Host`. A local origin (any loopback host, `http://` or `https://`: all of `127.0.0.0/8`, `::1` and IPv4-mapped forms, `localhost` with or without a trailing dot, `*.localhost`, and `0.0.0.0` or `[::]`) is reached on this machine only, and needs a paired device but no Access token; only the desktop app signs in there. |
-| `localListener` | none | a separate loopback port and matching origin | The desktop's PC-only listener, normally `127.0.0.1:8883`. Keep `pcOnlyWrites: false` until its live Windows check passes. |
+| `localListener` | none | loopback host, matching local origin, port distinct from `listen.port`, `bridge.port`, `helper.port` and 19011 (cloudflared metrics) | The desktop's PC-only listener, normally `127.0.0.1:8883`. Requires device sign-in and installed TLS. `pcOnlyWrites` defaults to false; keep it false until its live Windows check passes. |
+| `tls` | none | `certFile`: absolute certificate path; `keyFile`: development only | Both server listeners share this certificate. Installed keys and certificates come from `loopback-tls-key` and `loopback-tls-cert` systemd credentials. Shadow and desktop listeners require TLS; see [Loopback TLS](#loopback-tls). |
 | `rollout` | all false | `settingsPages`, `revokes`, `chatFirst`: booleans | Enable settings writes, revokes/staging, and the basic chat default separately. See [settings rollout](settings-rollout.md). |
 | `devices.enabled` | `true` | required in shadow | Device sign-in: every browser pairs once with a single-use code (see [SECURITY.md](../SECURITY.md#device-sign-in-pairing)). Turn it off only in primary mode with `access` configured; shadow refuses to start without pairing, including when an environment override selects shadow. |
 | `access` | none | | Cloudflare Access, an extra lock for public origins. When it's set, requests through a public origin need its token as well as a paired device; local origins need the device only. |
@@ -77,11 +89,14 @@ are gone, the installer doesn't start the service.
 | `paseo.url` | `ws://127.0.0.1:19007` | `ws://` or `wss://` loopback | The Paseo daemon (`/ws` is added if no path is given). |
 | `bridge.enabled` | `false` | | Turns on the [project bridge](bridge.md): a listener on `127.0.0.1` that agents use to reach the other chats in their project. |
 | `bridge.legacyNames` | `true` | boolean | Rename transition: accept `signalbox` alongside `wayroost`. Set false after the cutoff audit; see [finish/undo](bridge-names.md). |
-| `bridge.port` | `19012` | 1–65535, not `listen.port` and not 19011 | The bridge listener's port. It only ever binds to `127.0.0.1`. |
+| `bridge.port` | `19012` | 1–65535, not `listen.port` and not 19011 (cloudflared metrics) | The bridge listener's port. It only ever binds to `127.0.0.1`. |
 | `speech.enabled` | `false` | | Turns on [voice mode](voice.md). `deploy/setup-speech.sh` sets it after installing the speech service. |
 | `speech.socket` | `/run/signalbox-speech.sock` | absolute path | The speech service's Unix socket. |
 | `feed.enabled` | `false` | | Turns on [For you](for-you.md): cards from Hermes' brief and daytime checks (posted through the bridge, so turn that on too), the proactivity and quiet-hours settings, and phone notifications (these need an `https://` `publicOrigin`). |
 | `notifications.timeZone` | this PC's own zone | an IANA name this PC's time-zone database knows (`Europe/Berlin`, `UTC`) | Whose clock the quiet hours in Settings → Notifications are read on, so an owner away from home keeps their own 21:00. Unset means the zone this PC is set to. In pipeline mode this field is ignored; use `timeZone` in [owner-held settings](wayroost-settings.md). See [Alerts](notifications.md). |
+| `settings.legacyRoutesViaPipeline` | `false` | boolean; read at startup | Route Cloud agents, Safety commands and Worker approvals through the settings pipeline. Enable only after carrying over current choices with writers stopped and verifying supervisor config verbs and `configWrites`; see [cutover](shadow-cutover.md). Capabilities alone never enable it. |
+| `settings.packBuildFile` | `<stateDir>/roles-pack-build.json` | absolute path | Compiler build output used for role load counts, section counts and budgets. |
+| `settings.agentStatus` | none | `home` and `binaries` with absolute paths | Accepted for compatibility but no longer controls probes. Configure `agentStatus`, including `runAs`, in the supervisor's `settings-targets.json` as described above. |
 | `supervisor.socket` | `/run/wayroost/supervisor.sock` | absolute path, at most 107 bytes | Status & power: the supervisor's Unix socket. Without a `supervisor` block the power API says the supervisor isn't running. |
 | `supervisor.keyFile` | none | absolute path | Development only, when `CREDENTIALS_DIRECTORY` is unset: a file holding the supervisor's server key. When the `supervisor` block is configured, a configured credentials directory must supply a readable, valid `supervisor-server-key`; otherwise startup is refused, even with a `keyFile`. Without a `supervisor` block, no supervisor credential is required. The credential wins when both are there; a `supervisor` block with neither is refused. |
 | `stateDir` | `/var/lib/wayroost` for primary; `/var/lib/wayroost-shadow` for shadow | absolute path, isolated by role | Private state: the saved Hermes sign-in, the Paseo client id, the bridge token, For you's cards and phone subscriptions, and legacy Wayroost preferences. In pipeline mode, preferences use the [owner-held settings target](wayroost-settings.md); the state folder retains operational cards, queues and journals. Primary deployments carried over from Signalbox can keep `/var/lib/signalbox` (mode 700). |
@@ -112,7 +127,8 @@ Installed Wayroost listener configs include
 `https://127.0.0.1:8881` and `https://127.0.0.1:8883`. The desktop uses the separate
 8883 listener; the tunnel targets the main 8881 listener. See [settings rollout](settings-rollout.md). Supervisor config uses
 `"tls": { "certFile": "/etc/wayroost/supervisor-tls-cert.pem" }` with
-`"development": false`. Both units load `loopback-tls-cert` and
+`"development": false` at the root of `/etc/wayroost/supervisor.json`.
+`supervisor.development` is not a server config field. Both units load `loopback-tls-cert` and
 `loopback-tls-key` with systemd `LoadCredential`. Installed keys cannot use
 `tls.keyFile`. Shadow servers and servers with device-enabled local origins
 require TLS at startup; the existing primary deployment behind cloudflared keeps
@@ -161,31 +177,43 @@ The existing primary's tunnel stays unchanged until cutover.
 ## Signing in: pairing devices
 
 Each browser, phone and the desktop app pairs once. On a paired desktop, open
-Settings → Devices and choose **Pair a phone**: it shows a QR code that opens
+Settings → Devices & access → Devices and choose **Pair a phone**: it shows a QR code that opens
 `<publicOrigin>/pair#<code>` on the phone. The code works once, for 10 minutes.
 
-To pair the first device, or when no paired desktop is at hand, ask the server
-for a code as root on its machine:
+To pair the first device, or when no paired desktop is at hand, use the installed
+server's fixed-config recovery wrapper as root on its machine:
+
+```sh
+sudo wayroost pair            # a phone code
+sudo wayroost pair-desktop    # a desktop code and combined token with TLS pins
+```
+
+Both explicitly select `/etc/wayroost/config.json` and accept no extra flags or
+paths. Paste the desktop token into the desktop recovery form before it
+connects. These are **device pairing codes**. The supervisor rescue key is a
+separate credential shown once by `install-supervisor.sh`; use the saved
+installer key. The wrapper cannot recover that original key from its stored hash.
+
+Without the wrapper, select the build and config for your installation explicitly:
+
+```sh
+sudo node /opt/wayroost/server/dist/server/pair-code.js --config /etc/wayroost/config.json --phone
+```
+
+On a legacy `install.sh` deployment, use its build and config instead:
 
 ```sh
 sudo node /opt/signalbox/dist/server/pair-code.js --config /etc/signalbox/config.json            # a code for a desktop
 sudo node /opt/signalbox/dist/server/pair-code.js --config /etc/signalbox/config.json --phone    # a code for a phone
 ```
 
-(From a source checkout: `sudo npx tsx scripts/pair-code.ts --config /etc/signalbox/config.json`.) It prints the
+(From a source checkout: `sudo npx tsx scripts/pair-code.ts --config /etc/wayroost/config.json`,
+or `--config /etc/signalbox/config.json` for a legacy deployment.) The raw command prints the
 code and a pairing link for every https origin (type the code into the desktop
 app instead), and also lifts a pairing lock left by too many wrong codes. It reads the config from `--config <path>`,
-`WAYROOST_CONFIG`, `SIGNALBOX_CONFIG` or `/etc/wayroost/config.json`, in that
+`WAYROOST_CONFIG`, `SIGNALBOX_CONFIG`, `$CREDENTIALS_DIRECTORY/config.json`
+(when present) or `/etc/wayroost/config.json`, in that
 order, and talks to the running server over `<stateDir>/pairing/pair.sock`.
-
-The installed Wayroost server has its own fixed-config recovery wrapper:
-`sudo wayroost pair` offers a phone code; `sudo wayroost pair-desktop` offers a
-desktop code and a combined token carrying the server and supervisor rescue
-SPKI fingerprints. Paste that token into the desktop recovery form before it
-connects. Both explicitly select `/etc/wayroost/config.json`. These are
-**device pairing codes**. The supervisor rescue key is a separate credential
-shown once by `install-supervisor.sh`; use the saved installer key. The wrapper
-cannot recover that original key from its stored hash.
 
 To add the PC's own address for the Wayroost desktop app, list it in
 `origins`:
@@ -220,10 +248,11 @@ passes instead of starting on its own. "Now" actions are not affected.
 
 | Variable | Read by | Meaning |
 | --- | --- | --- |
-| `WAYROOST_CONFIG` | the server, `pair-code`; helper and hooks when explicitly set | Path to the config file. Default `/etc/wayroost/config.json`. `SIGNALBOX_CONFIG` is a deprecated fallback. |
+| `WAYROOST_CONFIG` | the server, `pair-code`; helper and hooks when explicitly set | Explicit config path. `SIGNALBOX_CONFIG` is a deprecated fallback. Without either, the server and `pair-code` use `$CREDENTIALS_DIRECTORY/config.json` when present, then `/etc/wayroost/config.json`. |
+| `WAYROOST_SAFETY_CONFIG` | Safety helper | Explicit helper config path. Without it, uses `$CREDENTIALS_DIRECTORY/safety-helper.json` when present, then `/etc/wayroost/safety-helper.json`. |
 | `WAYROOST_LOG_LEVEL` | the server | `trace`, `debug`, `info` (default), `warn`, `error`, `fatal` or `silent`. Applies to all of Wayroost's logs. `SIGNALBOX_LOG_LEVEL`, then the existing `LOG_LEVEL`, remain fallbacks. |
 | `WAYROOST_DEV_ALLOW_LOOPBACK` | the server | `1` lets the config use a local Access issuer and a plain-http loopback origin. **For tests only**: with it set, anyone who can run a local key server could mint tokens. The systemd unit never sets it. |
-| `CREDENTIALS_DIRECTORY` | the server | Set by systemd. The supervisor key is read from its `supervisor-server-key` file, and the Paseo password from its `paseo-password` file. |
+| `CREDENTIALS_DIRECTORY` | the server, Safety helper | Set by systemd. Supplies config credentials when explicit config paths are unset, the supervisor's `supervisor-server-key`, and `paseo-password`. |
 | `TUNNEL_NAME` | `deploy/setup-tunnel.sh` | The dedicated tunnel to create or reuse: 1 to 64 letters, digits, dots, underscores or hyphens. Default `signalbox`. |
 | `PORT` | `npm run demo` | The demo's address, `http://127.0.0.1:<PORT>`. Default `8890`. The demo server itself listens on the next port up, behind a local stand-in for Cloudflare. |
 | `PASEO_LOG` | `npm run check:paseo` | Log level of the Paseo daemon the compatibility harness starts. Default `silent`. |
@@ -239,6 +268,8 @@ Backend-owned variables such as `PASEO_AGENT_ID`, `HERMES_HOME` and systemd's
 
 | Variable | Read by | Meaning |
 | --- | --- | --- |
+| `WAYROOST_BRIDGE_NAME` | bridge wrapper | Stamp every new MCP registration with `wayroost`. An unset value identifies as `signalbox`; unstamped and explicit legacy launches are refused after cutoff. See [bridge names](bridge-names.md). |
+| `WAYROOST_BRIDGE_LEGACY_NAMES` | bridge wrapper, Hermes identity plugin | `true` or `false`: local compatibility gate. The wrapper defaults to true; the plugin otherwise reads its `wayroost-bridge.json` mirror. Keep overrides consistent with `bridge.legacyNames`; the server remains authoritative. See [cutoff](bridge-names.md#both-name-transition). |
 | `WAYROOST_ASSIST_URLS` | server | Comma-separated local model API bases. Default: `http://127.0.0.1:19001/v1`, an invented example; set this to your installed model's URL. |
 | `WAYROOST_ROLE` | server, helper, mail gate, launch hooks | `shadow` or `primary`; shadow wins if either environment or config says shadow. `primary` cannot widen a shadow config. Legacy configs without a role remain primary; invalid roles/config resolution stop the server or silence Python background work. |
 | `WAYROOST_HELPER_PORT` | helper | Loopback listener port; default 19013. |
@@ -366,6 +397,14 @@ The server config defaults to `/etc/wayroost/config.json`. State defaults to
 The legacy installer and existing deployments use the following locations;
 explicit config paths continue to work.
 
+The server's bridge token is always `<stateDir>/bridge-token`, for example
+`/var/lib/wayroost/bridge-token` after primary cutover. With `DynamicUser=yes`,
+systemd may back the configured state directory with `/var/lib/private/`:
+the legacy `signalbox.service` stores it at
+`/var/lib/private/signalbox/bridge-token`, and the shipped shadow server uses
+`/var/lib/private/wayroost-shadow/`. These are service state locations; the
+agents use their separate copy in `~/.config/wayroost/bridge-token`.
+
 | Path | Owner / mode | Contents |
 | --- | --- | --- |
 | `/opt/src/signalbox` | root; it and every parent directory writable by root only | Source. The installer refuses a directory that anyone but root could modify, including through a parent, so pick a root-only location. Debian's `/usr/local/src`, for example, is often `root:staff` with mode 2775, which is refused. |
@@ -386,10 +425,14 @@ explicit config paths continue to work.
 
 | Port | Bound to | What |
 | --- | --- | --- |
-| 19010 | 127.0.0.1 | Wayroost |
+| 8881 | 127.0.0.1 | Installed Wayroost main listener, HTTPS; the tunnel target after [cutover](shadow-cutover.md). |
+| 8883 | 127.0.0.1 | Installed desktop `localListener`, HTTPS; never the tunnel target. |
+| 8880 | 127.0.0.1 | Supervisor HTTPS rescue listener for the desktop. Separate from its Unix socket. |
+| none | Unix socket | Supervisor server API: `/run/wayroost/supervisor.sock`. |
+| 19010 | 127.0.0.1 | Server config default and legacy `install.sh` listener; the new installer uses 8881, including after cutover. |
 | 19011 | 127.0.0.1 | cloudflared metrics and readiness (`GET /ready`) |
 | 19012 | 127.0.0.1 | The project bridge, when it's on, and For you's card routes (`/pulse/v1/…`). Never routed through the tunnel. |
-| none | Unix socket | Pairing recovery: `/var/lib/signalbox/pairing/pair.sock`, for root's `pair-code` only. |
+| none | Unix socket | Pairing recovery: `<stateDir>/pairing/pair.sock`, for root's `pair-code` only. |
 | none | Unix socket | The speech service (voice mode) listens on `/run/signalbox-speech.sock` only, with no network at all. |
 | 19006 | your Hermes setup | Hermes dashboard (Wayroost connects locally) |
 | 19007 | your Paseo setup | Paseo daemon (Wayroost connects locally) |

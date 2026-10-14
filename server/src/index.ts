@@ -55,10 +55,10 @@ const log: Logger = {
   },
 };
 
-const path = configPath();
 let loaded;
 let stateLock: Awaited<ReturnType<typeof lockStateDirectory>>;
 try {
+  const path = configPath();
   loaded = loadStartupConfig(path);
   // Before any store opens: a shadow and a primary never share a state directory.
   stateLock = await lockStateDirectory(loaded.stateDir, loaded.role);

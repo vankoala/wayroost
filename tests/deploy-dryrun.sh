@@ -134,7 +134,10 @@ contains 'REQUIRE /etc/wayroost/supervisor-tls-cert.pem (re-run install-supervis
 absent 'http://127.0.0.1:8881'
 contains "TLS private key $ROOT/etc/wayroost/server-tls-key.pem mode=0600 owner=root:root (never printed)"
 absent 'BEGIN PRIVATE KEY'; absent 'BEGIN EC PRIVATE KEY'
-contains 'Environment=WAYROOST_ROLE=shadow'; contains 'Environment=WAYROOST_CONFIG=%d/config.json'
+contains 'Environment=WAYROOST_ROLE=shadow'
+contains 'Environment=WAYROOST_CONFIG=/run/credentials/%n/config.json'
+contains 'Environment=SIGNALBOX_CONFIG=/run/credentials/%n/config.json'
+absent '%d'
 contains 'StateDirectory=wayroost-shadow'; contains 'StateDirectoryMode=0700'
 contains 'NoNewPrivileges=yes'; contains 'ProtectSystem=strict'; contains 'Restart=on-failure'
 contains 'systemctl enable wayroost-server.service'; contains 'systemctl restart wayroost-server.service'
@@ -178,7 +181,8 @@ contains 'LoadCredential=safety-helper-key:/etc/wayroost/safety-helper-key'
 contains 'User=demo-owner'; contains 'ReadWritePaths=/home/me/demo-paseo'
 # The helper serves the shadow: no changes to the owner's Paseo config on its own.
 contains 'Environment=WAYROOST_ROLE=shadow'
-contains 'Environment=WAYROOST_SAFETY_CONFIG=%d/safety-helper.json'
+contains 'Environment=WAYROOST_SAFETY_CONFIG=/run/credentials/%n/safety-helper.json'
+absent '%d'
 contains 'ProtectHome=yes'; contains 'RuntimeDirectoryMode=0750'
 contains 'systemctl restart wayroost-paseo-safety.service'
 [[ "$BEFORE" == "$(find "$ROOT" -type f -exec sha256sum {} + | sort)" ]] || fail 'Safety dry-run changed files'
@@ -301,9 +305,60 @@ if bash -c 'source "$1"; require_trusted_binary "$2"' _ "$REPO/deploy/lib.sh" "$
 fi
 echo 'PASS argument validation and first install: fake root is dry-run-only, placeholders stay stopped'
 
+# Transactional plans write only private receipts; service queries remain offline.
+read -r RUNTIME_DIGEST SERVER_DIGEST < <(python3 - "$FIXTURE" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+folder = Path(sys.argv[1])
+runtime = {f'bin/{name}': '# prepared runtime\n' for name in [
+    'signalbox-bridge.mjs', 'signalbox-claude-hook.py', 'signalbox-helper.py',
+    'signalbox_mail_trigger.py', 'signalbox_skills.py', 'wayroost_runtime.py']}
+server = {'dist/server/index.js': 'export {};\n', 'dist/web/index.html': '<!doctype html>\n', 'package.json': '{}\n'}
+digests = []
+for kind, files in [('runtime', runtime), ('server', server)]:
+    manifest = ''
+    for name, data in sorted(files.items()):
+        path = folder / kind / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data)
+        manifest += hashlib.sha256(data.encode()).hexdigest() + '  ' + name + '\n'
+    (folder / kind / 'SHA256SUMS').write_text(manifest)
+    digests.append(hashlib.sha256(manifest.encode()).hexdigest())
+print(*digests)
+PY
+)
+cat > "$FIXTURE/blocked/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == --root && "$3" == is-enabled ]] || { echo 'FAIL: plan mutated unit state' >&2; exit 99; }
+echo disabled
+exit 1
+SH
+OUTPUT="$(PATH="$SAFE_PATH" bash "$REPO/deploy/install-wayroost-runtime.sh" --mode plan --root "$ROOT" \
+  --from "$FIXTURE/runtime" --manifest-sha256 "$RUNTIME_DIGEST" --role primary \
+  --receipts /var/lib/wayroost-install/receipts --receipt runtime-plan)"
+contains "PLAN $ROOT/opt/wayroost/runtime/bin/wayroost-role.json"
+absent systemctl; absent '/opt/signalbox'; absent '/etc/signalbox'
+[[ ! -e "$ROOT/opt/wayroost/runtime" ]] || fail 'runtime plan published files'
+OUTPUT="$(PATH="$SAFE_PATH" bash "$REPO/deploy/setup-wayroost-helper.sh" --mode plan --root "$ROOT" \
+  --owner demo-owner --home /home/me --receipts /var/lib/wayroost-install/receipts --receipt helper-plan)"
+contains "PLAN $ROOT/etc/systemd/system/wayroost-helper.service"
+[[ ! -e "$ROOT/etc/systemd/system/wayroost-helper.service" ]] || fail 'helper plan published files'
+OUTPUT="$(PATH="$SAFE_PATH" bash "$REPO/deploy/install-wayroost-server.sh" --update-artifacts --mode plan --root "$ROOT" \
+  --from "$FIXTURE/server" --manifest-sha256 "$SERVER_DIGEST" \
+  --receipts /var/lib/wayroost-install/receipts --receipt server-plan)"
+contains "PLAN $ROOT/opt/wayroost/server/dist/server/index.js"
+absent config.json; absent wayroost-server.service; absent systemctl; absent npm
+[[ ! -e "$ROOT/opt/wayroost/server" ]] || fail 'server plan published files'
+reject "$REPO/deploy/install-wayroost-runtime.sh" --mode plan --root "$ROOT" \
+  --from "$FIXTURE/runtime" --manifest-sha256 "$RUNTIME_DIGEST" \
+  --receipts /var/lib/wayroost-install/receipts --receipt missing-role
+echo 'PASS primary plans: isolated runtime, helper and artifact-only server; no publication or service mutation'
+
 if command -v shellcheck >/dev/null; then
   cd "$REPO"
-  shellcheck -x deploy/wayroost-lib.sh deploy/install-supervisor.sh deploy/install-wayroost-server.sh tests/deploy-dryrun.sh
+  shellcheck -x deploy/wayroost-lib.sh deploy/install-supervisor.sh deploy/install-wayroost-server.sh deploy/install-wayroost-runtime.sh deploy/setup-wayroost-helper.sh tests/deploy-dryrun.sh
   echo 'PASS shellcheck'
 else
   echo 'SKIP shellcheck: not installed'

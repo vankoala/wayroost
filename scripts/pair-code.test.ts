@@ -1,17 +1,24 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { temporaryDirectory } from '../tests/temporary-directory.js';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { loadStartupConfig } from '../server/src/config.js';
+import { configPath, loadStartupConfig } from '../server/src/config.js';
 import { spkiFingerprint } from '../lib/loopback-tls.js';
 import { Devices } from '../server/src/devices.js';
 import { parsePairingToken } from '../desktop/src/tls.js';
 import { loopbackTlsFixtures } from '../tests/loopback-tls-fixtures.js';
 
 const certificates = vi.hoisted(() => ({ missing: false, supervisor: '' }));
+const credentials = vi.hoisted(() => ({ inaccessible: '' }));
+const filesystem = vi.hoisted(() => ({ root: undefined as string | undefined, hostile: false, files: new Map<string, string>() }));
 vi.mock('node:fs', async original => {
-  const fs = await original<typeof import('node:fs')>();
-  return { ...fs, readFileSync: ((path: Parameters<typeof fs.readFileSync>[0], ...args: unknown[]) => {
-    if (path === '/etc/wayroost/supervisor-tls-cert.pem') {
+  const { hostPaths, isolatedStateFilesystem } = await import('../server/test/host-path-fixture.js');
+  const fs = isolatedStateFilesystem(await original<typeof import('node:fs')>(), filesystem);
+  return { ...fs, statSync: ((path: Parameters<typeof fs.statSync>[0], ...args: unknown[]) => {
+    if (path === credentials.inaccessible) throw Object.assign(new Error('Demo inaccessible credential'), { code: 'EACCES' });
+    return Reflect.apply(fs.statSync, fs, [path, ...args]);
+  }) as typeof fs.statSync, readFileSync: ((path: Parameters<typeof fs.readFileSync>[0], ...args: unknown[]) => {
+    if (path === `${hostPaths.config}/supervisor-tls-cert.pem`) {
       if (certificates.missing) throw Object.assign(new Error('Demo missing certificate'), { code: 'ENOENT' });
       return fs.readFileSync(certificates.supervisor);
     }
@@ -35,20 +42,80 @@ beforeEach(() => {
   vi.resetModules();
   recovery.mockReset();
   certificates.missing = false;
-  mkdirSync('test-results', { recursive: true });
-  root = mkdtempSync(resolve('test-results/pair-code-'));
+  credentials.inaccessible = '';
+  filesystem.root = temporaryDirectory('wayroost-pair-state-root-');
+  for (const path of ['var/lib', 'etc', 'run/credentials']) mkdirSync(join(filesystem.root, path), { recursive: true });
+  root = temporaryDirectory('pair-code-');
   config = join(root, 'config.json');
   writeFileSync(config, JSON.stringify({
     role: 'shadow', listen: { port: 8890 }, publicOrigin: 'http://127.0.0.1:8890', stateDir: join(root, 'state'),
   }));
   vi.spyOn(process, 'argv', 'get').mockReturnValue(['node', 'pair-code', '--phone', '--config', config]);
-  for (const name of ['WAYROOST_CONFIG', 'SIGNALBOX_CONFIG', 'WAYROOST_ROLE', 'SIGNALBOX_ROLE']) vi.stubEnv(name, undefined);
+  for (const name of ['WAYROOST_CONFIG', 'SIGNALBOX_CONFIG', 'WAYROOST_ROLE', 'SIGNALBOX_ROLE', 'CREDENTIALS_DIRECTORY']) vi.stubEnv(name, undefined);
   vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   rmSync(root, { recursive: true, force: true });
+  if (filesystem.root) rmSync(filesystem.root, { recursive: true, force: true });
+  filesystem.root = undefined;
+});
+
+describe('pairing recovery config precedence', () => {
+  it.each([
+    ['relative', true], ['relative', false],
+    ['inaccessible', true], ['inaccessible', false],
+  ] as const)('handles %s credentials with an explicit config: %s', async (directory, explicit) => {
+    const credentialDirectory = directory === 'relative' ? directory : join(root, 'credentials');
+    vi.stubEnv('CREDENTIALS_DIRECTORY', credentialDirectory);
+    if (directory === 'inaccessible') {
+      mkdirSync(credentialDirectory);
+      credentials.inaccessible = join(credentialDirectory, 'config.json');
+      writeFileSync(credentials.inaccessible, '{}');
+    }
+    const message = directory === 'relative'
+      ? 'CREDENTIALS_DIRECTORY must be an absolute path'
+      : 'Cannot inspect the systemd config credential config.json';
+    expect(() => configPath()).toThrow(message);
+    vi.stubEnv('WAYROOST_DEV_ALLOW_LOOPBACK', '1');
+    vi.spyOn(process, 'argv', 'get').mockReturnValue(['node', 'pair-code', '--phone', ...(explicit ? ['--config', config] : [])]);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('fake-pair-code-exit'); });
+    recovery.mockResolvedValue({ code: 'obviously-fake-pairing-code', kind: 'phone', expiresAt: Date.now() + 600_000, urls: [] });
+
+    if (explicit) {
+      await import('./pair-code.js');
+      expect(recovery).toHaveBeenCalledExactlyOnceWith(join(root, 'state', 'pairing', 'pair.sock'), 'phone');
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('obviously-fake-pairing-code'));
+      expect(error).not.toHaveBeenCalled();
+      expect(exit).not.toHaveBeenCalled();
+    } else {
+      await expect(import('./pair-code.js')).rejects.toThrow('fake-pair-code-exit');
+      expect(error).toHaveBeenCalledWith(expect.stringContaining(message));
+      expect(exit).toHaveBeenCalledWith(1);
+      expect(recovery).not.toHaveBeenCalled();
+    }
+  });
+
+  it('uses the config credential when no explicit argument or config variable is set', async () => {
+    const directory = join(root, 'credentials');
+    mkdirSync(directory);
+    writeFileSync(join(directory, 'config.json'), readFileSync(config));
+    vi.stubEnv('CREDENTIALS_DIRECTORY', directory);
+    vi.stubEnv('WAYROOST_DEV_ALLOW_LOOPBACK', '1');
+    vi.spyOn(process, 'argv', 'get').mockReturnValue(['node', 'pair-code', '--phone']);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('fake-pair-code-exit'); });
+    recovery.mockResolvedValue({ code: 'obviously-fake-pairing-code', kind: 'phone', expiresAt: Date.now() + 600_000, urls: [] });
+
+    await import('./pair-code.js');
+    expect(recovery).toHaveBeenCalledExactlyOnceWith(join(root, 'state', 'pairing', 'pair.sock'), 'phone');
+    expect(error).not.toHaveBeenCalled();
+    expect(exit).not.toHaveBeenCalled();
+  });
 });
 
 describe('pairing recovery development flag', () => {
