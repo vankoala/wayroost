@@ -14,14 +14,16 @@ import sys
 
 FAMILIES = {
     'feed': ('feed.json',),
-    'tasks': ('tasks.json', 'task-events.jsonl', 'task-event-totals.json', 'task-events.jsonl.retention'),
-    'lineage': ('lineage.json', 'hermes-chat-moves.json'),
+    'tasks': ('tasks.json', 'task-events.jsonl', 'task-event-totals.json', 'task-events.jsonl.retention',
+              'task-admissions.json', 'tasks-quiet.json'),
+    'lineage': ('lineage.json', 'hermes-chat-moves.json', 'lineage-quiet.json', 'lineage-quiet-save.json'),
     'voice': ('voice.json',),
     'schedule-ideas': ('schedule-ideas.json',),
     'paseo-client-id': ('paseo-client-id',),
     'hermes-sign-in': ('hermes-credentials.json',),
 }
-FORBIDDEN = ('devices.json', 'push.json', 'pairing', 'cookies', 'bridge-token', '.wayroost-role', 'pair.sock')
+FORBIDDEN = ('devices.json', 'push.json', 'pairing', 'cookies', 'bridge-token', '.wayroost-role',
+             'bridge-maintenance.json', 'bridge-admin', 'pair.sock')
 UNIT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@:-]{0,200}\.service\Z')
 
 

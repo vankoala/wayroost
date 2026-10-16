@@ -139,12 +139,14 @@ export interface CommandCatalog {
   runner: 'signalbox' | 'agent';
 }
 
-/** What running a "/" command produced. */
+/** Command output or a message receipt; receipts have no output items. */
 export interface CommandResult {
   /** Output to show in the conversation. Viewers of the conversation also get it live. */
   items: TimelineItem[];
   /** Text to put back in the message box, e.g. for /undo. Nothing was sent. */
   prefill?: string;
+  /** The backend's identity for a submitted message. */
+  messageId?: string;
 }
 
 /** Reply to POST /api/conversations/:source/:id/messages. */
@@ -234,8 +236,8 @@ export interface ConversationDetail {
 /** Server → browser messages on /ws. */
 export type ServerEvent =
   /** `email`: the Cloudflare Access identity, when the request came through Access. `device`: the paired device. */
-  | { type: 'hello'; email?: string; device?: DeviceInfo; statuses: SourceStatus[] }
-  | { type: 'source_status'; status: SourceStatus }
+  | { type: 'hello'; email?: string; device?: DeviceInfo; statuses: SourceStatus[]; maintenance?: boolean }
+  | { type: 'source_status'; status: SourceStatus; maintenance?: boolean }
   /** A live turn's outcome is explicit; an idle conversation alone does not establish success. */
   | { type: 'conversation_upsert'; conversation: ConversationSummary; turnOutcome?: TurnOutcome }
   | { type: 'conversation_removed'; source: Source; id: string }
@@ -521,10 +523,26 @@ export interface BridgeStatus {
   enabled: boolean;
   /** Kill switch from the app: every bridge call is refused while paused. */
   paused: boolean;
+  /** Durable owner hold: new work is refused while existing work drains. */
+  maintenance?: boolean;
   /** Loopback port agents' bridge tool talks to. */
   port?: number;
   /** Activity over the last hour. */
   recent: { sent: number; queued: number; started: number };
+}
+
+/** Local administration only; counts never carry chat or task content. */
+export interface QuietReport {
+  held: boolean;
+  quiet: boolean;
+  bridgeWaiters: number | null;
+  queuedMessages: number | null;
+  pendingRelays: number | null;
+  pendingDeliveries: number | null;
+  runningTasks: number | null;
+  openApprovalPrompts: number | null;
+  /** Fixed reason codes identify unavailable evidence; null counts are unknown. */
+  reasons?: string[];
 }
 
 // ---- Hermes safety commands ----

@@ -10,7 +10,7 @@ source "$REPO/deploy/lib.sh"
 source "$REPO/deploy/wayroost-lib.sh"
 for option in "$@"; do
   case "$option" in
-    --mode|--mode=*|--primary|--role|--role=*|--update-artifacts|--from|--from=*|--receipts|--receipts=*|--receipt|--receipt=*|--publish-config|--publish-unit|--config-source|--prefix|--enable|--restart)
+    --mode|--mode=*|--primary|--role|--role=*|--update-artifacts|--from|--from=*|--receipts|--receipts=*|--receipt|--receipt=*|--publish-config|--publish-unit|--publish-cli|--config-source|--prefix|--enable|--restart)
       wayroost_transaction server "$@"
       exit 0 ;;
   esac

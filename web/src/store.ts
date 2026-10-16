@@ -56,6 +56,7 @@ export interface ViewerImage {
 }
 
 export interface AppState {
+  maintenance: boolean;
   rollout?: import('../../shared/rollout.js').Rollout;
   /** Bumped when Hermes' scheduled jobs change, so an open Scheduled-jobs page refetches. */
   schedulesVersion: number;
@@ -87,6 +88,7 @@ export interface AppState {
 }
 
 const initialState: AppState = {
+  maintenance: false,
   sessionExpired: false,
   unpaired: false,
   schedulesVersion: 0,
@@ -449,13 +451,14 @@ export function applyEvent(event: ServerEvent): void {
     case 'hello':
       setState((s) => ({
         ...s,
+        maintenance: event.maintenance ?? false,
         ...(event.email ? { email: event.email } : {}),
         device: event.device,
         statuses: Object.fromEntries(event.statuses.map((st) => [st.source, st])) as AppState['statuses'],
       }));
       return;
     case 'source_status':
-      setState((s) => ({ ...s, statuses: { ...s.statuses, [event.status.source]: event.status } }));
+      setState((s) => ({ ...s, maintenance: event.maintenance ?? s.maintenance, statuses: { ...s.statuses, [event.status.source]: event.status } }));
       return;
     case 'schedules_changed':
       setState((s) => ({ ...s, schedulesVersion: s.schedulesVersion + 1 }));

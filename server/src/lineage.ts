@@ -1,10 +1,10 @@
 import { checkDeviceSignal } from './security/device-signal.js';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { accessSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ConversationSummary, Source } from '../../shared/protocol.js';
 import type { Logger } from './hermes/adapter.js';
-import type { StartedBy } from './sources.js';
+import { UserFacingError, type StartedBy } from './sources.js';
 import type { BackgroundGate } from './background.js';
 
 // Who started what, for the runs neither backend links by itself: Hermes chats an
@@ -50,6 +50,8 @@ export type RunRecord = z.infer<typeof RunSchema>;
 type LineageFile = z.infer<typeof FileSchema>;
 
 const FILE = 'lineage.json';
+const QUIET_FILE = 'lineage-quiet.json';
+const QUIET_SAVE_FILE = 'lineage-quiet-save.json';
 const MAX_LAUNCHES = 3000;
 const MAX_RUNS = 2000;
 const MAX_STARTED_BY = 1000;
@@ -79,6 +81,13 @@ export class Lineage {
   private claudeOwner: (sessionId: string) => string | undefined = () => undefined;
   private readonly listeners = new Set<(change: LineageChange) => void>();
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
+  private quietLoadUnavailable = false;
+  private quietSaveUnavailable = false;
+  private readonly quietMarkersSaved = new Set<string>();
+  private held = false;
+  private closed = false;
+
+  get unavailable(): boolean { return this.closed || this.quietLoadUnavailable || this.quietSaveUnavailable; }
 
   constructor(
     private readonly dir: string | null,
@@ -87,11 +96,29 @@ export class Lineage {
     private readonly background: BackgroundGate,
   ) {
     if (!dir) return;
+    for (const marker of [QUIET_FILE, QUIET_SAVE_FILE]) {
+      try {
+        accessSync(join(dir, marker));
+        // A failed save from another process may have lost records absent from this snapshot.
+        this.markUnavailable(true);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.markUnavailable(true);
+      }
+    }
     try {
       this.data = FileSchema.parse(JSON.parse(readFileSync(join(dir, FILE), 'utf8')));
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.log?.warn({ err: String(err) }, 'lineage file unreadable; starting empty');
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.markUnavailable(true);
+        this.log?.warn({ reason: 'paseo_activity_unavailable' }, 'lineage file unreadable; starting empty');
+      }
     }
+  }
+
+  /** Entering maintenance flushes the debounce; reports stay synchronous until release. */
+  setHeld(held: boolean): void {
+    this.held = held;
+    if (held) this.save();
   }
 
   /** How a backend tells when one of its conversations started (epoch ms), for choosing the nearest launcher. */
@@ -135,6 +162,7 @@ export class Lineage {
     run.updatedAt = at;
     this.data.runs[sessionId] = run;
     this.changed({ kind: 'run', sessionId });
+    if (this.held && this.quietSaveUnavailable) throw new UserFacingError('The run report could not be saved. Try again after storage is restored.', 503);
   }
 
   /** The chat the bridge started this one for (persisted; Hermes has nowhere to keep it). */
@@ -202,6 +230,45 @@ export class Lineage {
 
   // ---- storage ---------------------------------------------------------------
 
+  close(): void {
+    clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
+    this.closed = true;
+  }
+
+  /** Load failures need owner reconciliation; save failures can recover the complete live state. */
+  private markUnavailable(load = false): void {
+    if (load) this.quietLoadUnavailable = true;
+    else this.quietSaveUnavailable = true;
+    const marker = load ? QUIET_FILE : QUIET_SAVE_FILE;
+    if (this.quietMarkersSaved.has(marker) || !this.dir || !this.background.run(() => true)) return;
+    try {
+      this.saveQuietMarker(marker);
+      this.quietMarkersSaved.add(marker);
+    } catch {
+      this.log?.warn({ reason: 'paseo_activity_unavailable' }, 'lineage quiet evidence could not be saved');
+    }
+  }
+
+  private saveQuietMarker(name: string): void {
+    checkDeviceSignal();
+    mkdirSync(this.dir!, { recursive: true, mode: 0o700 });
+    let fd: number;
+    let created = true;
+    try { fd = openSync(join(this.dir!, name), 'wx', 0o600); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      fd = openSync(join(this.dir!, name), 'r');
+      created = false;
+    }
+    try {
+      if (created) writeFileSync(fd, '{"reason":"paseo_activity_unavailable"}');
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    const directory = openSync(this.dir!, 'r');
+    try { fsyncSync(directory); } finally { closeSync(directory); }
+  }
+
   private changed(change: LineageChange): void {
     this.scheduleSave();
     for (const listener of this.listeners) {
@@ -214,6 +281,7 @@ export class Lineage {
   }
 
   private scheduleSave(): void {
+    if (this.held) { this.save(); return; }
     if (!this.dir || this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = undefined;
@@ -222,11 +290,12 @@ export class Lineage {
     this.saveTimer.unref?.();
   }
 
-  /** Write now (also used at shutdown and by tests). Oldest entries go first when a table is full. */
+  /** Write now. Retain every running run; trim old completed records first. */
   save(): void {
     if (!this.background.run(() => true) || !this.dir) return;
     clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
+    if (this.quietLoadUnavailable) this.markUnavailable(true);
     const cutoff = this.now() - MAX_AGE_MS;
     const trim = <T>(table: Record<string, T>, max: number, at: (v: T) => number) =>
       Object.fromEntries(
@@ -235,10 +304,13 @@ export class Lineage {
           .sort(([, a], [, b]) => at(b) - at(a))
           .slice(0, max),
       );
+    const running = Object.entries(this.data.runs).filter(([, run]) => run.status === 'running');
+    const completed = Object.fromEntries(Object.entries(this.data.runs).filter(([, run]) => run.status !== 'running'));
+    const runs = { ...trim(completed, Math.max(0, MAX_RUNS - running.length), (v) => v.updatedAt), ...Object.fromEntries(running) };
     this.data = {
       version: 1,
       launches: trim(this.data.launches, MAX_LAUNCHES, (v) => v.reportedAt),
-      runs: trim(this.data.runs, MAX_RUNS, (v) => v.updatedAt),
+      runs,
       startedBy: trim(this.data.startedBy, MAX_STARTED_BY, (v) => v.at),
     };
     try {
@@ -248,8 +320,21 @@ export class Lineage {
       const tmp = `${path}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify(this.data), { mode: 0o600 });
       renameSync(tmp, path);
-    } catch (err) {
-      this.log?.warn({ err: String(err) }, 'could not save the lineage file');
+      const file = openSync(path, 'r');
+      try { fsyncSync(file); } finally { closeSync(file); }
+      const directory = openSync(this.dir, 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+      if (this.quietSaveUnavailable) {
+        try { unlinkSync(join(this.dir, QUIET_SAVE_FILE)); }
+        catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
+        this.quietMarkersSaved.delete(QUIET_SAVE_FILE);
+        const directory = openSync(this.dir, 'r');
+        try { fsyncSync(directory); } finally { closeSync(directory); }
+        this.quietSaveUnavailable = false;
+      }
+    } catch {
+      this.markUnavailable();
+      this.log?.warn({ reason: 'paseo_activity_unavailable' }, 'could not save the lineage file');
     }
   }
 }

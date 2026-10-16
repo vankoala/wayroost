@@ -648,6 +648,7 @@ def main():
     if kind == 'server':
         parser.add_argument('--primary', action='store_true')
         parser.add_argument('--update-artifacts', action='store_true')
+        parser.add_argument('--publish-cli', action='store_true')
         parser.add_argument('--publish-config', action='store_true')
         parser.add_argument('--config-source')
         parser.add_argument('--config-path', default='/etc/wayroost/config.json')
@@ -727,6 +728,11 @@ def main():
         validate_prefix(prefix)
     if not receipt_only and kind == 'server' and args.publish_config:
         publication_path(target(args.config_path))
+    if not receipt_only and kind == 'server':
+        if args.publish_cli and args.role == 'shadow':
+            fail('--publish-cli cannot be used with --role shadow.')
+        if args.publish_cli or (args.primary or args.role == 'primary') and args.role != 'shadow':
+            publication_path(target('/usr/local/sbin/wayroost'))
     if kind in ['helper', 'server'] and args.mode in ['plan', 'forward']:
         logical_unit_dir = Path(args.unit_dir)
         if str(logical_unit_dir) not in unit_directories:
@@ -1052,6 +1058,17 @@ def main():
                     if config.get('role') != role:
                         fail('Prepared config must already declare the selected role.')
                     publish(config_path, data, 0o600)
+                if role == 'primary' or args.publish_cli:
+                    node_path = shutil.which('node')
+                    if not node_path:
+                        fail('Publishing the wayroost CLI needs Node.js 22 or newer on PATH.')
+                    node = server_node(node_path, inspect=not root)
+                    replacements = {'@NODE@': str(node),
+                                    '@PAIR_CODE@': str(Path(args.prefix) / 'dist/server/pair-code.js'),
+                                    '@CONFIG@': args.config_path, '@ID@': '/usr/bin/id'}
+                    text = substitute(template('wayroost.sh'), {key: value.replace("'", "'\"'\"'")
+                                                               for key, value in replacements.items()})
+                    publish(target('/usr/local/sbin/wayroost'), text.encode(), 0o750)
                 if args.publish_unit:
                     if not role:
                         fail('Unit publication requires an explicit role.')

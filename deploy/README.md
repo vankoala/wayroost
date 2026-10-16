@@ -5,6 +5,20 @@ For the isolated runtime, owner helper and server artifact publication, see the
 use reversible receipts and require flags for service actions. The legacy flows
 below retain their original behavior.
 
+Explicit primary server publication (`--primary` or `--role primary`) refreshes
+the root-only `/usr/local/sbin/wayroost` CLI, including `hold`, `release` and `quiet`.
+Use `--update-artifacts --publish-cli` to request the same refresh on an artifact
+update. `--publish-cli` is also accepted with explicit primary publication and is
+refused with `--role shadow`. The wrapper uses Node from the invocation's PATH,
+the selected server prefix and `--config-path`; repeat custom paths on updates.
+Its publication is atomic and receipted. Reverse restores the previous bytes and
+metadata or absence. Publication does not enable or restart services.
+
+Role-less artifact updates without `--publish-cli` preserve the wrapper, including
+its absence. CLI publication does not inspect installed units, drop-ins, environment
+files or masks to choose a role or Node executable. Explicit shadow publication
+keeps its existing behavior. Publication paths still refuse symlinks.
+
 These scripts install the supervisor and Wayroost server under an admin's control.
 Development and tests run them only with `--dry-run`. They do not build from
 source, use the legacy app's config/state, or change its units.

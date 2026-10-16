@@ -347,6 +347,8 @@ export class TaskHistory {
     return this.latest.get(task);
   }
 
+  canCheckQuiet(): boolean { return !this.unavailable && !this.appendFailed; }
+
   /** Retry storage failures before appending more telemetry. */
   recover(): void {
     checkDeviceSignal();

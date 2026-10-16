@@ -6,6 +6,8 @@ import type { Feed } from '../feed/service.js';
 import { CardInput } from '../feed/store.js';
 import type { Logger } from '../hermes/adapter.js';
 import { UserFacingError } from '../sources.js';
+import { MaintenanceError } from './maintenance.js';
+import { bridgeStateDirectory } from './token.js';
 import { isBridgeTool, isReportTool, type Bridge, type BridgeIdentity } from './service.js';
 import { shadowBackground, type BackgroundGate } from '../background.js';
 
@@ -32,7 +34,7 @@ const CHAT_ID = /^[A-Za-z0-9][\w.:@+-]{0,199}$/;
 
 export interface BridgeServerOptions {
   background?: BackgroundGate;
-  bridge: Pick<Bridge, 'call'>;
+  bridge: Pick<Bridge, 'call'> & Partial<Pick<Bridge, 'maintenanceHold'>>;
   token: string;
   /** Accept old wrappers (no name header) and the signalbox alias during the rename transition. */
   legacyNames?: boolean;
@@ -73,6 +75,8 @@ export function headerFolder(value: string | undefined): string | undefined {
 export async function buildBridgeServer(options: BridgeServerOptions): Promise<FastifyInstance> {
   (options.background ?? shadowBackground).require();
   const { bridge, port, log } = options;
+  const stateDir = bridgeStateDirectory(options.token);
+  if (stateDir) bridge.maintenanceHold?.(stateDir);
   const expected = digest(options.token);
   const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
   const app = Fastify({
@@ -156,6 +160,7 @@ export async function buildBridgeServer(options: BridgeServerOptions): Promise<F
   app.setNotFoundHandler((_req, reply) => reply.code(404).send({ ok: false, error: 'Not found.' }));
 
   app.setErrorHandler((err, _req, reply) => {
+    if (err instanceof MaintenanceError) return reply.code(err.status).send({ ok: false, error: err.code, message: err.message });
     if (err instanceof UserFacingError) return reply.code(err.status).send({ ok: false, error: err.message });
     if (err instanceof z.ZodError) {
       return reply.code(400).send({ ok: false, error: `Invalid request: ${err.issues.map((i) => i.path.join('.') || 'body').join(', ')}` });

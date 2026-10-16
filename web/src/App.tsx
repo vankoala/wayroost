@@ -36,6 +36,7 @@ import { StatusPage, type PowerConfirmation } from './pages/StatusPage';
 import { TeamPage } from './pages/TeamPage';
 import { TasksPage } from './pages/TasksPage';
 import { usePower } from './power';
+import { MaintenanceBanner } from './components/MaintenanceBanner.js';
 
 let started = false;
 
@@ -128,6 +129,7 @@ function Main({ route }: { route: Exclude<Route, { name: 'pair' }> }) {
 
   return (
     <div className={`app ${inChats ? (route.name === 'conversation' ? 'show-conv' : 'show-list') : 'app-page'}`}>
+      <MaintenanceBanner />
       {phone ? null : <Sidebar route={route} waiting={waitingCount} />}
       {inChats ? (
         <>

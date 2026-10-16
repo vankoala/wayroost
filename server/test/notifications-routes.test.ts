@@ -1,5 +1,7 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isolatedStateRoot, useIsolatedStateDirectories } from './state-directory-fixture.js';
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
+import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as promises from 'node:fs/promises';
 import type { ServerEvent } from '../../shared/protocol.js';
@@ -27,16 +29,32 @@ const quietLog = { info() {}, warn() {}, error() {} };
 const NOON = () => new Date('2026-10-02T12:00:00Z').getTime();
 const roots: string[] = [];
 const apps: Awaited<ReturnType<typeof makeApp>>['app'][] = [];
+// A shadow server validates its installed primary directories when it starts, so those installed
+// paths are redirected into a private root for every test here.
+useIsolatedStateDirectories();
+
 vi.mock('node:fs/promises', async original => {
   const actual = await original<typeof import('node:fs/promises')>();
   return { ...actual, lstat: vi.fn(actual.lstat) };
 });
 const actualPromises = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+// The write-through store refuses a state directory whose ancestors allow group or world writes.
+// Above a fixture's own private directories sits the checkout, which no test may chmod and whose
+// modes belong to the host: that chain is modelled as trusted here, while every directory a test
+// creates itself keeps the mode it really has.
+const aboveFixture = (candidate: string) => {
+  const fixtureRoots = [...roots, isolatedStateRoot()];
+  return !fixtureRoots.some(root => candidate === root || candidate.startsWith(`${root}/`))
+    && fixtureRoots.some(root => `${root}/`.startsWith(`${candidate.replace(/\/$/, '')}/`));
+};
+const ungrouped = (mode: number | bigint) => typeof mode === 'bigint' ? mode & ~0o022n : Number(mode) & ~0o022;
 beforeEach(() => {
   // Fixtures model a trusted root on hosts with mapped mount ownership.
   vi.mocked(promises.lstat).mockImplementation(async (path, options) => {
     const stat = await actualPromises.lstat(path, options);
-    if (String(path) === '/') stat.uid = typeof stat.uid === 'bigint' ? 0n : 0;
+    const text = String(path);
+    if (text === '/') stat.uid = typeof stat.uid === 'bigint' ? 0n : 0;
+    if (aboveFixture(text)) (stat as { mode: number | bigint }).mode = ungrouped(stat.mode);
     return stat;
   });
 });
@@ -52,6 +70,39 @@ const body = (extra: Record<string, unknown> = {}) => ({
   quietHours: { start: '22:00', end: '06:30' },
   push: { approvals: true, cards: true },
   ...extra,
+});
+
+describe('isolated directory permissions', () => {
+  it.each([0o755, 0o775, 0o777])('preserves mode %s on fixture roots and their children', async mode => {
+    const root = temporaryDirectory('notification-permissions-');
+    roots.push(root);
+    const child = join(root, 'child');
+    mkdirSync(child);
+    // A nested fixture root must not make the directories between it and its parent root look trusted.
+    const grandchild = join(child, 'grandchild');
+    mkdirSync(grandchild);
+    roots.push(grandchild);
+    chmodSync(root, mode);
+    chmodSync(child, mode);
+    for (const path of [root, child, grandchild, isolatedStateRoot()]) {
+      expect((await promises.lstat(path)).mode).toBe((await actualPromises.lstat(path)).mode);
+      expect((await promises.lstat(path, { bigint: true })).mode)
+        .toBe((await actualPromises.lstat(path, { bigint: true })).mode);
+    }
+  });
+
+  it('leaves trusted ancestor mode bits unchanged', async () => {
+    expect(ungrouped(0o40755)).toBe(0o40755);
+    expect(ungrouped(0o40755n)).toBe(0o40755n);
+    for (let path = dirname(isolatedStateRoot());; path = dirname(path)) {
+      const actual = await actualPromises.lstat(path, { bigint: true });
+      if ((actual.mode & 0o022n) === 0n) {
+        expect((await promises.lstat(path, { bigint: true })).mode).toBe(actual.mode);
+        expect((await promises.lstat(path)).mode).toBe(Number(actual.mode));
+      }
+      if (dirname(path) === path) break;
+    }
+  });
 });
 
 describe('production event delivery', () => {
@@ -182,8 +233,7 @@ describe('worker approvals writer', () => {
   });
 
   it.each([true, false])('saves enabled=%s through the helper and retains it after restart', async enabled => {
-    mkdirSync(join(process.cwd(), '.tmp'), { recursive: true });
-    const root = mkdtempSync(join(process.cwd(), '.tmp', 'approvals-route-'));
+    const root = temporaryDirectory('approvals-route-');
     roots.push(root);
     const configPath = join(root, 'paseo-test.json');
     const statePath = join(root, 'worker-approvals.json');
@@ -221,11 +271,10 @@ describe('worker approvals writer', () => {
 async function routeFixture(options: { zone?: string; wired?: boolean; feedEnabled?: boolean; workerApprovals?: AppDeps['workerApprovals'];
   supervisor?: AppDeps['supervisor']; shadow?: boolean; local?: boolean; legacySafety?: boolean; pipeline?: boolean;
   initialSettings?: Record<string, unknown>; initialAudit?: string } = {}) {
-  mkdirSync(join(process.cwd(), '.tmp'), { recursive: true });
   const keys = await makeKeys();
   const token = await makeToken(keys);
   // The write-through core wants a folder only this PC's user can write, as the service has.
-  const state = mkdtempSync(join(process.cwd(), '.tmp', 'notification-route-'));
+  const state = temporaryDirectory('notification-route-');
   roots.push(state);
   if (options.shadow) writeFileSync(join(state, '.wayroost-role'), 'shadow\n', { mode: 0o600 });
   seedDevices(state);
@@ -669,6 +718,22 @@ describe('writing them', () => {
     expect(response.statusCode).toBe(409);
     expect(response.json()).toEqual({ status: 'refused', code: 'unsafe_target' });
     expect((await t.get()).json().quietHours).toEqual({ start: '21:00', end: '07:00' });
+  });
+
+  it.each([0o775, 0o777])('refuses an unsafe state directory with mode %s without changing settings', async mode => {
+    const t = await routeFixture();
+    expect((await t.put(body())).statusCode).toBe(200);
+    const bytes = readFileSync(join(t.state, WAYROOST_SETTINGS_FILE), 'utf8');
+    const child = join(t.state, 'nested-fixture');
+    mkdirSync(child);
+    roots.push(child);
+    chmodSync(t.state, mode);
+    expect(Number((await promises.lstat(t.state, { bigint: true })).mode) & 0o777).toBe(mode);
+    const response = await t.put(body({ quietHours: { start: '20:00', end: '06:00' } }));
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ status: 'refused', code: 'unsafe_directory' });
+    expect(readFileSync(join(t.state, WAYROOST_SETTINGS_FILE), 'utf8')).toBe(bytes);
+    expect(t.events.filter(event => event.type === 'settings_changed')).toHaveLength(1);
   });
 
   it.each([

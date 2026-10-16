@@ -1,5 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { useIsolatedStateDirectories } from './state-directory-fixture.js';
+import { temporaryDirectory } from '../../tests/temporary-directory.js';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { request } from 'node:http';
 import { once } from 'node:events';
@@ -19,11 +20,14 @@ import { loopbackTlsFixtures } from '../../tests/loopback-tls-fixtures.js';
 
 // Throwaway key pairs, generated for this run and removed afterwards; none is committed.
 const tls = loopbackTlsFixtures();
+// Each test passes its credential directory through the CREDENTIALS_DIRECTORY stub below; a shadow
+// also validates its installed primaries, so those paths are redirected into a private root.
+useIsolatedStateDirectories();
 afterAll(() => tls.remove());
 const directories: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 function credentials() {
-  const directory = mkdtempSync(join(tmpdir(), 'demo-tls-credentials-')); directories.push(directory);
+  const directory = temporaryDirectory('demo-tls-credentials-'); directories.push(directory);
   const cert = tls.cert('server');
   writeFileSync(join(directory, 'loopback-tls-cert'), cert);
   writeFileSync(join(directory, 'loopback-tls-key'), tls.key('server'), { mode: 0o600 });

@@ -7,6 +7,7 @@ import {
   DaemonClient,
   type ConnectionState,
   type FetchAgentsEntry,
+  type FetchAgentTimelinePayload,
   type FileReadResult,
   type WebSocketLike,
 } from '@getpaseo/client/internal/daemon-client';
@@ -51,7 +52,7 @@ import { splitFolder } from '../folders.js';
 import type { Logger } from '../hermes/adapter.js';
 import type { EventHub } from '../hub.js';
 import { MAX_MEDIA_BYTES, type MediaFile } from '../media.js';
-import { UserFacingError, eachThread, type CreatePaseoAgentInput, type PaseoSource, type StartedBy } from '../sources.js';
+import { UserFacingError, eachThread, transientFailure, type CreatePaseoAgentInput, type PaseoSource, type StartedBy } from '../sources.js';
 import { homeRelative, oneLine, str } from '../text.js';
 import { isRunRowId, runRowId, runSessionId, type Lineage, type RunRecord } from '../lineage.js';
 import { AgentTimelineMirror, type AgentStreamEvent, type MirrorRow, type MirrorSink } from './mirror.js';
@@ -268,6 +269,7 @@ export class PaseoAdapter implements PaseoSource {
   private providers: ProviderEntry[] | undefined;
   private workspaces: WorkspaceDescriptorPayload[] = [];
   private listLoaded = false;
+  private activityRevision = 0;
   private previousState: ConnectionState['status'] | null = null;
   private refusedReason: string | undefined;   // the last password refusal logged, so a retry loop logs once
   private unsubscribers: Array<() => void> = [];
@@ -302,6 +304,7 @@ export class PaseoAdapter implements PaseoSource {
       return undefined;
     });
     lineage.onChange((change) => {
+      this.activityRevision++;
       if (change.kind !== 'run') return;
       const row = this.runRow(change.sessionId);
       if (row) this.publish(row);
@@ -569,6 +572,61 @@ export class PaseoAdapter implements PaseoSource {
 
   // ---- for the task log (read-only) --------------------------------------------
 
+  get activityVersion(): number { return this.activityRevision; }
+
+  /** Read all daemon activity, including archived agents, without subscriptions or inbox changes. */
+  async readActivityConversations(activityRevision = this.activityRevision): Promise<ConversationSummary[]> {
+    const client = this.requireClient();
+    const revision = this.statusValue;
+    const conversations: ConversationSummary[] = [];
+    const ids = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await client.fetchAgents({
+        filter: { includeArchived: true },
+        sort: [{ key: 'created_at', direction: 'asc' }],
+        page: { limit: 200, ...(cursor ? { cursor } : {}) },
+      });
+      if (this.statusValue !== revision || !Array.isArray(page.entries) || typeof page.pageInfo?.hasMore !== 'boolean' || page.sync?.mode === 'changes') {
+        throw new UserFacingError('Paseo activity is unavailable.', 503);
+      }
+      for (const { agent, project } of page.entries) {
+        if (!agent.id || ids.has(agent.id) || !Array.isArray(agent.pendingPermissions) ||
+          !['running', 'initializing', 'busy', 'starting', 'idle', 'error', 'closed'].includes(agent.status)) {
+          throw new UserFacingError('Paseo activity is unavailable.', 503);
+        }
+        ids.add(agent.id);
+        const summary = agentSummary(agent, providerLabel(agent.provider, this.labels), agent.pendingPermissions.length, project ?? null);
+        if (['running', 'initializing', 'busy', 'starting'].includes(agent.status)) summary.status = 'running';
+        if (agentLoaded(agent)) {
+          if (client.getLastServerInfoMessage()?.features?.providerSubagents !== true) {
+            throw new UserFacingError('Paseo activity is unavailable.', 503);
+          }
+          const reply = await client.listProviderSubagents(agent.id, { timeout: SUBAGENT_LIST_TIMEOUT_MS });
+          if (this.statusValue !== revision || !Array.isArray(reply.subagents) ||
+            reply.subagents.some((subagent) => !['running', 'completed', 'failed', 'canceled'].includes(subagent.status))) {
+            throw new UserFacingError('Paseo activity is unavailable.', 503);
+          }
+          if (reply.subagents.some((subagent) => subagent.status === 'running')) summary.status = 'running';
+        }
+        conversations.push(summary);
+      }
+      if (!page.pageInfo.hasMore) break;
+      cursor = page.pageInfo.nextCursor ?? undefined;
+      if (!cursor || cursors.has(cursor) || !page.entries.length || cursors.size >= 1_000) {
+        throw new UserFacingError('Paseo activity is unavailable.', 503);
+      }
+      cursors.add(cursor);
+    } while (cursor);
+    // Lineage has no live completion reader; elapsed time cannot certify an unfinished run.
+    if (this.statusValue !== revision || this.activityRevision !== activityRevision || this.lineage?.unavailable ||
+        this.lineage?.runs().some(([, run]) => run.status === 'running')) {
+      throw new UserFacingError('Paseo activity is unavailable.', 503);
+    }
+    return conversations;
+  }
+
   /** Paseo's agent list has loaded since the last (re)connect: an agent missing from it is gone. */
   get agentsLoaded(): boolean {
     return this.listLoaded;
@@ -687,6 +745,7 @@ export class PaseoAdapter implements PaseoSource {
       | { kind: 'upsert'; agent: AgentSnapshotPayload; project?: ProjectPlacementPayload | null }
       | { kind: 'remove'; agentId: string },
   ): void {
+    this.activityRevision++;
     if (update.kind === 'remove') {
       this.forgetAgent(update.agentId);
       return;
@@ -705,6 +764,7 @@ export class PaseoAdapter implements PaseoSource {
   // agent that runs them. Their work shows in that agent's tool cards.
 
   private onSubagentUpdate(update: SubagentUpdate): void {
+    this.activityRevision++;
     if (update.kind === 'upsert') {
       const { subagent } = update;
       const parent = this.agents.get(subagent.parentAgentId);
@@ -809,6 +869,102 @@ export class PaseoAdapter implements PaseoSource {
   }
 
   // ---- one agent ------------------------------------------------------------
+
+  /** Relay quotes share the inbox mirror, but never revive archived workers. */
+  async readWorkerLastMessage(agentId: string): Promise<string | undefined> {
+    const client = this.requireClient();
+    if (!this.agents.has(agentId)) {
+      const found = await client.fetchAgent({ agentId }).catch(() => null);
+      if (!found || found.agent.archivedAt && !agentLoaded(found.agent)) return undefined;
+      this.keepAgent(found.agent);
+      this.placements.set(agentId, found.project ?? null);
+    }
+    const known = this.agents.get(agentId);
+    if (known?.archivedAt && !agentLoaded(known)) return undefined;
+    const { items } = await this.getConversation(agentId);
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i]!;
+      if (item.kind === 'assistant' && item.text.trim()) return item.text;
+    }
+    return undefined;
+  }
+
+  private async readWorkerTimeline(agentId: string): Promise<FetchAgentTimelinePayload | undefined> {
+    const client = this.requireClient();
+    try {
+      const page = await client.fetchAgentTimeline(agentId, { direction: 'tail', limit: 120, projection: 'projected' });
+      if (page?.error && /agent not found/i.test(page.error)) return undefined;
+      if (!page || page.error || page.gap || page.staleCursor) throw new UserFacingError('Paseo worker history is unavailable.', 503);
+      return page;
+    } catch (err) {
+      if (/agent not found/i.test(message(err))) return undefined;
+      throw err;
+    }
+  }
+
+  /** Read a worker's stored tail without subscriptions or adding it to the inbox. */
+  async readWorkerConversation(agentId: string): Promise<(ConversationDetail & {
+    userMessageIds: string[]; userMessages: Array<{ id: string; turnId?: string }>;
+    completionTurnId?: string; subsequentTurnIds: Array<string | undefined>;
+  }) | undefined> {
+    const client = this.requireClient();
+    const revision = this.statusValue;
+    const activityRevision = this.activityRevision;
+    try {
+      const found = await client.fetchAgent({ agentId });
+      if (found === null) return undefined;
+      if (!found || !['running', 'initializing', 'idle', 'error', 'closed'].includes(found.agent.status)) {
+        throw new UserFacingError('Paseo worker activity is unavailable.', 503);
+      }
+      const conversation = agentSummary(found.agent, providerLabel(found.agent.provider, this.labels),
+        this.approvalsFor(agentId).length, found.project ?? null);
+      if (!agentLoaded(found.agent) || found.agent.archivedAt) {
+        return { conversation, items: [], userMessageIds: [], userMessages: [], subsequentTurnIds: [], approvals: this.approvalsFor(agentId) };
+      }
+      const activity = JSON.stringify(found.agent);
+      const page = await this.readWorkerTimeline(agentId);
+      if (!page) return undefined;
+      if (page.agent && activity !== JSON.stringify(page.agent)) {
+        throw new UserFacingError('Paseo worker activity is unavailable.', 503);
+      }
+      const confirmed = await this.readWorkerTimeline(agentId);
+      const latest = await client.fetchAgent({ agentId });
+      if (!latest) return undefined;
+      if (!['running', 'initializing', 'idle', 'error', 'closed'].includes(latest.agent.status)) {
+        throw new UserFacingError('Paseo worker activity is unavailable.', 503);
+      }
+      // Compare daemon snapshots as well as notifications, which can arrive late.
+      if (activity !== JSON.stringify(latest.agent) || confirmed?.agent && activity !== JSON.stringify(confirmed.agent)) {
+        throw new UserFacingError('Paseo worker activity is unavailable.', 503);
+      }
+      const tail = (history: typeof page) => JSON.stringify([history.epoch, history.window,
+        history.startCursor, history.endCursor, history.entries]);
+      if (!confirmed || tail(page) !== tail(confirmed) ||
+          this.statusValue !== revision || this.activityRevision !== activityRevision) {
+        throw new UserFacingError('Paseo worker activity is unavailable.', 503);
+      }
+      const latestConversation = agentSummary(latest.agent, providerLabel(latest.agent.provider, this.labels),
+        this.approvalsFor(agentId).length, latest.project ?? null);
+      const rows = page.entries.map((entry) => ({ ...entry,
+        key: entry.item.type === 'user_message' && entry.item.clientMessageId ? entry.item.clientMessageId : `${page.epoch}:${entry.seqStart}`,
+      }));
+      const users = rows.filter((entry) => entry.item.type === 'user_message');
+      const lastUser = rows.findLastIndex((entry) => entry.item.type === 'user_message');
+      return { conversation: latestConversation, items: this.toItems(rows),
+        userMessageIds: users.map((entry) => entry.key),
+        userMessages: users.map((entry) => ({ id: entry.key, ...(entry.turnId ? { turnId: entry.turnId } : {}) })),
+        // Content can outlive its run. Only the daemon's current turn can bind a running admission;
+        // ended snapshots expose no terminal-turn identity and cannot certify a held completion.
+        ...(['running', 'initializing'].includes(latest.agent.status) && latest.agent.activeTurn?.turnId
+          ? { completionTurnId: latest.agent.activeTurn.turnId } : {}),
+        subsequentTurnIds: rows.slice(lastUser + 1).map((entry) => entry.turnId ?? undefined),
+        approvals: this.approvalsFor(agentId) };
+    } catch (err) {
+      if (/agent not found/i.test(message(err))) return undefined;
+      if (!this.workerSnapshot(agentId)?.loaded && !transientFailure(err) && !/timeout|timed out|\b503\b/i.test(message(err))) return undefined;
+      throw err;
+    }
+  }
 
   async getConversation(agentId: string, deliberateOpen = false): Promise<ConversationDetail> {
     if (isRunRowId(agentId)) return this.runDetail(agentId);
@@ -957,7 +1113,7 @@ export class PaseoAdapter implements PaseoSource {
 
   // ---- actions --------------------------------------------------------------
 
-  async sendMessage(agentId: string, text: string, attachments: Attachment[] = []): Promise<void> {
+  async sendMessage(agentId: string, text: string, attachments: Attachment[] = []): Promise<{ messageId: string; items: [] }> {
     this.refuseSubagent(agentId);
     const client = this.requireClient();
     const files = await this.prepareFiles(client, attachments);
@@ -978,6 +1134,7 @@ export class PaseoAdapter implements PaseoSource {
       checkDeviceSignal();
       throw new UserFacingError(`Paseo: ${message(err)}`);
     }
+    return { messageId, items: [] };
   }
 
   /**
@@ -1286,7 +1443,9 @@ export class PaseoAdapter implements PaseoSource {
     };
   }
 
-  async createConversation(input: CreatePaseoAgentInput): Promise<string> {
+  async createConversation(input: CreatePaseoAgentInput): Promise<string>;
+  async createConversation(input: CreatePaseoAgentInput, withReceipt: true): Promise<{ id: string; messageId: string }>;
+  async createConversation(input: CreatePaseoAgentInput, withReceipt = false): Promise<string | { id: string; messageId: string }> {
     const client = this.requireClient();
     const providers = this.providers ?? (await this.loadProviders());
     const provider = providers.find((p) => p.id === input.providerId);
@@ -1349,7 +1508,7 @@ export class PaseoAdapter implements PaseoSource {
     }
     this.keepAgent(agent);
     this.publishSummary(agent.id);
-    return agent.id;
+    return withReceipt ? { id: agent.id, messageId } : agent.id;
   }
 
   // ---- tidying up ----------------------------------------------------------------

@@ -28,6 +28,7 @@ import {
   PAIR_PATH,
   type ArchivedList,
   type BridgeStatus,
+  type ConversationSummary,
   type CleanupPreview,
   CLOUD_AGENT_IDS,
   type CloudAgentsStatus,
@@ -73,6 +74,10 @@ import type { SafetyCommandsSetting } from './hermes/safety.js';
 import type { WorkerUpdatesSetting } from './tasks/setting.js';
 import type { TaskRelay } from './tasks/relay.js';
 import type { Bridge } from './bridge/service.js';
+import { BackgroundGate } from './background.js';
+import { MaintenanceHold } from './bridge/maintenance.js';
+import { quietReport, type QuietConversation } from './bridge/quiet.js';
+import { startMaintenanceAdmin } from './bridge/admin.js';
 import type { AppConfig } from './config.js';
 import type { HelperApi } from './connectors/helper.js';
 import { DraftInput, ScheduleInput, ScheduleUpdate, type Schedules } from './schedules.js';
@@ -154,7 +159,7 @@ export interface AppDeps {
   /** Longest a live socket may stay open before signing in again (through Access, or the device check). */
   wsMaxLifetimeMs?: number;
   /** The project bridge, when it's turned on and listening. */
-  bridge?: Pick<Bridge, 'status' | 'setPaused'>;
+  bridge?: Pick<Bridge, 'status' | 'setPaused'> & Partial<Pick<Bridge, 'maintenanceHold' | 'quietCounts'>>;
   /** Settings → Connectors, when Hermes is on. */
   connectors?: Connectors;
   /** Voice mode, when it's turned on (deploy/setup-speech.sh). */
@@ -186,7 +191,7 @@ export interface AppDeps {
   /** Settings → Project bridge → Worker updates, when the task log runs (bridge, Hermes and Paseo all on). */
   workerUpdates?: Pick<WorkerUpdatesSetting, 'status' | 'update'> & Partial<Pick<WorkerUpdatesSetting, 'useSettingsSource' | 'refreshSettings'>>;
   /** The authenticated, read-only task ledger, when worker updates are available. */
-  tasks?: Pick<TaskRelay, 'status'>;
+  tasks?: Pick<TaskRelay, 'status'> & Partial<Pick<TaskRelay, 'quietCounts'>>;
   /**
    * What a folder's own files let an agent do there, read as the owner before an agent starts in it.
    * Defaults to the real scan; tests and the visual check plant their own folders instead.
@@ -968,7 +973,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const { source, id } = ConversationParams.parse(req.params);
     const { text, attachments } = MessageBody.parse(req.body);
     const command = await sources[source].sendMessage(id, text, decodeAttachments(attachments));
-    const reply: SendResponse = { ok: true, ...(command ? { command } : {}) };
+    const reply: SendResponse = { ok: true, ...(command && !command.messageId ? { command } : {}) };
     return reply;
   });
 
@@ -1067,8 +1072,51 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.delete('/api/settings/hermes', async () => ({ status: await sources.hermes.clearCredentials() }));
 
   // The project bridge's kill switch. The bridge itself listens on its own loopback port.
+  const maintenance = deps.bridge?.maintenanceHold?.(config.stateDir) ?? new MaintenanceHold(config.stateDir);
+  const stopMaintenanceWatch = maintenance.watch((held) => hub.publish({ type: 'source_status', status: sources.hermes.status(), maintenance: held }));
+  const quiet = () => {
+    return quietReport({ hold: maintenance, sources,
+      ...(deps.bridge ? { bridge: { quietCounts: (conversations?: readonly QuietConversation[]) => {
+        if (!deps.bridge!.quietCounts) throw new Error();
+        return deps.bridge!.quietCounts(conversations);
+      } } } : {}),
+      ...(deps.tasks ? { tasks: { quietCounts: () => {
+        if (!deps.tasks!.quietCounts) throw new Error();
+        return deps.tasks!.quietCounts();
+      } } } : {}),
+    });
+  };
+  let maintenanceAdmin: Awaited<ReturnType<typeof startMaintenanceAdmin>> | undefined;
+  app.addHook('onListen', async () => {
+    maintenanceAdmin = await startMaintenanceAdmin(config.stateDir, maintenance, quiet, new BackgroundGate(config.role));
+  });
+  app.addHook('onClose', async () => {
+    stopMaintenanceWatch();
+    if (maintenanceAdmin) await new Promise<void>((resolve) => maintenanceAdmin!.close(() => resolve()));
+  });
+  const requireLocalAdmin = (req: FastifyRequest) => {
+    const site = siteFor(req.headers, config);
+    const origin = site && new URL(site.origin);
+    const port = origin && Number(origin.port || (origin.protocol === 'https:' ? 443 : 80));
+    if (!site?.local || !config.localListener || req.raw.socket.localPort !== config.localListener.port
+      || port !== config.localListener.port) {
+      throw new UserFacingError('Maintenance administration is only available on this PC.', 403);
+    }
+    requireDesktopChange(req);
+  };
+  app.put('/api/bridge/maintenance', async (req) => {
+    requireLocalAdmin(req);
+    new BackgroundGate(config.role).require();
+    return maintenance.set(z.object({ held: z.boolean() }).strict().parse(req.body).held);
+  });
+  app.get('/api/bridge/quiet', async (req) => {
+    requireLocalAdmin(req);
+    const report = await quiet();
+    requireLocalAdmin(req);
+    return report;
+  });
   app.get('/api/bridge', async (): Promise<BridgeStatus> =>
-    deps.bridge?.status() ?? { enabled: false, paused: false, recent: { sent: 0, queued: 0, started: 0 } },
+    ({ ...(deps.bridge?.status() ?? { enabled: false, paused: false, recent: { sent: 0, queued: 0, started: 0 } }), maintenance: maintenance.isHeld() }),
   );
 
   app.put('/api/bridge', async (req): Promise<BridgeStatus> => {
@@ -1727,6 +1775,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
     hub.sendTo(client, {
       type: 'hello',
+      maintenance: maintenance.isHeld(),
       ...(identity ? { email: identity.email } : {}),
       ...(device ? { device } : {}),
       statuses: statuses(),

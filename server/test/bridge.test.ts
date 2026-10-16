@@ -1505,7 +1505,7 @@ describe('app: /api/bridge', () => {
     expect((await instance.inject({ url: '/api/bridge', headers: { host, 'x-signalbox-request': '1' } })).statusCode).toBe(401);
     const get = await instance.inject({ url: '/api/bridge', headers: apiHeaders(accessToken) });
     expect(get.statusCode).toBe(200);
-    expect(get.json()).toEqual({ enabled: true, paused: false, port: PORT, recent: { sent: 0, queued: 0, started: 0 } });
+    expect(get.json()).toEqual({ enabled: true, paused: false, maintenance: false, port: PORT, recent: { sent: 0, queued: 0, started: 0 } });
 
     const { origin: _origin, ...noOrigin } = postHeaders(accessToken);
     expect((await put({ paused: true }, noOrigin)).statusCode).toBe(403);
@@ -1524,7 +1524,7 @@ describe('app: /api/bridge', () => {
   it('reports the bridge as off when the config leaves it off', async () => {
     const { instance, put } = await app(false);
     const get = await instance.inject({ url: '/api/bridge', headers: apiHeaders(accessToken) });
-    expect(get.json()).toEqual({ enabled: false, paused: false, recent: { sent: 0, queued: 0, started: 0 } });
+    expect(get.json()).toEqual({ enabled: false, paused: false, maintenance: false, recent: { sent: 0, queued: 0, started: 0 } });
     const res = await put({ paused: true });
     expect(res.statusCode).toBe(409);
     expect(res.json()).toEqual({ error: 'The Wayroost bridge is turned off in the server config.' });

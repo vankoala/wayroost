@@ -899,11 +899,85 @@ export class HermesAdapter implements HermesSource {
     }, delay);
   }
 
-  // No activeTurns() count: /api/status normalizes missing or invalid runtime counts
-  // to zero, and gateway_running=false also covers failed identity probes. Neither
-  // it nor session.active_list establishes host-wide activity: independent desktop
-  // backends have their own session registries. busy.ts keeps an unavailable count
-  // unknown until Hermes offers authoritative evidence covering every backend.
+  /** Fresh activity counts from complete stored session listings and outstanding approvals. */
+  async activitySnapshot(): Promise<{ complete: boolean; runningTasks: number; openApprovalPrompts: number;
+    conversations: Array<Pick<ConversationSummary, 'source' | 'id' | 'status' | 'pendingApprovals'>>; isCurrent(): boolean }> {
+    const status = this.status();
+    const generation = this.gateway.generation;
+    const attachments = this.attachmentGeneration;
+    const revision = this.activityRevision;
+    const listRevision = this.listRevision;
+    const subagentRevision = this.subagentRevision;
+    if (status.state !== 'connected' || this.gateway.state !== 'ready') throw new Error('hermes_activity_unavailable');
+    const isCurrent = () => this.status() === status && this.gateway.state === 'ready' && this.gateway.generation === generation &&
+      this.attachmentGeneration === attachments && this.activityRevision === revision &&
+      this.listRevision === listRevision && this.subagentRevision === subagentRevision && !this.attaching.size;
+    const requireVisibility = async () => {
+      const config = await this.auth.json<{ sessions?: unknown }>('/api/config');
+      const sessions = config?.sessions;
+      if (!isCurrent() || typeof sessions !== 'object' || sessions === null || !('show_subagents' in sessions) ||
+          sessions.show_subagents !== true) throw new Error('hermes_activity_unavailable');
+    };
+    const readPages = async (query: string, limit: number): Promise<HermesSessionRow[]> => {
+      const rows: HermesSessionRow[] = [];
+      const seen = new Set<string>();
+      let total: number | undefined;
+      for (let page = 0; page < TIDY_PAGES; page++) {
+        const data = await this.auth.json<{ sessions?: HermesSessionRow[]; total?: number; storage?: unknown }>(`${query}&offset=${page * limit}`);
+        if (!isCurrent()) throw new Error('hermes_activity_unavailable');
+        if (!Array.isArray(data?.sessions) || data.sessions.length > limit || typeof data.total !== 'number' ||
+            !Number.isSafeInteger(data.total) || data.total < 0 || total !== undefined && data.total !== total) {
+          throw new Error('hermes_listing_incomplete');
+        }
+        total = data.total;
+        if (data.storage !== undefined && (typeof data.storage !== 'object' || data.storage === null ||
+            Array.isArray(data.storage) || Object.keys(data.storage).length)) throw new Error('hermes_activity_unavailable');
+        // Each page applies the effective visibility setting independently.
+        await requireVisibility();
+        for (const row of data.sessions) {
+          if (!row || typeof row.id !== 'string' || !row.id || seen.has(row.id)) throw new Error('hermes_listing_incomplete');
+          seen.add(row.id);
+          rows.push(row);
+        }
+        if (rows.length > total) throw new Error('hermes_listing_incomplete');
+        if (data.sessions.length < limit) {
+          if (rows.length !== total) throw new Error('hermes_listing_incomplete');
+          return rows;
+        }
+      }
+      throw new Error('hermes_listing_incomplete');
+    };
+    await requireVisibility();
+    const activityQuery = '/api/sessions?order=recent&archived=include&min_messages=0';
+    const [listed, runs] = await Promise.all([
+      readPages(`${activityQuery}&limit=60`, 60),
+      readPages(`${activityQuery}&limit=100&exclude_sources=subagent`, 100),
+    ]);
+    await requireVisibility();
+    if (!isCurrent()) throw new Error('hermes_activity_unavailable');
+    const running = new Set<string>();
+    for (const row of [...listed, ...runs]) {
+      if (row.ended_at != null && (typeof row.ended_at !== 'number' || !Number.isFinite(row.ended_at) || row.ended_at < 0)) {
+        throw new Error('hermes_activity_unavailable');
+      }
+      const stored = this.resolveChat(row.id);
+      // Neither a recent-write flag nor an idle runtime proves a stored run finished.
+      if (row.ended_at == null) {
+        if (row.is_active !== true) throw new Error('hermes_activity_unavailable');
+        running.add(stored);
+      }
+    }
+    for (const stored of this.turns.keys()) running.add(this.resolveChat(stored));
+    const approvals = this.listApprovals();
+    for (const approval of approvals) running.add(this.resolveChat(approval.conversationId));
+    const openApprovalPrompts = approvals.length;
+    const ids = new Set([...listed, ...runs].map((row) => this.resolveChat(row.id)));
+    for (const id of running) ids.add(id);
+    const conversations = [...ids].map((id) => ({ source: 'hermes' as const, id,
+      status: running.has(id) ? 'running' as const : 'idle' as const,
+      pendingApprovals: approvals.filter((approval) => this.resolveChat(approval.conversationId) === id).length }));
+    return { complete: true, runningTasks: running.size, openApprovalPrompts, conversations, isCurrent };
+  }
 
   /**
    * What Hermes' live sessions are doing. Also the safety net for cards: a

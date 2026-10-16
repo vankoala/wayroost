@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { shadowBackground, type BackgroundGate } from '../background.js';
@@ -9,6 +9,18 @@ import { shadowBackground, type BackgroundGate } from '../background.js';
 
 export const BRIDGE_TOKEN_FILE = 'bridge-token';
 const TOKEN = /^[A-Za-z0-9_-]{32,512}$/;
+const stateDirectories = new Map<string, string>();
+const tokenKey = (token: string) => createHash('sha256').update(token).digest('hex');
+
+/** The listener restores its admission hold from the same state directory as its token. */
+export function bridgeStateDirectory(token: string): string | undefined {
+  return stateDirectories.get(tokenKey(token));
+}
+
+function remember(token: string, stateDir: string): string {
+  stateDirectories.set(tokenKey(token), stateDir);
+  return token;
+}
 
 /** Read the token, creating 32 random bytes (base64url, mode 0600) on first start. */
 export function readOrCreateBridgeToken(stateDir: string, background: BackgroundGate = shadowBackground): string {
@@ -23,7 +35,7 @@ export function readOrCreateBridgeToken(stateDir: string, background: Background
   if (existing !== undefined) {
     if (!TOKEN.test(existing)) throw new Error(`${path} doesn't hold a usable bridge token; delete it to make a new one.`);
     if ((statSync(path).mode & 0o077) !== 0) chmodSync(path, 0o600);
-    return existing;
+    return remember(existing, stateDir);
   }
   const token = randomBytes(32).toString('base64url');
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
@@ -34,5 +46,5 @@ export function readOrCreateBridgeToken(stateDir: string, background: Background
     if ((err as NodeJS.ErrnoException).code === 'EEXIST') return readOrCreateBridgeToken(stateDir, background);
     throw err;
   }
-  return token;
+  return remember(token, stateDir);
 }

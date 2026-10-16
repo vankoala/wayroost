@@ -1420,6 +1420,17 @@ describe('server modes', () => {
     f.success('server', 'verify');
   });
 
+  it('explains a missing Node when publishing the CLI', () => {
+    const f = fixture();
+    // Only the tools the installer needs, so no node is found on PATH.
+    const tools = join(f.folder, 'tools');
+    mkdirSync(tools);
+    for (const tool of ['bash', 'python3', 'readlink', 'dirname', 'env']) symlinkSync(`/usr/bin/${tool}`, join(tools, tool));
+    const result = f.invoke('server', 'plan', ['--primary'], { PATH: `${f.binaries}:${tools}` });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Publishing the wayroost CLI needs Node.js 22 or newer on PATH.');
+  });
+
   it('preserves template paths inserted into the server prefix', () => {
     const f = fixture();
     const prefix = `/opt/wayroost/demo${hostPaths.config}/config.json/server`;
@@ -1517,6 +1528,254 @@ server_node(sys.argv[1])
     f.success('server', 'reverse');
     expect(readFileSync(config)).toEqual(contents);
     expect(existsSync(f.target('server'))).toBe(false);
+  });
+
+  it.each(['fresh', 'older'] as const)('receipts the maintenance wrapper for a %s primary installation and reverses it exactly', previous => {
+    const f = fixture();
+    const wrapper = join(f.root, 'usr/local/sbin/wayroost');
+    const original = '#!/bin/bash -p\ncase "$1" in pair) exit 0 ;; *) exit 2 ;; esac\n';
+    if (previous === 'older') {
+      mkdirSync(join(wrapper, '..'), { recursive: true });
+      writeFileSync(wrapper, original, { mode: 0o700 });
+    }
+    const options = ['--publish-unit', '--publish-config', '--config-source', f.sourceConfig];
+    f.success('server', 'plan', options);
+    expect(existsSync(wrapper)).toBe(previous === 'older');
+    if (previous === 'older') expect(readFileSync(wrapper, 'utf8')).toBe(original);
+    f.success('server', 'forward', options);
+    f.success('server', 'verify');
+    const contents = readFileSync(wrapper, 'utf8');
+    expect(contents).toContain('hold|release|quiet)');
+    expect(contents).toContain(`CONFIG='${hostPaths.config}/config.json'`);
+    expect(contents).toContain("PAIR_CODE='/opt/wayroost/server/dist/server/pair-code.js'");
+    expect(contents).toContain("ID='/usr/bin/id'");
+    expect(contents).not.toMatch(/@(NODE|PAIR_CODE|CONFIG|ID)@/);
+    expect(statSync(wrapper).mode & 0o777).toBe(0o750);
+    const receipt = JSON.parse(readFileSync(f.receipt('server'), 'utf8'));
+    const entry = receipt.paths.find((item: { path: string }) => item.path === wrapper);
+    expect(entry.new.hash).toBe(hash(contents));
+    expect(entry.old?.hash ?? null).toBe(previous === 'older' ? hash(original) : null);
+    expect(readFileSync(f.calls, 'utf8')).not.toMatch(/\b(enable|start|stop|restart)\b/);
+    f.success('server', 'reverse');
+    f.success('server', 'verify');
+    expect(existsSync(wrapper)).toBe(previous === 'older');
+    if (previous === 'older') {
+      expect(readFileSync(wrapper, 'utf8')).toBe(original);
+      expect(statSync(wrapper).mode & 0o777).toBe(0o700);
+    }
+  });
+
+  it.each([false, true])('updates the primary wrapper using selected paths without service actions; publish unit: %s', publishUnit => {
+    const f = fixture();
+    f.defaults.server = f.server;
+    const wrapper = join(f.root, 'usr/local/sbin/wayroost');
+    const original = '#!/bin/bash -p\nexit 2\n';
+    mkdirSync(join(wrapper, '..'), { recursive: true });
+    writeFileSync(wrapper, original, { mode: 0o740 });
+    const executable = join(f.binaries, 'node');
+    writeFileSync(executable, '#!/bin/sh\nexit 94\n', { mode: 0o755 });
+    const unit = join(f.root, 'etc/systemd/system/wayroost-server.service');
+    const originalUnit = `[Service]\nEnvironment=WAYROOST_ROLE=primary\nExecStart=/opt/installed-node/bin/node /srv/demo-server/dist/server/index.js\n`;
+    mkdirSync(join(unit, '..'), { recursive: true });
+    writeFileSync(unit, originalUnit);
+    const config = '/etc/demo-wayroost/primary.json';
+    const options = ['--update-artifacts', '--publish-cli', '--prefix', '/srv/demo-server', '--config-path', config,
+      ...(publishUnit ? ['--primary', '--publish-unit'] : [])];
+    f.success('server', 'forward', options);
+    f.success('server', 'forward', options);
+    f.success('server', 'verify');
+    const contents = readFileSync(wrapper, 'utf8');
+    expect(contents).toContain(`NODE='${executable}'`);
+    expect(contents).toContain(`CONFIG='${config}'`);
+    expect(contents).toContain("PAIR_CODE='/srv/demo-server/dist/server/pair-code.js'");
+    expect(contents).toContain('hold|release|quiet)');
+    if (!publishUnit) {
+      expect(readFileSync(unit, 'utf8')).toBe(originalUnit);
+      expect(readFileSync(f.calls, 'utf8')).toBe('');
+    }
+    expect(readFileSync(f.calls, 'utf8')).not.toMatch(/\b(enable|start|stop|restart)\b/);
+    f.success('server', 'reverse');
+    expect(readFileSync(wrapper, 'utf8')).toBe(original);
+    expect(statSync(wrapper).mode & 0o777).toBe(0o740);
+    expect(readFileSync(unit, 'utf8')).toBe(originalUnit);
+  });
+
+  it('refuses a wrapper edit before reversing any primary publications', () => {
+    const f = fixture();
+    f.success('server', 'forward');
+    const wrapper = join(f.root, 'usr/local/sbin/wayroost');
+    writeFileSync(wrapper, '#!/bin/bash -p\nexit 3\n');
+    expect(f.invoke('server', 'verify').status).toBe(1);
+    expect(f.invoke('server', 'reverse').status).toBe(1);
+    expect(existsSync(f.target('server'))).toBe(true);
+  });
+
+  it.each(['primary', 'shadow', 'environment file', 'unset environment', 'command prefix', 'empty mask', 'null mask', 'unit symlink', 'drop-in symlink']
+    .flatMap(installation => [false, true].map(present => ({ installation, present }))))
+  ('preserves wrapper presence=$present during role-less artifact updates with $installation', ({ installation, present }) => {
+    const f = fixture();
+    f.defaults.server = f.server;
+    const wrapper = join(f.root, 'usr/local/sbin/wayroost');
+    const original = '#!/bin/bash -p\nexit 2\n';
+    if (present) {
+      mkdirSync(join(wrapper, '..'), { recursive: true });
+      writeFileSync(wrapper, original, { mode: 0o740 });
+    }
+    const unit = join(f.root, 'etc/systemd/system/wayroost-server.service');
+    mkdirSync(join(unit, '..'), { recursive: true });
+    const directives = installation === 'shadow' ? 'Environment=WAYROOST_ROLE=shadow\n'
+      : installation === 'environment file' ? 'EnvironmentFile=/etc/example/role.env\n'
+      : installation === 'unset environment' ? 'UnsetEnvironment=WAYROOST_ROLE\n' : '';
+    if (installation === 'environment file') {
+      mkdirSync(join(f.root, 'etc/example'));
+      writeFileSync(join(f.root, 'etc/example/role.env'), 'WAYROOST_ROLE=shadow\n');
+    }
+    const originalUnit = installation === 'empty mask' ? '' : `[Service]\nEnvironment=WAYROOST_ROLE=primary\n${directives}ExecStart=${installation === 'command prefix' ? '-' : ''}/opt/installed-node/bin/node /srv/demo-server/dist/server/index.js\n`;
+    const outside = join(f.folder, 'outside-unit');
+    if (installation === 'null mask') symlinkSync('/dev/null', unit);
+    else if (installation === 'unit symlink') {
+      writeFileSync(outside, originalUnit);
+      symlinkSync(outside, unit);
+    } else writeFileSync(unit, originalUnit);
+    const dropIn = join(unit + '.d', '50-role.conf');
+    mkdirSync(join(dropIn, '..'));
+    if (installation === 'drop-in symlink') {
+      writeFileSync(outside, 'Environment=WAYROOST_ROLE=shadow\n');
+      symlinkSync(outside, dropIn);
+    } else writeFileSync(dropIn, `[Service]\nEnvironment=WAYROOST_ROLE=primary\n${installation === 'command prefix' ? '' : 'ExecStart=/opt/override-node/bin/node /srv/demo-server/dist/server/index.js\n'}`);
+    const unitBefore = lstatSync(unit);
+    const dropInBefore = lstatSync(dropIn);
+    const wrapperBefore = present ? statSync(wrapper) : undefined;
+    for (const mode of ['plan', 'forward', 'forward', 'verify', 'reverse', 'verify']) {
+      f.success('server', mode, ['--update-artifacts']);
+      expect(existsSync(wrapper)).toBe(present);
+      if (present) {
+        expect(readFileSync(wrapper, 'utf8')).toBe(original);
+        expect(statSync(wrapper)).toMatchObject({ ino: wrapperBefore!.ino, mode: wrapperBefore!.mode,
+          uid: wrapperBefore!.uid, gid: wrapperBefore!.gid, mtimeMs: wrapperBefore!.mtimeMs });
+      }
+      expect(lstatSync(unit)).toMatchObject({ ino: unitBefore.ino, mode: unitBefore.mode });
+      expect(lstatSync(dropIn)).toMatchObject({ ino: dropInBefore.ino, mode: dropInBefore.mode });
+      expect(readFileSync(unit, 'utf8')).toBe(installation === 'null mask' ? '' : originalUnit);
+    }
+    const receipt = JSON.parse(readFileSync(f.receipt('server'), 'utf8'));
+    expect(receipt.paths.some((entry: { path: string }) => entry.path === wrapper || entry.path === unit)).toBe(false);
+    expect(readFileSync(f.calls, 'utf8')).toBe('');
+    expect(existsSync(f.target('server'))).toBe(false);
+  });
+
+  it.each(['primary', 'flag', 'update flag'])('publishes the CLI only from invocation paths: %s', selection => {
+    const f = fixture();
+    f.defaults.server = f.server;
+    const executable = join(f.binaries, 'node');
+    writeFileSync(executable, '#!/bin/sh\nexit 94\n', { mode: 0o755 });
+    const unit = join(f.root, 'etc/systemd/system/wayroost-server.service');
+    mkdirSync(join(unit, '..'), { recursive: true });
+    symlinkSync('/dev/null', unit);
+    mkdirSync(unit + '.d');
+    symlinkSync('/absent-demo.conf', join(unit + '.d', '50-node.conf'));
+    const options = [...(selection === 'primary' ? ['--primary', '--publish-cli'] : selection === 'flag' ? ['--publish-cli'] : ['--update-artifacts', '--publish-cli']),
+      '--prefix', '/srv/demo-server', '--config-path', '/etc/example-primary/config.json'];
+    const wrapper = join(f.root, 'usr/local/sbin/wayroost');
+    f.success('server', 'plan', options);
+    expect(existsSync(wrapper)).toBe(false);
+    f.success('server', 'forward', options);
+    f.success('server', 'forward', options);
+    f.success('server', 'verify');
+    const contents = readFileSync(wrapper, 'utf8');
+    expect(contents).toContain(`NODE='${executable}'`);
+    expect(contents).toContain("PAIR_CODE='/srv/demo-server/dist/server/pair-code.js'");
+    expect(contents).toContain("CONFIG='/etc/example-primary/config.json'");
+    expect(contents).toContain('hold|release|quiet)');
+    f.success('server', 'reverse');
+    f.success('server', 'verify');
+    expect(existsSync(wrapper)).toBe(false);
+    expect(readlinkSync(unit)).toBe('/dev/null');
+    expect(readFileSync(f.calls, 'utf8')).toBe('');
+  });
+
+  it.each(['plan', 'forward'])('refuses explicit CLI publication for a shadow in %s mode', mode => {
+    const f = fixture();
+    f.defaults.server = [...f.server, '--role', 'shadow'];
+    const result = f.invoke('server', mode, ['--publish-cli', '--update-artifacts']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--publish-cli cannot be used with --role shadow.');
+    expect(existsSync(f.receipt('server'))).toBe(false);
+    expect(existsSync(f.target('server'))).toBe(false);
+    expect(readFileSync(f.calls, 'utf8')).toBe('');
+  });
+
+  it.each(['unit', 'wrapper'])('refuses symlinks at the published %s path', kind => {
+    const f = fixture();
+    const path = join(f.root, kind === 'unit' ? 'etc/systemd/system/wayroost-server.service' : 'usr/local/sbin/wayroost');
+    mkdirSync(join(path, '..'), { recursive: true });
+    symlinkSync('/dev/null', path);
+    const result = f.invoke('server', 'forward', kind === 'unit' ? ['--publish-unit'] : ['--publish-cli']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Refusing a symlink in a deployment path.');
+    expect(readlinkSync(path)).toBe('/dev/null');
+    expect(existsSync(f.target('server'))).toBe(false);
+  });
+
+  it.each(['before', 'after'] as const)('resumes primary wrapper publication interrupted %s its atomic replacement', boundary => {
+    const f = fixture();
+    const wrapper = join(f.root, 'usr/local/sbin/wayroost');
+    const original = '#!/bin/bash -p\nexit 2\n';
+    mkdirSync(join(wrapper, '..'), { recursive: true });
+    writeFileSync(wrapper, original, { mode: 0o700 });
+    const replace = '        os.replace(temporary, path)';
+    const interrupt = `        if path == Path(${JSON.stringify(wrapper)}): os._exit(77)`;
+    pythonShim(f, [[replace, boundary === 'before' ? `${interrupt}\n${replace}` : `${replace}\n${interrupt}`]]);
+    const result = f.invoke('server', 'forward');
+    expect(result.status, result.stderr).toBe(77);
+    expect(readFileSync(wrapper, 'utf8') === original).toBe(boundary === 'before');
+    expect(JSON.parse(readFileSync(f.receipt('server'), 'utf8')).status).toBe('applying');
+    rmSync(join(f.binaries, 'python3'));
+    f.success('server', 'forward');
+    f.success('server', 'verify');
+    expect(readFileSync(wrapper, 'utf8')).toContain('hold|release|quiet)');
+    f.success('server', 'reverse');
+    expect(readFileSync(wrapper, 'utf8')).toBe(original);
+    expect(statSync(wrapper).mode & 0o777).toBe(0o700);
+  });
+
+  it('preserves shell delimiters and template markers literally in wrapper paths', () => {
+    const f = fixture();
+    const executable = join(f.binaries, 'demo-@CONFIG@', 'node');
+    mkdirSync(join(executable, '..'));
+    writeFileSync(executable, '#!/bin/sh\nexit 94\n', { mode: 0o755 });
+    const unit = join(f.root, 'etc/systemd/system/wayroost-server.service');
+    mkdirSync(join(unit, '..'), { recursive: true });
+    writeFileSync(unit, `[Service]\nExecStart=${executable} /srv/demo-server/dist/server/index.js\n`);
+    const prefix = "/srv/demo'$(printf demo)@CONFIG@";
+    const config = "/etc/demo'$(printf demo)@NODE@/primary.json";
+    const options = ['--prefix', prefix, '--config-path', config];
+    const resultWithPaths = f.invoke('server', 'forward', options, { PATH: `${join(executable, '..')}:${f.environmentFor().PATH}` });
+    expect(resultWithPaths.status, resultWithPaths.stderr).toBe(0);
+    const contents = readFileSync(join(f.root, 'usr/local/sbin/wayroost'), 'utf8');
+    const assignments = contents.split('\nusage()')[0]!;
+    const result = spawnSync('/bin/bash', ['-p', '-c', assignments + '\nprintf "%s\\0" "$NODE" "$PAIR_CODE" "$CONFIG" "$ID"'], { encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.split('\0')).toEqual([executable, `${prefix}/dist/server/pair-code.js`, config, '/usr/bin/id', '']);
+    f.success('server', 'reverse');
+  });
+
+  it.each(['fresh', 'installed'] as const)('preserves a %s wrapper during explicit shadow publication', previous => {
+    const f = fixture();
+    f.defaults.server = [...f.server, '--role', 'shadow'];
+    const wrapper = join(f.root, 'usr/local/sbin/wayroost');
+    const original = '#!/bin/bash -p\nexit 2\n';
+    if (previous === 'installed') {
+      mkdirSync(join(wrapper, '..'), { recursive: true });
+      writeFileSync(wrapper, original, { mode: 0o700 });
+    }
+    f.success('server', 'forward', ['--update-artifacts', '--publish-unit']);
+    f.success('server', 'verify');
+    expect(existsSync(wrapper)).toBe(previous === 'installed');
+    if (previous === 'installed') expect(readFileSync(wrapper, 'utf8')).toBe(original);
+    f.success('server', 'reverse');
+    expect(existsSync(wrapper)).toBe(previous === 'installed');
+    if (previous === 'installed') expect(readFileSync(wrapper, 'utf8')).toBe(original);
   });
 
   it('publishes prepared primary config and unit only by flags and restarts only when requested', () => {
@@ -1645,7 +1904,7 @@ print('PASS reverse creation ownership recovered')
     expect(existsSync(f.target('helper'))).toBe(false);
   });
 
-  it.each(['install-wayroost-runtime.sh', 'setup-wayroost-helper.sh', 'install-wayroost-server.sh', 'wayroost-lib.sh', 'lib.sh', 'wayroost-helper.service', 'wayroost-server.service'])('requires trusted ownership and ancestors for %s', name => {
+  it.each(['install-wayroost-runtime.sh', 'setup-wayroost-helper.sh', 'install-wayroost-server.sh', 'wayroost-lib.sh', 'lib.sh', 'wayroost-helper.service', 'wayroost-server.service', 'wayroost.sh'])('requires trusted ownership and ancestors for %s', name => {
     const f = fixture();
     const directory = join(f.folder, 'installer');
     mkdirSync(directory, { mode: 0o755 });
@@ -1706,6 +1965,7 @@ trusted_file(Path(sys.argv[1]))
     const installer = join(f.folder, 'installer');
     const deploy = join(installer, 'deploy');
     mkdirSync(deploy, { recursive: true });
+    if (kind === 'server') writeFileSync(join(deploy, 'wayroost.sh'), readFileSync('deploy/wayroost.sh'), { mode: 0o644 });
     writeFileSync(join(deploy, `wayroost-${kind}.service`), '[Service]\nExecStartPre=+/bin/false\n', { mode: 0o666 });
     pythonShim(f, [['if not root:\n                trusted_file(path)', 'trusted_file(path)']], `sys.argv[1] = ${JSON.stringify(installer)}`);
     const result = f.invoke(kind, 'forward', kind === 'server' ? ['--publish-unit'] : []);

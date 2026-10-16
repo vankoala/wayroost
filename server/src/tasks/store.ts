@@ -1,5 +1,5 @@
 import { checkDeviceSignal } from '../security/device-signal.js';
-import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { accessSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ChatIdentity } from '../hermes/identity.js';
 import type { Logger } from '../hermes/adapter.js';
@@ -105,17 +105,51 @@ export class TaskStore {
   private readonly pendingMoves = new Map<string, { from: TaskState; next: TaskRecord }>();
   private baselines: TaskRecord[];
   private dirty = false;
+  private quietAvailable = true;
+  private readonly quietPath: string;
+  private quietFailureSaved = false;
 
   constructor(
-    stateDir: string,
+    readonly stateDir: string,
     private readonly now: () => number = Date.now,
     readonly chatIdentity = new ChatIdentity(stateDir),
     private readonly log: Pick<Logger, 'info' | 'warn'> = console,
   ) {
     this.path = join(stateDir, FILE);
+    this.quietPath = join(stateDir, 'tasks-quiet.json');
+    try {
+      accessSync(this.quietPath);
+      this.quietAvailable = false;
+      this.quietFailureSaved = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.quietAvailable = false;
+    }
     this.history = new TaskHistory(stateDir, now, log);
     this.file = this.load();
     this.baselines = structuredClone(this.file.tasks);
+    if (!this.quietAvailable) {
+      try { this.saveQuietFailure(); }
+      catch { this.log.warn({ reason: 'tasks_unavailable' }, 'task log: quiet evidence could not be saved'); }
+    }
+  }
+
+  /** Lost records stay unknown even if ordinary tracking replaces the ledger. */
+  private saveQuietFailure(): void {
+    if (this.quietFailureSaved) return;
+    let fd: number | undefined;
+    try { fd = openSync(this.quietPath, 'wx', 0o600); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw new Error('tasks_unavailable');
+    }
+    if (fd !== undefined) {
+      try {
+        writeFileSync(fd, '{"reason":"tasks_unavailable"}');
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+    }
+    const directory = openSync(this.stateDir, 'r');
+    try { fsyncSync(directory); } finally { closeSync(directory); }
+    this.quietFailureSaved = true;
   }
 
   private load(): TaskFile {
@@ -150,6 +184,7 @@ export class TaskStore {
               ),
           )
         : [];
+      if (!Array.isArray(raw.tasks) || tasks.length !== raw.tasks.length) this.quietAvailable = false;
       for (const task of tasks) {
         this.savedTasks.set(task.id, structuredClone(task));
         for (const relay of task.relays) {
@@ -171,8 +206,10 @@ export class TaskStore {
         ? raw.bridgeStarts.filter((start) => start && typeof start.id === 'string' && WORKER_ID.test(start.id) &&
             typeof start.chat === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(start.chat) && Number.isFinite(start.at))
         : [];
+      if (raw.bridgeStarts !== undefined && (!Array.isArray(raw.bridgeStarts) || bridgeStarts.length !== raw.bridgeStarts.length)) this.quietAvailable = false;
       return { tasks, bridgeStarts, ...(typeof raw.aliveAt === 'number' ? { aliveAt: raw.aliveAt } : {}) };
-    } catch {
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.quietAvailable = false;
       return { tasks: [] };
     }
   }
@@ -188,6 +225,19 @@ export class TaskStore {
 
   all(): readonly TaskRecord[] {
     return this.file.tasks;
+  }
+
+  /** Failed ledger and history operations cannot establish an empty drain. */
+  canCheckQuiet(): boolean { return this.quietAvailable && this.history.canCheckQuiet(); }
+
+  private recordHistory(write: () => void): void {
+    try { write(); }
+    catch (err) {
+      this.quietAvailable = false;
+      try { this.saveQuietFailure(); }
+      catch { this.log.warn({ reason: 'tasks_unavailable' }, 'task log: quiet evidence could not be saved'); }
+      throw err;
+    }
   }
 
   bridgeChat(id: string): string | undefined {
@@ -207,8 +257,10 @@ export class TaskStore {
 
   add(task: TaskRecord): TaskRecord {
     checkDeviceSignal();
-    this.writeBaselines();
-    this.history.append(task, null, true);
+    this.recordHistory(() => {
+      this.writeBaselines();
+      this.history.append(task, null, true);
+    });
     this.file.tasks.push(task);
     this.changed();
     return task;
@@ -217,12 +269,12 @@ export class TaskStore {
   /** The single status mutation point: publish metadata before changing the durable record. */
   move(task: TaskRecord, state: TaskState, now: number): void {
     checkDeviceSignal();
-    this.writeBaselines();
+    this.recordHistory(() => this.writeBaselines());
     const pending = this.pendingMoves.get(task.id);
     if (!pending || pending.from !== task.status || pending.next.status !== state) {
       this.pendingMoves.delete(task.id);
-      this.history.baseline(task);
-    } else if (!this.history.recorded(pending.next, pending.from)) this.history.baseline(task);
+      this.recordHistory(() => this.history.baseline(task));
+    } else if (!this.history.recorded(pending.next, pending.from)) this.recordHistory(() => this.history.baseline(task));
     if (task.status === state) return;
     const next = pending?.from === task.status && pending.next.status === state ? pending.next : { ...task };
     if (next !== pending?.next) {
@@ -245,7 +297,7 @@ export class TaskStore {
       next.lastSeen = now;
     }
     this.pendingMoves.set(task.id, { from: task.status, next });
-    this.history.append(next, task.status);
+    this.recordHistory(() => this.history.append(next, task.status));
     this.pendingMoves.delete(task.id);
     // Assigning alone would leave optional fields that the new run cleared.
     for (const key of ['finishedAt', 'unseenFrom', 'baseline', 'feedKey'] as const) {
@@ -282,6 +334,7 @@ export class TaskStore {
   /** Write if anything changed, noting the task log ran now. Forgets old records first. */
   save(force = false): void {
     checkDeviceSignal();
+    if (!this.quietAvailable) this.saveQuietFailure();
     try { this.writeBaselines(); this.history.retain(); }
     catch { checkDeviceSignal(); this.log.warn({}, 'task log: history retention failed; task records will still be saved'); }
     const now = this.now();

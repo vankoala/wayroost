@@ -1,3 +1,5 @@
+import { TaskAdmissions, type CompletionEvidence } from './admission.js';
+import { MaintenanceError } from '../bridge/maintenance.js';
 import { INVISIBLE } from '../../../shared/invisible.js';
 import type { ConversationSummary, ServerEvent, TaskList } from '../../../shared/protocol.js';
 import type { BackgroundGate } from '../background.js';
@@ -70,6 +72,8 @@ export interface TaskRelayDeps {
   /** Paseo's agents, as the adapter last heard of them. */
   workers: {
     readonly agentsLoaded: boolean;
+    readonly revision?: unknown;
+    completionEvidence?(id: string): Promise<CompletionEvidence | undefined>;
     workerSnapshot(id: string): WorkerSnapshot | undefined;
     workerSnapshots(): WorkerSnapshot[];
     /** Ask Paseo about a worker missing from its list (archived ones too): null if it's gone, throws if Paseo can't be asked. */
@@ -92,7 +96,7 @@ export interface TaskRelayDeps {
     deliverSystem(message: SystemMessage): 'queued' | 'already queued' | 'full';
     withdrawSystem(key: string): boolean;
     watch(observer: BridgeObserver): void;
-    status(): { paused: boolean };
+    status(): { paused: boolean; maintenance?: boolean };
   };
   hub: { observe(observer: (event: ServerEvent) => void): void };
   feed?: { ingest(source: 'agent', cards: CardInput[]): unknown; close(key: string): void };
@@ -168,6 +172,7 @@ export class TaskRelay {
   private readonly starts = new Map<string, Map<string, { process: BackgroundProcess; at: number }>>();
   /** One read per chat per round (several workers often share a chat). */
   private rowsThisTick: Map<string, Promise<HermesMessageRow[]>> | undefined;
+  private rowsRevisionThisTick: Map<string, number> | undefined;
   private cappedNoted = false;
   /** Workers Paseo reports as stored-but-running (stale): since when. */
   private readonly staleSince = new Map<string, number>();
@@ -176,15 +181,23 @@ export class TaskRelay {
   /** Unverified workers: when they were last checked, and in which state. */
   private readonly checked = new Map<string, { at: number; state: string }>();
   private readonly failedWorkers = new Set<string>();
+  private readonly deferredWorkers = new Set<string>();
   /** Failed writes and restored pending updates wait until reconciliation succeeds. */
   private readonly unreconciledWorkers = new Set<string>();
+  private readonly proofUnread = new Map<string, number>();
+  private proofRevision = 0;
+  private readonly admissions: TaskAdmissions;
 
   constructor(private readonly deps: TaskRelayDeps) {
+    this.admissions = new TaskAdmissions(deps.store.stateDir);
     this.now = deps.now ?? Date.now;
     this.startedAt = this.now();
     this.aliveBefore = deps.store.aliveAt;
     // Even an absent queue record may mean its save failed before a restart.
-    for (const task of deps.store.all()) this.unreconciledWorkers.add(task.id);
+    for (const task of deps.store.all()) {
+      this.unreconciledWorkers.add(task.id);
+      if (!task.verified && !task.baseline) this.proofUnread.set(task.id, ++this.proofRevision);
+    }
   }
 
   status(): TaskList {
@@ -210,6 +223,24 @@ export class TaskRelay {
     })) };
   }
 
+  /** Read-only drain counts include updates still inside their grace period. */
+  quietCounts(): { pendingRelays: number; runningTaskIds: string[]; reasons?: string[] } {
+    let pendingRelays = this.deps.store.bridgeStarts().filter((start) => !this.deps.store.get(start.id)).length;
+    const followups = this.admissions.quiet(this.deps.workers.revision);
+    const running = new Set(followups.ids);
+    for (const task of this.deps.store.all()) {
+      if (!ENDED.has(task.status)) running.add(task.id);
+      pendingRelays += task.relays.filter((relay) => relay.deliveredAt === undefined && !relay.skipped).length;
+      const update = this.currentUpdate(task);
+      if (task.verified && !task.baseline && update && !task.relays.some((relay) => relay.id === update)) pendingRelays++;
+    }
+    const reasons = [...(!this.deps.store.canCheckQuiet() ? ['tasks_unavailable'] : []),
+      ...(this.unreconciledWorkers.size || this.proofUnread.size || this.deferredWorkers.size ? ['tasks_unreconciled'] : []), ...followups.reasons,
+      ...(this.deps.store.all().some((task) => task.relays.some((relay) => relay.held === 'relay_admission_unverified' &&
+        relay.deliveredAt === undefined && !relay.skipped)) ? ['relay_admission_unverified'] : [])];
+    return { pendingRelays, runningTaskIds: [...running], ...(reasons.length ? { reasons } : {}) };
+  }
+
   /** In shadow this starts nothing: no observers, no timer, no chat posts, no cards, no saves. */
   start(): void {
     checkDeviceSignal();
@@ -219,8 +250,16 @@ export class TaskRelay {
       this.suppressDisabledUpdates();
       this.deps.hub.observe((event) => this.onEvent(event));
       this.deps.bridge.watch({
-        started: (agent, by, at) => {
+        starting: (source) => source === 'paseo' ? this.deps.workers.revision : undefined,
+        sending: (agent, epoch, envelope) => {
+          if (agent.source !== 'paseo') return;
+          const task = this.deps.store.get(agent.id);
+          if (!task?.verified) return;
+          return this.admissions.sending(task, epoch, envelope, this.deps.workers.revision);
+        },
+        started: (agent, by, at, epoch, messageId, revision) => {
           if (agent.source !== 'paseo' || by.source !== 'hermes') return;
+          this.admissions.started(agent.id, epoch, messageId, revision);
           this.deps.store.recordBridgeStart(agent.id, by.id, at);
           const task = this.deps.store.get(agent.id);
           if (task && !task.verified && task.chat === by.id) this.markVerified(task, 'bridge');
@@ -270,7 +309,9 @@ export class TaskRelay {
   consider(snap: WorkerSnapshot, now: number): TaskRecord | undefined {
     checkDeviceSignal();
     if (!this.deps.background.run(() => true)) return undefined;
-    return this.checkWorker(snap.id, () => this.considerWorker(snap, now));
+    const task = this.checkWorker(snap.id, () => this.considerWorker(snap, now));
+    if (task) this.admissions.observe(task, this.deps.workers.revision);
+    return task;
   }
 
   private checkWorker<T>(id: string, check: () => T): T | undefined {
@@ -293,7 +334,10 @@ export class TaskRelay {
     if (!task && (!chat || !CHAT_ID.test(chat) || !WORKER_ID.test(snap.id))) return undefined;
     const state = stateOf(snap);
     if (!task) {
-      if (this.deps.store.bridgeChat(snap.id) !== chat && this.unprovenFull(chat, now)) return undefined;
+      if (this.deps.store.bridgeChat(snap.id) !== chat && this.unprovenFull(chat, now)) {
+        this.deferredWorkers.add(snap.id);
+        return undefined;
+      }
       const createdAt = snap.createdAt ?? now;
       const dueMinutes = dueMinutesOf(snap.labels) ?? this.deps.setting.defaultMinutes();
       // A stale stored "running" counts as stopped for this test: nothing runs it.
@@ -328,7 +372,9 @@ export class TaskRelay {
         lastSeen: now,
         ...(baseline ? { baseline: true } : {}),
       });
+      this.deferredWorkers.delete(snap.id);
       if (this.deps.store.bridgeChat(snap.id) === chat) this.markVerified(task, 'bridge');
+      if (!task.verified && !task.baseline) this.proofUnread.set(task.id, ++this.proofRevision);
       this.suppressDisabledUpdate(task);
       this.deps.log.info({ worker: short(snap.id), chat, state: task.status, ...(baseline ? { baseline } : {}) }, 'task log: new worker');
       return task;
@@ -354,6 +400,7 @@ export class TaskRelay {
     const was = task.status;
     this.unreconciledWorkers.add(task.id);
     this.deps.store.move(task, state, now);
+    if (!task.verified && !task.baseline) this.proofUnread.set(task.id, ++this.proofRevision);
     this.unreconciledWorkers.delete(task.id);
     this.cleanup(task);
     if (task.status !== was && !task.baseline) this.deps.log.info({ worker: short(task.id), from: was, to: state, round: task.round }, 'task log: worker changed');
@@ -418,6 +465,7 @@ export class TaskRelay {
   private markVerified(task: TaskRecord, via: 'bridge' | 'terminal'): void {
     checkDeviceSignal();
     task.verified = true;
+    this.proofUnread.delete(task.id);
     task.via = via;
     if (via === 'terminal') task.launchProof = 'single-command-v1';
     delete task.linkReason;
@@ -434,6 +482,7 @@ export class TaskRelay {
     if (this.ticking || !this.deps.background.run(() => true)) return;
     this.ticking = true;
     this.rowsThisTick = new Map();
+    this.rowsRevisionThisTick = new Map();
     this.cappedNoted = false;
     this.failedWorkers.clear();
     try {
@@ -442,6 +491,9 @@ export class TaskRelay {
       for (const task of [...store.all()]) this.checkWorker(task.id, () => this.cleanup(task));
       if (workers.agentsLoaded) {
         for (const snap of workers.workerSnapshots()) this.consider(snap, now);
+        for (const id of this.deferredWorkers) {
+          if (store.get(id) || !workers.workerSnapshot(id)) this.deferredWorkers.delete(id);
+        }
         // Recover trusted launches missed before a crash, including archived workers.
         for (const start of store.bridgeStarts()) {
           if (store.get(start.id)) continue;
@@ -505,15 +557,31 @@ export class TaskRelay {
       const force = now - this.savedAt >= SAVE_EVERY_MS;
       store.save(force);
       if (force) this.savedAt = now;
+      this.admissions.forgetMissing((id) => store.get(id));
+      await this.reconcileQuiet();
     } finally {
       this.rowsThisTick = undefined;
+      this.rowsRevisionThisTick = undefined;
       this.ticking = false;
     }
   }
 
+  /** Evidence reads belong to held ticks. */
+  async reconcileQuiet(): Promise<void> {
+    const { workers, store } = this.deps;
+    if (!workers.agentsLoaded || !this.admissions.needsReconciliation() || !this.deps.bridge.status().maintenance) return;
+    await this.admissions.reconcile(
+      (id) => workers.completionEvidence?.(id) ?? Promise.resolve(undefined), (id) => store.get(id),
+      () => workers.agentsLoaded ? workers.revision : undefined,
+      (id) => store.canCheckQuiet() && !this.unreconciledWorkers.has(id) && !this.failedWorkers.has(id),
+      (task) => ENDED.has(task.status) && task.relays.every((relay) => relay.deliveredAt !== undefined || relay.skipped) &&
+        (!this.currentUpdate(task) || task.relays.some((relay) => relay.id === this.currentUpdate(task))),
+    );
+  }
+
   private forgetOld(now: number): void {
     for (const [chat, failed] of [...this.readFailures]) if (now - failed.at > 60 * MINUTE) this.readFailures.delete(chat);
-    for (const map of [this.checked, this.lateChecks, this.staleSince, this.unreconciledWorkers]) {
+    for (const map of [this.checked, this.lateChecks, this.staleSince, this.unreconciledWorkers, this.proofUnread]) {
       for (const id of [...map.keys()]) if (!this.deps.store.get(id)) map.delete(id);
     }
     for (const [chat, known] of [...this.starts]) {
@@ -530,6 +598,7 @@ export class TaskRelay {
     if (failed && now < failed.until) throw new Error('reads of this chat are paused');
     const cached = this.rowsThisTick?.get(chat);
     if (cached) return cached;
+    this.rowsRevisionThisTick?.set(chat, this.proofRevision);
     const read = this.deps.chats.rows(chat).then(
       (rows) => {
         checkDeviceSignal();
@@ -608,6 +677,7 @@ export class TaskRelay {
     checkDeviceSignal();
     this.checked.set(task.id, { at: now, state: `${task.status}#${task.round}` });
     let rows: HermesMessageRow[];
+    const { status, round, changedAt } = task;
     try {
       rows = await this.rows(task.chat);
     } catch {
@@ -615,6 +685,8 @@ export class TaskRelay {
       return; // Hermes isn't answering, or the chat can't be read: try again later
     }
     checkDeviceSignal();
+    if (task.status === status && task.round === round && task.changedAt === changedAt &&
+        (this.rowsRevisionThisTick?.get(task.chat) ?? -1) >= (this.proofUnread.get(task.id) ?? 0)) this.proofUnread.delete(task.id);
     if (launchedHere(readLaunchProof(rows, task.id, this.knownStarts([task.chat])), task.createdAt, LAUNCH_WINDOW_MS)) this.markVerified(task, 'terminal');
   }
 
@@ -829,7 +901,14 @@ export class TaskRelay {
     }
     // The relay post itself: the one place Wayroost writes into a Hermes chat.
     // Covers first hand-overs and re-sends; a shadow never gets here (see start() and tick()).
+    const { workers } = this.deps;
+    const admissionEpoch = this.deps.bridge.status().maintenance
+      ? await this.admissions.relayEpoch(task, (id) => workers.completionEvidence?.(id) ?? Promise.resolve(undefined),
+        () => workers.agentsLoaded ? workers.revision : undefined)
+      : this.admissions.epoch(task, workers.revision);
+    checkDeviceSignal();
     const outcome = this.deps.bridge.deliverSystem({
+      admissionEpoch,
       key,
       target: { source: 'hermes', id: target.id },
       sender: SENDER,
@@ -910,7 +989,8 @@ export class TaskRelay {
   private hold(task: TaskRecord, relay: RelayRecord, err: unknown): void {
     checkDeviceSignal();
     relay.queuedAt ??= this.now();
-    relay.held = 'Held: current Hermes recipient or readiness could not be resolved.';
+    relay.held = err instanceof MaintenanceError ? 'relay_admission_unverified'
+      : 'Held: current Hermes recipient or readiness could not be resolved.';
     if (!transientFailure(err)) relay.failures = (relay.failures ?? 0) + 1;
     if (err instanceof UserFacingError && err.status === 404) relay.skipped = 'chat gone';
     else if ((relay.failures ?? 0) >= MAX_FAILED_HANDOVERS) relay.skipped = 'not delivered';

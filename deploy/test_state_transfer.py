@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import subprocess
 from types import SimpleNamespace
@@ -328,6 +329,143 @@ def test_absence_is_part_of_a_family_and_retention_is_transferred(tree):
     assert not (tree.legacy / 'tasks.json').exists()
     assert (tree.journal / 'reverse-rollback' / 'tasks.json').exists()
     assert tree.run('verify')['verified']
+
+
+@pytest.mark.parametrize('source_present', [False, True])
+@pytest.mark.parametrize('destination_present', [False, True])
+@pytest.mark.parametrize('compatible', [False, True])
+def test_task_and_lineage_markers_transfer_with_absence_and_exact_retained_originals(tree, source_present, destination_present, compatible):
+    markers = ('task-admissions.json', 'tasks-quiet.json', 'lineage-quiet.json', 'lineage-quiet-save.json')
+    originals = {}
+    for directory, present in ((tree.legacy, source_present), (tree.primary, destination_present)):
+        for name in markers:
+            path = directory / name
+            path.unlink(missing_ok=True)
+            originals[path] = (directory.name + ':' + name).encode() if present else None
+            if present:
+                path.write_bytes(originals[path])
+                path.chmod(0o400)
+    families = ['tasks', 'lineage']
+    plan = tree.run('plan', families=families)
+    assert set(markers) <= plan['files'].keys()
+    tree.run('forward', families=families)
+    tree.run('verify', families=families)
+    for name in markers:
+        transfer.check_copy(tree.primary / name, transfer.metadata(tree.legacy / name),
+                            (os.getuid(), os.getgid()))
+        backup = tree.journal / 'forward-rollback' / name
+        assert (backup.read_bytes() if backup.exists() else None) == originals[tree.primary / name]
+        if backup.exists():
+            assert stat.S_IMODE(backup.stat().st_mode) == 0o400
+        path = tree.primary / name
+        path.unlink(missing_ok=True)
+        if not source_present:
+            path.write_bytes(b'Current primary marker: ' + name.encode())
+            path.chmod(0o600)
+    current = {name: transfer.metadata(tree.primary / name) for name in markers}
+    tree.run('reverse', families=families, compatible=families if compatible else [])
+    tree.run('verify', families=families)
+    for name in markers:
+        backup = tree.journal / 'reverse-rollback' / name
+        assert (backup.read_bytes() if backup.exists() else None) == originals[tree.legacy / name]
+        if backup.exists():
+            assert stat.S_IMODE(backup.stat().st_mode) == 0o400
+        expected = current[name] if compatible else transfer.metadata(backup)
+        transfer.check_copy(tree.legacy / name, expected, (os.getuid(), os.getgid()))
+
+
+@pytest.mark.parametrize('source_present', [False, True])
+@pytest.mark.parametrize('destination_present', [False, True])
+def test_holds_and_admin_sockets_stay_local_in_both_directions(tree, source_present, destination_present, monkeypatch):
+    holds, sockets = {}, {}
+    for directory, present in ((tree.legacy, source_present), (tree.primary, destination_present)):
+        hold = directory / 'bridge-maintenance.json'
+        holds[hold] = (directory.name + ': independent hold').encode() if present else None
+        if present:
+            hold.write_bytes(holds[hold])
+            hold.chmod(0o600)
+        (directory / 'bridge-admin').mkdir()
+        monkeypatch.chdir(directory)
+        with socket.socket(socket.AF_UNIX) as admin:
+            admin.bind('bridge-admin/admin.sock')
+        path = directory / 'bridge-admin/admin.sock'
+        sockets[path] = path.stat().st_ino
+    for mode in ('forward', 'reverse'):
+        tree.run(mode, **({'compatible': list(transfer.FAMILIES)} if mode == 'reverse' else {}))
+        tree.run('verify')
+        for path, expected in holds.items():
+            assert (path.read_bytes() if path.exists() else None) == expected
+        for path, inode in sockets.items():
+            assert stat.S_ISSOCK(path.stat().st_mode) and path.stat().st_ino == inode
+        for path in tree.journal.rglob('*'):
+            assert path.name not in ('bridge-maintenance.json', 'bridge-admin', 'admin.sock')
+
+
+def test_transferred_storage_failure_keeps_the_destination_quiet_check_unavailable(tree):
+    for directory in (tree.legacy, tree.primary):
+        for name in (*transfer.FAMILIES['tasks'], 'task-admissions.json', 'tasks-quiet.json'):
+            (directory / name).unlink(missing_ok=True)
+        (directory / 'tasks.json').write_bytes(b'{"tasks":[]}')
+        (directory / 'tasks.json').chmod(0o600)
+        (directory / 'bridge-maintenance.json').write_bytes(b'{"version":1,"held":true}')
+    marker = tree.legacy / 'tasks-quiet.json'
+    marker.write_bytes(b'{"reason":"tasks_unavailable"}')
+    marker.chmod(0o600)
+    script = """
+import { MaintenanceHold } from './server/src/bridge/maintenance.js';
+import { quietReport } from './server/src/bridge/quiet.js';
+import { DisabledHermes, DisabledPaseo } from './server/src/disabled.js';
+import { TaskRelay } from './server/src/tasks/relay.js';
+import { TaskStore } from './server/src/tasks/store.js';
+const log = { info() {}, warn() {} };
+const stateDir = process.argv[2];
+const store = new TaskStore(stateDir, Date.now, undefined, log);
+const tasks = new TaskRelay({ store, workers: { revision: {} } });
+console.log(JSON.stringify(await quietReport({ hold: new MaintenanceHold(stateDir), tasks,
+  sources: { hermes: new DisabledHermes(), paseo: new DisabledPaseo() } })));
+"""
+
+    def quiet(directory):
+        result = subprocess.run(['node', '--import', 'tsx', '--input-type=module', '-', str(directory)],
+                                input=script, cwd=Path(__file__).resolve().parent.parent,
+                                capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)
+
+    assert quiet(tree.primary)['quiet'] is True
+    assert 'tasks_unavailable' in quiet(tree.legacy)['reasons']
+    tree.run('forward')
+    report = quiet(tree.primary)
+    assert report['quiet'] is False
+    assert report['pendingRelays'] is None
+    assert 'tasks_unavailable' in report['reasons']
+
+
+@pytest.mark.parametrize('marker', ['lineage-quiet.json', 'lineage-quiet-save.json'])
+def test_transferred_lineage_failure_keeps_the_destination_activity_unavailable(tree, marker):
+    for directory in (tree.legacy, tree.primary):
+        # An absent ledger is an empty, readable lineage; only the marker differs.
+        for name in transfer.FAMILIES['lineage']:
+            (directory / name).unlink(missing_ok=True)
+    path = tree.legacy / marker
+    path.write_bytes(b'{"reason":"paseo_activity_unavailable"}')
+    path.chmod(0o600)
+    script = """
+import { BackgroundGate } from './server/src/background.js';
+import { Lineage } from './server/src/lineage.js';
+const lineage = new Lineage(process.argv[2], { info() {}, warn() {} }, Date.now, new BackgroundGate('primary'));
+console.log(JSON.stringify({ unavailable: lineage.unavailable }));
+"""
+
+    def unavailable(directory):
+        result = subprocess.run(['node', '--import', 'tsx', '--input-type=module', '-', str(directory)],
+                                input=script, cwd=Path(__file__).resolve().parent.parent,
+                                capture_output=True, text=True, check=True)
+        return json.loads(result.stdout.strip().splitlines()[-1])['unavailable']
+
+    assert unavailable(tree.primary) is False
+    assert unavailable(tree.legacy) is True
+    tree.run('forward', families=['tasks', 'lineage'])
+    assert unavailable(tree.primary) is True
 
 
 def steps(mode):

@@ -25,7 +25,7 @@ user, before invoking an installer. The explicit installers never invoke a
 package manager, run prepared code or build anything as root.
 
 Production also requires the installer scripts, shared deployment libraries,
-unit templates and every ancestor directory to be owned by root and not writable
+unit and CLI templates and every ancestor directory to be owned by root and not writable
 by other users. Place reviewed installer files in a protected installation tree
 before invoking them. This trust check is separate from artifact verification:
 the prepared `--from` directory may remain owned by the unprivileged builder,
@@ -199,6 +199,35 @@ To publish primary config and unit as well, add `--primary --publish-unit
 prepared config must already declare `"role":"primary"`; it is published
 verbatim, mode 0600. `--role shadow` is also available for explicit shadow
 publication. `--config-path` defaults to `/etc/wayroost/config.json`.
+
+Primary publication (`--primary` or `--role primary`) also publishes
+`/usr/local/sbin/wayroost`, mode 0750, from the protected `deploy/wayroost.sh`
+template. Add `--publish-cli` to an artifact update to refresh the CLI explicitly:
+
+```bash
+sudo bash deploy/install-wayroost-server.sh --update-artifacts --publish-cli --mode forward \
+  --from /home/me/wayroost-build/server --manifest-sha256 "$SERVER_DIGEST" \
+  --prefix /opt/wayroost/server --config-path /etc/wayroost/config.json \
+  --receipts /var/lib/wayroost-install/receipts --receipt server-release
+```
+
+`--publish-cli` is also accepted with explicit primary publication. The wrapper
+includes `hold`, `release` and `quiet`, plus the pairing and certificate commands.
+It uses Node selected from the invocation's PATH, `<prefix>/dist/server/pair-code.js`
+and `--config-path`; repeat custom paths when updating. Select the intended Node
+executable in PATH before invoking the installer. Production checks its trusted
+ownership and Node version (22 or newer).
+
+A role-less `--update-artifacts` without `--publish-cli` preserves the wrapper's
+bytes, metadata or absence. CLI publication never discovers a role or executable
+from installed units, drop-ins, environment files or masks. Explicit shadow
+publication keeps its existing behavior; `--role shadow --publish-cli` is refused.
+Publication paths still refuse symlinks.
+
+The wrapper is an atomic, receipted publication. Plan leaves an older wrapper
+intact or a fresh path absent; verify checks the published wrapper, and reverse
+restores its exact prior bytes, ownership and mode or removes a newly installed
+wrapper. Wrapper publication does not enable or restart any service.
 
 The primary unit declares `WAYROOST_ROLE=primary` and `StateDirectory=wayroost`.
 It retains the template's sandbox and any installed base unit's optional

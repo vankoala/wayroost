@@ -12,12 +12,14 @@ import type { Logger } from '../hermes/adapter.js';
 import type { EventHub } from '../hub.js';
 import { HERMES_PARENT_LABEL, PARENT_AGENT_LABEL, modeTier } from '../paseo/normalize.js';
 import type { Lineage } from '../lineage.js';
-import { UserFacingError, transientFailure, type Sources, type StartedBy } from '../sources.js';
+import { UserFacingError, transientFailure, type CreatePaseoAgentInput, type Sources, type StartedBy } from '../sources.js';
 import { defaultChatTitle } from './envelope.js';
 import { chatEntry, chatKey, cut, transcript, type ChatStatus } from './format.js';
 import { LOOP_NOTICE, SendLimits, SlidingWindow } from './limits.js';
 import { NOT_A_PROJECT, ProjectIndex, canonicalFolder, isBareFolder, type ProjectRef } from './project.js';
 import { shadowBackground, type BackgroundGate } from '../background.js';
+import { MaintenanceHold } from './maintenance.js';
+import type { QuietConversation } from './quiet.js';
 
 // The project bridge: agents working in a project list, read, message and start
 // the other chats in the same project (as the Projects view groups them),
@@ -96,6 +98,7 @@ export interface CallOptions {
 }
 
 export interface BridgeOptions {
+  stateDir?: string;
   background?: BackgroundGate;
   sources: Sources;
   hub: EventHub;
@@ -130,6 +133,7 @@ interface Queued {
   callerKey: string;
   callerLog: string;
   at: number;
+  admissionEpoch?: number;
   attempts: number;
   /** Reserved by an adapter; it cannot also become a wait's reply. */
   sending?: boolean;
@@ -150,6 +154,10 @@ export const SYSTEM_CALLER = 'wayroost:system';
 
 /** A message from Wayroost itself (the task log), not from an agent. */
 export interface SystemMessage {
+  /** Server-trusted start time of existing work whose completion is draining. */
+  admittedAt?: number;
+  /** The server's admission epoch, preserved by the task ledger for this run only. */
+  admissionEpoch?: number;
   /** One per message: queuing the same key again while it waits changes nothing. */
   key: string;
   target: { source: Source; id: string };
@@ -168,8 +176,12 @@ export interface SystemMessage {
 
 /** What the task log hears from the bridge. */
 export interface BridgeObserver {
+  /** Capture the connection revision before launching; passed back to started. */
+  starting?(source: Source): unknown;
   /** A chat started an agent. Runs before acknowledging it; a failed provenance write must throw. */
-  started?(agent: { source: Source; id: string }, by: StartedBy, at: number): void;
+  started?(agent: { source: Source; id: string }, by: StartedBy, at: number, admissionEpoch?: number, messageId?: string, revision?: unknown): void;
+  /** Observe submission metadata without delaying or changing delivery. */
+  sending?(agent: { source: Source; id: string }, admissionEpoch: number | undefined, envelope: string): { acknowledged(messageId?: string): void; failed(): void } | void;
   /** A wait_for_reply returned the chat's answer or its finish. */
   waited?(callerKey: string, targetKey: string, kind: 'reply' | 'finished', at: number): void;
 }
@@ -177,6 +189,7 @@ export interface BridgeObserver {
 interface StartedChat {
   project: string;
   at: number;
+  acknowledgedAt?: number;
   /** Unset while it's being created. */
   chat?: { source: Source; id: string };
 }
@@ -279,11 +292,7 @@ function parseArgs<T extends z.ZodType>(schema: T, args: unknown): z.infer<T> {
   throw new UserFacingError(`Invalid arguments. ${problems.join('; ')}`, 400);
 }
 
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-const isIdle = (c: ConversationSummary) => (c.status === 'idle' || c.status === 'error') && c.pendingApprovals === 0;
+const isIdle = (c: Pick<ConversationSummary, 'status' | 'pendingApprovals'>) => (c.status === 'idle' || c.status === 'error') && c.pendingApprovals === 0;
 const pairKey = (from: string, to: string) => `${from}>${to}`;
 
 type ChatRef = { source: Source; id: string };
@@ -307,6 +316,12 @@ function actingChat(conversations: readonly ConversationSummary[], chat: Convers
 }
 
 export class Bridge {
+  private maintenance?: MaintenanceHold;
+  private activeCalls = 0;
+  private pendingWaiters = 0;
+  private sending = 0;
+  private readonly sendingTargets = new Set<string>();
+  private workGeneration = 0;
   private paused = false;
   private stopped = false;
   private readonly limits = new SendLimits();
@@ -332,6 +347,39 @@ export class Bridge {
 
   constructor(private readonly options: BridgeOptions) {
     this.now = options.now ?? Date.now;
+    if (options.stateDir) this.maintenanceHold(options.stateDir);
+  }
+
+  maintenanceHold(stateDir: string): MaintenanceHold {
+    if (!this.maintenance) {
+      this.maintenance = new MaintenanceHold(stateDir, this.now);
+      this.options.lineage?.setHeld(this.maintenance.isHeld());
+      this.maintenance.watch((held) => this.options.lineage?.setHeld(held));
+    }
+    return this.maintenance;
+  }
+
+  /** Includes unresolved admissions and acknowledged work still settling into backend status. */
+  quietCounts(conversations: readonly QuietConversation[] = []): { bridgeWaiters: number; queuedMessages: number; pendingDeliveries: number; generation: number } {
+    const now = this.now();
+    const settling = [...this.deliveries].filter(([key, delivery]) => {
+      if (this.sendingTargets.has(key) || delivery.sawBusy || now - delivery.at >= HOUR) return false;
+      const summary = conversations.find((chat) => chatKey(chat) === key);
+      return !summary || isIdle(summary) && now - delivery.at < SETTLE_MS;
+    }).length;
+    const launching = this.started.filter((start) => {
+      const ref = start.chat;
+      if (!ref) return false;
+      const summary = conversations.find((chat) => sameChat(chat, ref)) ??
+        conversations.find((chat) => chat.aliases?.some((alias) => sameChat(alias, ref)));
+      return !summary ? now - start.at < STARTING_GRACE_MS : isIdle(summary) && now - (start.acknowledgedAt ?? start.at) < SETTLE_MS;
+    }).length;
+    return {
+      generation: this.workGeneration,
+      bridgeWaiters: this.pendingWaiters,
+      queuedMessages: [...this.queues.values()].reduce((count, queue) => count + queue.length, 0),
+      pendingDeliveries: this.activeCalls + this.sending + settling + launching,
+    };
   }
 
   /** Hear about launches and answered waits (the task log). */
@@ -339,13 +387,29 @@ export class Bridge {
     this.observers.push(observer);
   }
 
+  private submission(target: { source: Source; id: string }, epoch: number | undefined, envelope: string) {
+    const callbacks: Array<{ acknowledged(messageId?: string): void; failed(): void }> = [];
+    this.tell((observer) => {
+      const callback = observer.sending?.(target, epoch, envelope);
+      if (callback) callbacks.push(callback);
+    });
+    return (success: boolean, receipt?: unknown) => {
+      const messageId = receipt && typeof receipt === 'object' && 'messageId' in receipt &&
+        typeof receipt.messageId === 'string' ? receipt.messageId : undefined;
+      for (const callback of callbacks) {
+        try { if (success) callback.acknowledged(messageId); else callback.failed(); }
+        catch { this.options.log.warn({ reason: 'admission_storage_unavailable' }, 'bridge admission evidence unavailable'); }
+      }
+    };
+  }
+
   private tell(visit: (observer: BridgeObserver) => void): void {
     for (const observer of this.observers) {
       try {
         visit(observer);
-      } catch (err) {
+      } catch {
         // An observer must never break a tool call.
-        this.options.log.warn({ err: errorText(err) }, 'bridge observer failed');
+        this.options.log.warn({ reason: 'observer_failed' }, 'bridge observer failed');
       }
     }
   }
@@ -365,6 +429,7 @@ export class Bridge {
     const key = chatKey(message.target);
     const queue = this.queues.get(key) ?? [];
     if (queue.some((m) => m.system?.key === message.key)) return 'already queued';
+    this.maintenance?.requireAdmission(message.admittedAt, message.admissionEpoch);
     // A chat that stays busy mustn't pile up Wayroost's messages: the caller keeps them for later.
     if (queue.filter((m) => m.system).length >= MAX_SYSTEM_WAITING_PER_CHAT) return 'full';
     const now = this.now();
@@ -380,6 +445,7 @@ export class Bridge {
     });
     queue.sort(queueOrder);
     this.queues.set(key, queue);
+    this.workGeneration++;
     // Wakes the existing delivery loop for Wayroost's own message (the bridge runs only in primary).
     // Not agents' activity: Settings' counts leave it out.
     this.ensurePolling();
@@ -403,8 +469,8 @@ export class Bridge {
     if (!message.system) return;
     try {
       message.system.dropped(reason);
-    } catch (err) {
-      this.options.log.warn({ err: errorText(err) }, 'bridge system message callback failed');
+    } catch {
+      this.options.log.warn({ reason: 'delivery_callback_failed' }, 'bridge system message callback failed');
     }
   }
 
@@ -415,6 +481,7 @@ export class Bridge {
     return {
       enabled: true,
       paused: this.paused,
+      ...(this.maintenance ? { maintenance: this.maintenance.isHeld() } : {}),
       ...(this.options.port ? { port: this.options.port } : {}),
       recent: {
         sent: this.recent.sent.count('*', now),
@@ -458,8 +525,13 @@ export class Bridge {
   async call(tool: string, args: unknown, identity: BridgeIdentity = {}, options: CallOptions = {}): Promise<unknown> {
     (this.options.background ?? shadowBackground).require();
     if (isReportTool(tool)) return this.report(tool, args);
+    const active = tool === 'start_chat' || tool === 'send_message';
+    if (active) this.activeCalls++;
+    if (tool === 'wait_for_reply') this.pendingWaiters++;
+    if (active || tool === 'wait_for_reply') this.workGeneration++;
     const log: CallLog = { tool, caller: 'unknown' };
     try {
+      if (tool === 'start_chat' || tool === 'send_message' && this.paused) this.maintenance?.requireAdmission();
       this.stillOn();
       let result: unknown;
       switch (tool) {
@@ -488,6 +560,9 @@ export class Bridge {
       throw err;
     } finally {
       // Never the message text, the title or the folder.
+      if (active) this.activeCalls--;
+      if (tool === 'wait_for_reply') this.pendingWaiters--;
+      if (active || tool === 'wait_for_reply') this.workGeneration++;
       this.options.log.info({ ...log }, 'bridge call');
     }
   }
@@ -567,9 +642,20 @@ export class Bridge {
 
   private async sendMessage(args: z.infer<typeof SendArgs>, identity: BridgeIdentity, log: CallLog) {
     if (SLASH.test(args.text)) throw new UserFacingError(SLASH_MESSAGE, 400);
-    const { caller, members } = await this.context(args, identity, log);
-    log.target = args.chat;
-    const target = this.member(members, args.chat);
+    // Only a live wait can accept a reply while held; verify its sender below.
+    const pending = this.waiters.get(args.chat);
+    if (!pending || pending.done) this.maintenance?.requireAdmission();
+    let caller: Caller;
+    let target: ConversationSummary;
+    try {
+      const context = await this.context(args, identity, log);
+      caller = context.caller;
+      log.target = args.chat;
+      target = this.member(context.members, args.chat);
+    } catch (err) {
+      this.maintenance?.requireAdmission();
+      throw err;
+    }
     const key = chatKey(target);
     if (caller.chat && chatKey(caller.chat) === key) {
       throw new UserFacingError("That's your own chat. Message the other chats in the project.", 400);
@@ -580,6 +666,9 @@ export class Bridge {
     this.stillOn();
     const now = this.now();
     this.tidy(now);
+    const waiter = this.waiters.get(key);
+    const replying = waiter && !waiter.done && waiter.targetKey === caller.key;
+    if (!replying) this.maintenance?.requireAdmission();
     const refusal = this.limits.check(caller.key, key, now);
     if (refusal) {
       if (refusal.tripped && caller.chat) this.breakLoop(caller.chat, target, now);
@@ -587,8 +676,7 @@ export class Bridge {
     }
 
     // The chat is waiting for exactly this answer: hand it over, and don't also deliver it.
-    const waiter = this.waiters.get(key);
-    if (waiter && !waiter.done && waiter.targetKey === caller.key) {
+    if (replying) {
       this.limits.record(caller.key, key, now);
       this.lastDelivered.set(pairKey(caller.key, key), now);
       this.recent.sent.add('*', now);
@@ -598,6 +686,7 @@ export class Bridge {
     }
 
     const envelope = bridgeEnvelope(caller.label, args.text, caller.chat ? chatKey(caller.chat) : undefined);
+    const admissionEpoch = this.maintenance?.admit();
     const waiting = this.queues.get(key);
     // Only agents' messages count here: Wayroost's own never hold one back or use up the limit.
     const agentsWaiting = waiting?.filter((m) => !m.system).length ?? 0;
@@ -605,13 +694,17 @@ export class Bridge {
       this.limits.record(caller.key, key, now);
       const previous = this.deliveries.get(key);
       this.deliveries.set(key, { at: now, sawBusy: false });
+      const settled = this.submission(target, admissionEpoch, envelope);
+      this.sendingTargets.add(key);
       try {
-        await this.options.sources[target.source].sendMessage(target.id, envelope);
+        const receipt = await this.options.sources[target.source].sendMessage(target.id, envelope);
+        settled(true, receipt);
       } catch (err) {
+        settled(false);
         if (previous) this.deliveries.set(key, previous);
         else this.deliveries.delete(key);
         throw err;
-      }
+      } finally { this.sendingTargets.delete(key); }
       this.delivered(caller.key, key, now);
       log.outcome = 'delivered';
       return { delivered: 'now' as const, note: caller.chat ? NOTES.sent : NOTES.sentAnonymous };
@@ -632,6 +725,7 @@ export class Bridge {
       callerKey: caller.key,
       callerLog: caller.logAs,
       at: now,
+      ...(admissionEpoch !== undefined ? { admissionEpoch } : {}),
       attempts: 0,
     });
     this.queues.set(key, queue);
@@ -650,6 +744,7 @@ export class Bridge {
     const { caller, project, conversations } = await this.context(args, identity, log);
     const launch = args.backend === 'paseo' ? await this.paseoLaunch(args.agent, args.mode) : undefined;
     this.stillOn();
+    const admissionEpoch = this.maintenance?.admit();
 
     // Check the caps and hold a place in one step, so parallel calls can't both get through.
     const now = this.now();
@@ -673,10 +768,16 @@ export class Bridge {
     const startedBy = caller.chat;
     const envelope = bridgeEnvelope(caller.label, args.text, startedBy ? chatKey(startedBy) : undefined);
     const title = args.title ?? defaultChatTitle(args.text);
+    const revisions = new Map<BridgeObserver, unknown>();
+    this.tell((observer) => { revisions.set(observer, observer.starting?.(args.backend)); });
     let id: string;
+    let messageId: string | undefined;
     try {
       if (launch) {
-        id = await this.options.sources.paseo.createConversation({
+        const source = this.options.sources.paseo as Sources['paseo'] & {
+          createConversation(input: CreatePaseoAgentInput, withReceipt: true): Promise<string | { id: string; messageId: string }>;
+        };
+        const created = await source.createConversation({
           providerId: launch.providerId,
           cwd: project.path,
           modeId: launch.modeId,
@@ -688,7 +789,9 @@ export class Bridge {
             ? { labels: { [startedBy.source === 'paseo' ? PARENT_AGENT_LABEL : HERMES_PARENT_LABEL]: startedBy.id } }
             : {}),
           ...(startedBy ? { startedBy } : {}),
-        });
+        }, true);
+        if (typeof created === 'string') id = created;
+        else ({ id, messageId } = created);
       } else {
         ({ id } = await this.options.sources.hermes.createConversation(envelope, project.path, [], {
           title,
@@ -701,10 +804,11 @@ export class Bridge {
       throw err;
     }
     place.chat = { source: args.backend, id };
+    place.acknowledgedAt = this.now();
     this.recent.started.add('*', now);
     log.target = chatKey(place.chat);
     log.outcome = 'started';
-    if (startedBy) for (const observer of this.observers) observer.started?.({ source: args.backend, id }, startedBy, now);
+    if (startedBy) for (const observer of this.observers) observer.started?.({ source: args.backend, id }, startedBy, now, admissionEpoch, messageId, revisions.get(observer));
     // Its first message came from the caller: waiting on it counts from now.
     if (startedBy) this.lastDelivered.set(pairKey(caller.key, log.target), now);
     return { chat: log.target, title, note: startedBy ? NOTES.started : NOTES.startedAnonymous };
@@ -841,7 +945,7 @@ export class Bridge {
         }
       }
     } catch (err) {
-      this.options.log.warn({ target: waiter.targetKey, err: errorText(err) }, "bridge couldn't read a finished chat");
+      this.options.log.warn({ target: waiter.targetKey, reason: 'chat_read_unavailable' }, "bridge couldn't read a finished chat");
     }
     this.settle(waiter, {
       from: waiter.targetKey,
@@ -1111,7 +1215,13 @@ export class Bridge {
           const reservation = { at: now, sawBusy: false };
           this.deliveries.set(key, reservation);
           head.sending = true;
+          this.sending++;
+          this.sendingTargets.add(key);
+          this.workGeneration++;
+          let settled: ((success: boolean, receipt?: unknown) => void) | undefined;
+          let submitted = false;
           try {
+            settled = head.system ? undefined : this.submission(head.target, head.admissionEpoch, head.envelope);
             const beforeSubmit = async () => {
               const pending = () => !this.paused && !this.stopped && this.queues.get(key) === queue && queue[0] === head;
               if (!pending()) throw new UserFacingError('Bridge delivery is paused or cancelled.', 503);
@@ -1130,8 +1240,11 @@ export class Bridge {
                 throw new UserFacingError('Bridge delivery is awaiting recipient readiness.', 503);
               }
             };
-            if (source.sendMessageWhenIdle) await source.sendMessageWhenIdle(head.target.id, head.envelope, beforeSubmit);
-            else { await beforeSubmit(); await source.sendMessage(head.target.id, head.envelope); }
+            let receipt: unknown;
+            if (source.sendMessageWhenIdle) receipt = await source.sendMessageWhenIdle(head.target.id, head.envelope, beforeSubmit);
+            else { await beforeSubmit(); receipt = await source.sendMessage(head.target.id, head.envelope); }
+            submitted = true;
+            settled?.(true, receipt);
             reservation.at = this.now();
             // Equal-time updates can sort ahead while submission awaits acknowledgement.
             if (this.queues.get(key) === queue) {
@@ -1147,8 +1260,8 @@ export class Bridge {
             if (head.system) {
               try {
                 head.system.delivered(this.now());
-              } catch (err) {
-                this.options.log.warn({ err: errorText(err) }, 'bridge system message callback failed');
+              } catch {
+                this.options.log.warn({ reason: 'delivery_callback_failed' }, 'bridge system message callback failed');
               }
             }
           } catch (err) {
@@ -1159,6 +1272,10 @@ export class Bridge {
               this.deliveryFailure(key, head, err);
             }
           } finally {
+            if (!submitted) settled?.(false);
+            this.sending--;
+            this.sendingTargets.delete(key);
+            this.workGeneration++;
             delete head.sending;
           }
         } catch (err) {
@@ -1184,7 +1301,7 @@ export class Bridge {
       this.queues.set(key, current);
       return;
     }
-    this.options.log.warn({ caller: head.callerLog, target: key, err: errorText(err) }, 'bridge dropped a message it could not deliver');
+    this.options.log.warn({ caller: head.callerLog, target: key, reason: 'delivery_failed' }, 'bridge dropped a message it could not deliver');
     this.dropSystem(head, gone ? 'gone' : 'failed');
   }
 
@@ -1211,7 +1328,7 @@ export class Bridge {
     const every = this.options.pollMs ?? POLL_MS;
     if (this.timer || this.stopped || every <= 0 || (!this.queues.size && !this.waiters.size)) return;
     this.timer = setInterval(() => {
-      this.tick().catch((err) => this.options.log.error({ err: errorText(err) }, 'bridge poll failed'));
+      this.tick().catch(() => this.options.log.error({ reason: 'poll_failed' }, 'bridge poll failed'));
     }, every);
     this.timer.unref?.();
   }

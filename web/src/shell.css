@@ -40,6 +40,27 @@
 
 /* ---------- The sidebar (desktop) ---------- */
 
+.maintenance-banner {
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-4);
+  transform: translateX(-50%);
+  z-index: 20;
+  max-width: calc(100% - var(--space-6));
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--need);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: var(--text-body);
+  text-align: center;
+  pointer-events: none;
+}
+
+@media (max-width: 899px) {
+  .maintenance-banner { bottom: calc(var(--tabbar-height) + var(--safe-bottom) + var(--space-2)); }
+}
+
 .sidebar {
   position: fixed;
   left: 0;

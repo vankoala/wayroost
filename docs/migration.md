@@ -236,8 +236,8 @@ lineage must be selected together so provenance is retained.
 | Family | Fixed names moved together |
 | --- | --- |
 | `feed` | `feed.json`: cards, closures, proactivity, less-like and notification dedup |
-| `tasks` | `tasks.json`, `task-events.jsonl`, `task-event-totals.json`, `task-events.jsonl.retention` |
-| `lineage` | `lineage.json`, `hermes-chat-moves.json` |
+| `tasks` | `tasks.json`, `task-events.jsonl`, `task-event-totals.json`, `task-events.jsonl.retention`, `task-admissions.json`, `tasks-quiet.json` |
+| `lineage` | `lineage.json`, `hermes-chat-moves.json`, `lineage-quiet.json`, `lineage-quiet-save.json` |
 | `voice` | `voice.json` |
 | `schedule-ideas` | `schedule-ideas.json` cache |
 | `paseo-client-id` | `paseo-client-id` |
@@ -251,6 +251,21 @@ are checked after publication. Only paths, hashes, sizes, modes and transaction
 control metadata appear in output, journals or receipts. Opaque stage, archive
 and rollback files contain store bytes and remain protected by root-private
 parents; do not publish them.
+
+The task admission evidence and storage-failure marker travel with the task
+ledger in both directions. An absent source marker removes a destination marker;
+each direction retains the destination's exact prior bytes, mode or absence in
+its rollback snapshot. A transferred `tasks-quiet.json` keeps the destination's
+quiet check unavailable until the underlying task evidence is recovered.
+The lineage failure markers, `lineage-quiet.json` and `lineage-quiet-save.json`,
+travel with the lineage ledger the same way, so a transferred marker keeps the
+destination's Paseo activity unavailable until the lineage evidence is recovered.
+
+`bridge-maintenance.json` is local operational state and never transfers. Each
+backend keeps its own hold, including its absence, through forward and reverse.
+The cutover operator explicitly sets and releases the hold on each backend;
+copying task state does not hold or release either backend. The `bridge-admin/`
+socket directory also stays excluded.
 
 Have systemd prepare the primary `StateDirectory` with the service's existing
 `DynamicUser=yes` and 0700 convention before transfer, then stop the service.

@@ -92,6 +92,10 @@ in that agent's project:
   that agent's sub-agents. It asks only about agents of providers that have
   them, never about Hermes, and never about an agent Paseo only has stored:
   asking would make Paseo resume it.
+- Maintenance activity reports ask for sub-agents of every loaded agent when
+  Paseo advertises sub-agent support, including custom providers. Stored and
+  closed agents are never queried. Without that capability, loaded agents
+  remain unknown for quiet checks.
 - The project bridge never offers them to other agents.
 
 ## Timelines

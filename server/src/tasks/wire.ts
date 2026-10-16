@@ -52,17 +52,23 @@ export function paseoWorkers(paseo: PaseoAdapter): TaskRelayDeps['workers'] {
     get agentsLoaded() {
       return paseo.agentsLoaded && paseo.status().state === 'connected';
     },
+    get revision() { return paseo.status(); },
     workerSnapshot: (id) => paseo.workerSnapshot(id),
     workerSnapshots: () => paseo.workerSnapshots(),
     lookUp: (id) => paseo.lookUpWorker(id),
-    async lastMessage(id: string): Promise<string | undefined> {
-      const { items } = await paseo.getConversation(id);
-      for (let i = items.length - 1; i >= 0; i--) {
-        const item = items[i]!;
-        if (item.kind === 'assistant' && item.text.trim()) return item.text;
-      }
-      return undefined;
+    async completionEvidence(id) {
+      const revision = paseo.status();
+      if (!paseo.agentsLoaded || revision.state !== 'connected') return undefined;
+      const detail = await paseo.readWorkerConversation(id);
+      if (!paseo.agentsLoaded || paseo.status() !== revision) return undefined;
+      if (!detail) return { messages: [], completed: true };
+      const snapshot = paseo.workerSnapshot(id);
+      if (!paseo.agentsLoaded || paseo.status() !== revision) return undefined;
+      const ended = (status: string) => status === 'idle' || status === 'error' || status === 'closed';
+      return { messages: detail.userMessages, completionTurnId: detail.completionTurnId, subsequentTurnIds: detail.subsequentTurnIds,
+        completed: ended(detail.conversation.status) && (!snapshot || ended(snapshot.status)) };
     },
+    lastMessage: (id) => paseo.readWorkerLastMessage(id),
   };
 }
 

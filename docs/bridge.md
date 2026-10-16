@@ -571,6 +571,228 @@ plugin. Enabling the plugin can load it into a dashboard or gateway that's
 already running, and a running Hermes keeps the copy of the agents' side it
 started with, so restart both right after step 3.
 
+## Maintenance hold and quiet checks
+
+Before stopping the server for maintenance, hold new bridge work:
+
+```bash
+sudo wayroost hold
+sudo wayroost quiet
+sudo wayroost release
+```
+
+These commands return JSON. `hold` and `release` return `{"held":true}` and
+`{"held":false}`. The hold is stored atomically in `bridge-maintenance.json`
+in the configured server state directory and survives a restart. Updating the
+CLI wrapper is enough; the commands use its fixed config and accept no path or
+server address from the caller. Its default state directory honours
+`WAYROOST_ROLE` (with `SIGNALBOX_ROLE` as a fallback). A shadow server refuses
+`hold` and `release` through both local admin paths; only the primary can change
+the hold. The shadow can still report quiet counts.
+
+While held, new bridge chats, task starts and messages are refused with HTTP
+503, the stable error `maintenance`, and a human explanation. Reads, status
+and launch reports remain available. Already queued deliveries and waits can
+finish, including replies to an existing wait and completion updates for tasks
+started before the hold. Admission epochs live in `task-admissions.json`, a
+separate side record that never changes task status, rounds, time boxes or
+relay delivery records. A follow-up receives permission only after submission
+is acknowledged, its receiving round is observed on the same connection and
+its exact message identity from the submission acknowledgment is verified by a
+read begun after that observation. Earlier reads cannot authorize a later round.
+An acknowledgment without a message identity grants no epoch. Repeated text
+cannot establish identity, and older digest-based records grant no permission. Missing or ambiguous evidence, failed sends,
+reconnects and a restart before reconciliation grant no epoch. Such rounds
+cannot admit a relay while held and keep the drain unquiet. Once granted, an
+epoch survives a restart for that round only. Later rounds need new evidence.
+Launch rounds also retain the initial prompt's exact message identity. Every
+relay admission while held requires its own fresh, non-reviving history read,
+for launches and follow-ups alike. The latest raw user timeline row, including
+image-only and file-only rows, must have the recorded identity, with no later
+user row. The message must occur exactly once and have a turn id that matches
+the completion and every subsequent raw row. Missing or different turn ids
+refuse the relay, including scheduled runs that add no user message. The same
+turn binding applies when reconciling admission evidence. Content rows alone
+cannot establish which turn most recently ended: a later scheduled turn can
+be canceled without adding any content. Paseo's snapshots identify the active
+turn, but do not expose a durable terminal-turn identity. Such completed
+relays remain deferred with `relay_admission_unverified`, even if the content
+matches the original submission. Release the hold to deliver them, let the
+queues drain, then set the hold again before requesting quiet. Restarting
+does not supply the missing terminal identity.
+Admission reads compare two fresh history tails and the daemon's activity
+snapshots, as well as the notification revision. Changed or inconsistent
+evidence is unavailable, including when activity notifications arrive late.
+The receiving run must have ended. Cached epoch verification
+alone never admits a relay, even on an unchanged connection. Missing, ambiguous
+or unavailable evidence defers the relay with `relay_admission_unverified` and
+keeps quiet false. Launches without an identity grant no epoch.
+Relay quotes use the same subscribed timeline mirror as ordinary inbox reads;
+fresh admission reads never replace that mirror or supply quote text. Archived
+workers that Paseo has not loaded are never revived to read a quote, so only
+their quotes are omitted. Loaded archived workers keep their ordinary quotes.
+Already queued messages retain their original admission. Expired, dropped and
+failed messages grant no permission to later runs.
+Admission-storage failures keep the quiet check unknown without interrupting
+ordinary task tracking or delivery. Acknowledged messages are never submitted
+again to retry admission storage. With the hold released, task tracking,
+persistence, retry and delivery follow the normal behavior.
+For new sends, maintenance refusal takes precedence over send rate limits and
+backend or project-member resolution failures. A live reply wait still checks
+the sender before accepting a reply.
+
+Every new admission is checked at these entry points:
+
+| Entry point | Work refused while held |
+| --- | --- |
+| `start_chat` with `backend: "hermes"` | A new Hermes chat |
+| `start_chat` with `backend: "paseo"` | A new Paseo task |
+| `send_message` | An immediate message or a new queue entry |
+| Task completion relay (`deliverSystem`) | A relay without admission evidence from before the hold |
+
+Reply handovers to an existing wait and work already in the queue can finish.
+New relay admissions remain held. This differs from
+Settings' Pause, which ends waits and stops queue delivery; resume that pause
+if the queues need to drain.
+
+The owner's connected desktop and phone show **Maintenance: new work paused**.
+The banner also reflects the saved hold after reconnecting or restarting.
+
+`quiet` returns the hold state, a `quiet` boolean, these counts and, when needed,
+a `reasons` array of fixed reason codes. An unknown count is `null`.
+
+| Field | What it counts |
+| --- | --- |
+| `bridgeWaiters` | Outstanding reply waits, including waits resolving their target |
+| `queuedMessages` | Messages waiting in bridge queues, including task updates |
+| `pendingRelays` | Task updates not delivered or explicitly skipped, including completion updates awaiting their grace period and trusted launches awaiting task recovery |
+| `pendingDeliveries` | Bridge admissions and deliveries awaiting resolution, acknowledgment or their backend settlement window |
+| `runningTasks` | Active backend chats and tracked tasks, including work waiting for approval; tracked Paseo tasks are deduplicated against chats |
+| `openApprovalPrompts` | Open approvals, including summary counts whose prompts are not yet loaded |
+
+Counts can overlap: a task relay can also be a queued message. `quiet` is true
+only when the hold is set and every source has verified a zero count. One source
+registry checks bridge waits, queues and deliveries, the task ledger and its
+pending follow-ups, Paseo activity and approvals, and Hermes activity and approvals.
+Each report reads every page of Paseo daemon activity afresh, including archived
+agents, without loading workers or changing the inbox. Cached inbox rows never
+certify activity. Each report reads sub-agents of every loaded agent afresh,
+including agents of custom providers. A running sub-agent counts its parent as running.
+Stored and closed agents are never queried for sub-agents. Missing sub-agent
+support or a failed sub-agent read makes activity unknown. Unfinished shell-run
+lineage records also remain unknown because they have no fresh completion reader;
+elapsed time alone cannot prove they ended.
+An agent, sub-agent or lineage change during the entire report, including the Hermes read,
+invalidates the report with `paseo_activity_unavailable`; run `quiet` again after
+activity settles.
+Running, busy or starting agents return `paseo_running`;
+unknown activity, failed reads or incomplete paging return
+`paseo_activity_unavailable`. Both keep `quiet` false.
+Unreadable lineage also makes Paseo activity unknown. A failed load sets
+`lineage-quiet.json` in the state directory; ordinary saves and restarts cannot
+clear it. The inbox can still start empty after an unreadable lineage file.
+Lineage persistence problems warn and make activity unknown; they never abort
+startup. Failure markers are written best effort if storage permits it.
+A failed save sets `lineage-quiet-save.json`. A later successful save of the
+complete in-memory state clears that save marker and restores availability unless
+there was also a load failure. Restarting with a save marker means the snapshot
+may be missing runs, so it also sets the persistent load marker. After restoring
+storage and reconciling all lost runs, the owner can remove both markers while
+the server is stopped, then restart and run `quiet` again.
+Setting the hold synchronously flushes pending lineage changes, including on a
+repeated hold command. While held, run reports are saved and synced before being
+acknowledged; a save failure returns an error and keeps activity unknown. Running
+records are never removed by the size or age limits. An unclean stop after a
+successful hold and successful reports loses no recorded run and leaves no
+process guard that would block later quiet checks.
+Without a hold, lineage saves retain their 500 ms debounce. An unheld crash within
+that window after a run starts can lose its record. Set the hold, which flushes
+lineage, before any maintenance restart.
+Unreadable or filtered task storage and unavailable task history remain unknown
+for quiet checks. Ledger read failures and failed history operations that prevent
+recording new tasks or status changes also set `tasks-quiet.json`; ordinary
+task-log saves and server restarts cannot erase this marker. After restoring
+storage and reconciling all lost work, the owner can remove this marker while
+the server is stopped.
+Restart and run `quiet` again to check the restored sources. Restored tasks must be
+reconciled before quiet can be certified. Unverified tasks that are not historical
+baselines remain `tasks_unreconciled` until a successful launch-proof read began
+after their latest state change. Failed, paused or exhausted proof reads cannot
+certify zero; restore readable chat history or restart to retry proof checks.
+Workers deferred by the unproven-worker cap also remain `tasks_unreconciled`
+until recorded or removed from Paseo's list.
+A transient write failure in
+`task-admissions.json` reports `followups_unavailable`. After storage is writable
+again, the flag clears on a successful save once every affected task has ended
+and been reconciled. If the side record is unreadable or its affected tasks cannot
+be identified, restore and reconcile all lost work, then remove
+`task-admissions.json` while the server is stopped and run `quiet` after restarting.
+Removing the side record discards follow-up admission epochs, so their remaining
+relays stay refused while held. If the hold or bridge work changes
+while counts are collected, run `quiet` again. Follow-ups that finish, fail or
+stop during downtime remain pending until their worker's state is reconciled.
+Follow-up side records retire only after acknowledgment and a fresh, non-reviving
+worker read begun after that acknowledgment shows idle, error or closed activity.
+Observed rounds, cached completion and delivered relays cannot substitute for
+that read when no message identity is available. Side records are dropped without
+daemon reads once their task leaves the ledger.
+Busy, unavailable or superseded evidence keeps records pending. A conflicting
+cached worker snapshot also keeps a record pending. Retirement never grants an
+epoch, and retired records no longer require completion-history reads.
+Held ticks reconcile admission and completion evidence. Quiet reports read the
+resulting counts without reconciling or saving that evidence. Unheld ticks preserve
+the ordinary daemon call cadence. Stored,
+closed and archived workers are read through their activity state without fetching
+timelines or resuming them. A definitive stored-worker error retires its evidence
+without granting an epoch; service unavailability and timeouts remain unknown.
+A launch identity absent from the fresh history tail grants no epoch and is
+dropped without further history reads.
+Interrupted, unacknowledged submissions remain unknown until the owner resolves
+them using the side-record recovery procedure above. If a rare ambiguous follow-up remains
+pending after all workers have ended, leave the hold set and restart the server
+to reconcile it, then run `quiet` again. An unavailable source returns
+`quiet: false`, unknown counts and reason codes such as `hermes_activity_unavailable`,
+`tasks_unavailable`, `tasks_unreconciled` or `followups_unreconciled`.
+The report returns no messages, titles or prompts. The production Hermes
+adapter reads fresh dashboard chat and run listings to verified page exhaustion,
+including cron, ACP, archived and zero-message sessions, together with outstanding
+approval counts. Every page must supply the same valid total, and the number of
+rows across all pages must equal it. Hidden sessions omitted from the rows, missing
+totals and inconsistent paging totals return `hermes_listing_incomplete`.
+Run visibility is read from the effective configuration at `/api/config`.
+Hidden runs (`sessions.show_subagents` off), missing run-list capability evidence,
+unreadable pages, repeated rows or reaching the page limit keep activity unknown.
+An unfinished stored chat or run always prevents quiet: a clearly active row is
+counted as running, and ambiguous activity remains unknown. Idle runtime entries,
+watchers and activity flags cannot prove completion. A valid stored completion
+timestamp supplies idle evidence; malformed evidence keeps activity unknown.
+A crashed run that never finished requires the owner's resolution before quiet
+can be certified. Paseo and task counts are read after the
+remote reads settle, and the Hermes activity and session-list revisions are
+checked again before returning the report. The check uses a counts-and-ids activity reader so source
+failures cannot log response contents. The check does not open
+or resume chats. Missing or malformed activity evidence, an unavailable run
+listing, or a backend disconnecting or reconnecting during the check prevents
+quiet certification. A disabled backend contributes verified zero counts.
+Follow-up reconciliation reads worker history without timeline subscriptions
+or adding archived workers to the inbox.
+
+The CLI uses `<stateDir>/bridge-admin/admin.sock`, inside a directory with mode
+0700 and with socket mode 0600, accessible only to root and the service user.
+Agent bridge tokens grant no maintenance access. A paired desktop can also
+use `PUT /api/bridge/maintenance` with `{"held":true|false}` and read
+`GET /api/bridge/quiet` through the configured local listener. Both routes
+require that listener's local origin and port; the public origin, main listener
+and phone cannot administer the hold or read the report.
+
+Hold other writers separately before a cutover. This hold controls bridge
+admissions; cron jobs, external backend clients and ordinary app actions can
+still create work. Repeat the quiet check after those writers have stopped,
+leave the hold set across the restart, and release it when maintenance ends.
+Paseo 0.9.2 exposes no pending-run state: a run being started or resumed can
+briefly read idle before it becomes active. The attended quiet window and the
+hold, which refuses new bridge admissions, cover this limit.
+
 ## Turning it off
 
 - **For a while:** Pause in Settings.
