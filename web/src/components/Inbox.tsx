@@ -4,7 +4,7 @@ import { CalendarClock, FolderTree, KeyRound, List, Plus, Search, Settings, Spar
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ConversationSummary } from '../../../shared/protocol';
 import { oneLine } from '../format';
-import { chatIndex, groupByProject, parentOf } from '../projects';
+import { chatIndex, groupByProject, projectTree, parentOf } from '../projects';
 import { conversationPath, navigate, type ChatsFilter } from '../router';
 import { convKey, useStore } from '../store';
 import { ApprovalBanner } from './Approvals';
@@ -115,7 +115,7 @@ export function Inbox({
     return [...shown].sort((a, b) => rank(a) - rank(b) || b.updatedAt - a.updatedAt);
   }, [filtered, needsYou, query]);
 
-  const groups = useMemo(() => groupByProject(filtered, needsYou), [filtered, needsYou]);
+  const groups = useMemo(() => projectTree(groupByProject(filtered, needsYou)), [filtered, needsYou]);
 
   const attentionCount = useMemo(() => all.filter(needsYou).length, [all, needsYou]);
   const workingCount = useMemo(() => all.filter((c) => c.status === 'running').length, [all]);

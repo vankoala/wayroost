@@ -2,7 +2,7 @@ import { BackgroundGate } from '../src/background.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerEvent } from '../../shared/protocol.js';
 import { HermesAdapter } from '../src/hermes/adapter.js';
 import { EventHub } from '../src/hub.js';
@@ -184,6 +184,7 @@ describe('hermes: archive, restore, delete, idle', () => {
   afterEach(async () => {
     adapter.stop();
     await fake.stop();
+    vi.restoreAllMocks();
   });
 
   const connect = async () => {
@@ -249,6 +250,28 @@ describe('hermes: archive, restore, delete, idle', () => {
       expect.objectContaining({ source: 'hermes', id: 'a', title: 'Chat a', folder: '~/proj' }),
     ]);
     expect(fake.listQueries.at(-1)).toMatchObject({ archived: 'only' });
+  });
+
+  it('tidies and folder-archives one-shots beyond their 100 listed runs, and can restore them', async () => {
+    const fixedNow = 1_790_490_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(fixedNow);
+    fake.topLevel = [
+      ...Array.from({ length: 130 }, (_, i) => chat(`auto${i}`, '/home/me/research', 30 + i, { source: 'oneshot' })),
+      chat('nested', '/home/me/research/sub', 40, { source: 'oneshot' }),
+      chat('elsewhere', '/home/me/elsewhere', 40, { source: 'oneshot' }),
+    ];
+    await connect();
+    expect(await adapter.listConversations()).toHaveLength(100);
+    expect(await adapter.idleThreads(fixedNow - 14 * DAY)).toHaveLength(132);
+    const result = await adapter.archiveThreads(['auto0'], { path: '/home/me/research', paseoRoots: [] });
+    expect(result).toEqual({ done: 130, failed: [] });
+    expect(fake.archived.has('auto129')).toBe(true);
+    expect(fake.archived.has('nested')).toBe(false);
+    expect(fake.archived.has('elsewhere')).toBe(false);
+    expect((await adapter.listConversations()).map((c) => c.id)).not.toContain('auto0');
+    expect((await adapter.listArchived(50)).map((c) => c.id)).toContain('auto0');
+    await adapter.restoreThreads(['auto0']);
+    await expect.poll(async () => (await adapter.listConversations()).map((c) => c.id)).toContain('auto0');
   });
 
   it('finds every idle chat, a page at a time, not just the ones the inbox lists', async () => {

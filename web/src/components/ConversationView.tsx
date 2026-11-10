@@ -1,4 +1,6 @@
-import { Archive, Bot, ChevronLeft, CornerDownRight, CornerLeftUp, Ellipsis, Feather, SquareTerminal, Trash2, WifiOff } from 'lucide-react';
+import { MoveChatSheet } from './MoveChatSheet';
+import { moveDisabledReason } from '../move';
+import { Archive, Bot, ChevronLeft, CornerDownRight, CornerLeftUp, Ellipsis, FolderInput, Feather, SquareTerminal, Trash2, WifiOff } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import type { Source } from '../../../shared/protocol';
 import { api, dropThreads, loadConversation, reportTidy } from '../api';
@@ -64,6 +66,7 @@ export function ConversationView({
   const [menu, setMenu] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [tidying, setTidying] = useState(false);
+  const [moving, setMoving] = useState(false);
   const title = readableBridgeText(conversation?.title) ?? 'this thread';
 
   const archive = async () => {
@@ -153,6 +156,15 @@ export function ConversationView({
       {menu && (
         <Sheet title="This thread" onClose={() => !tidying && setMenu(false)}>
           <div className="group thread-actions">
+            {conversation?.source === 'hermes' && !subagent && (
+              <button type="button" className="kv action-row" disabled={tidying || working || !!moveDisabledReason(conversation)}
+                onClick={() => { setMenu(false); setMoving(true); }}>
+                <FolderInput size={18} />
+                <div className="grow"><div>Move to folder…</div><div className="muted">
+                  {working ? 'Wait until this chat finishes working and has no pending approval.' : moveDisabledReason(conversation) ?? 'Change the folder where Hermes works for this chat.'}
+                </div></div>
+              </button>
+            )}
             <button type="button" className="kv action-row" onClick={archive} disabled={tidying}>
               <Archive size={18} />
               <div className="grow">
@@ -253,6 +265,7 @@ export function ConversationView({
         </div>
       )}
 
+      {moving && conversation && <MoveChatSheet conversation={conversation} onClose={() => setMoving(false)} />}
       <Timeline
         conversationKey={key}
         items={detail?.items ?? []}

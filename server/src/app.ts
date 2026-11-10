@@ -1,3 +1,4 @@
+import { canonicalFolder, isBareFolder } from './bridge/project.js';
 import { SETTINGS_RESOLUTION_MESSAGE, type SettingsErrorCode } from '../../shared/settings.js';
 import type { WayroostSettingsDocument } from '../../shared/wayroost-settings.js';
 import { oneLine } from './feed/store.js';
@@ -1566,6 +1567,36 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.post('/api/threads/archive', async (req): Promise<ThreadActionResult> => {
     const { threads, folder } = ArchiveBody.parse(req.body);
     return tidy(req, 'archive', threads, folder);
+  });
+
+  app.post('/api/threads/move', async (req) => {
+    const { thread, cwd } = z.object({ thread: ThreadRefBody, cwd: FolderPath }).strict().parse(req.body);
+    try {
+      maintenance.requireAdmission();
+      if (thread.source !== 'hermes') throw new UserFacingError('Only Hermes chats can be moved.', 400);
+      if (canonicalFolder(cwd) !== cwd || cwd.includes('..') || isBareFolder(cwd)) {
+        throw new UserFacingError('Choose an absolute project folder with no trailing slash, . or .. parts.', 400);
+      }
+      if (!sources.hermes.moveToFolder) throw new UserFacingError('Hermes cannot move chats from here.', 503);
+      const found = await sources.paseo.folderStatus(cwd);
+      if (found !== 'exists') {
+        throw new UserFacingError(
+          found === 'unknown' ? "Couldn't check that folder. Connect Paseo and try again." : 'The destination folder does not exist or is not a folder.',
+          400,
+        );
+      }
+      checkLiveChange(req);
+      maintenance.requireAdmission();
+      const conversation = await sources.hermes.moveToFolder(thread.id, cwd, () => { checkLiveChange(req); maintenance.requireAdmission(); });
+      req.log.info({ id: thread.id, ok: true }, 'thread moved');
+      return { conversation };
+    } catch (err) {
+      req.log.info({ id: thread.id, ok: false }, 'thread moved');
+      // Hermes can include the destination in its refusal. Show it to the caller,
+      // but never send it through the generic error logger.
+      if (err instanceof UserFacingError) throw err;
+      throw new UserFacingError(`Couldn't move the chat: ${err instanceof Error ? err.message : 'Hermes refused the move.'}`, 424);
+    }
   });
 
   app.post('/api/threads/restore', async (req): Promise<ThreadActionResult> =>

@@ -523,11 +523,31 @@ a {
   overflow: hidden;
 }
 
+.project-children {
+  margin-left: 8px;
+}
+
+/* Bound the inset on deeply nested paths at phone widths. */
+.project-children .project-children .project-children {
+  margin-left: 0;
+}
+
+.project-children .project {
+  margin: 4px 2px;
+  border-radius: 12px;
+}
+
 .project-head {
   display: flex;
   align-items: center;
   gap: 2px;
   padding: 4px 6px 4px 4px;
+}
+
+.project-head.move-target {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-elev));
 }
 
 .project-toggle {
@@ -1452,6 +1472,17 @@ a {
 
 .field small.folder-note.bad {
   color: var(--danger);
+}
+
+.options.move-folders {
+  max-height: 40vh;
+  overflow-y: auto;
+  margin-bottom: 18px;
+}
+
+.move-folders .label,
+.move-current-folder {
+  overflow-wrap: anywhere;
 }
 
 .options {

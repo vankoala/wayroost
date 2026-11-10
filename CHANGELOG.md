@@ -11,6 +11,12 @@ The first public release, to be tagged 0.1.0.
 
 ### Added
 
+- Collapsible nested project folders, with branching parents and rolled-up counts.
+- A separate one-shot run listing, so automated runs keep ordinary chats in view;
+  folder archive and tidy-up still include them.
+- Move idle Hermes chats to an existing folder from the thread menu or by
+  dragging a project row onto a folder. Moves respect pairing and maintenance holds.
+
 - The bridge now registers as `wayroost`, with Hermes plugin
   `wayroost-identity`. `bridge.legacyNames` controls compatibility with
   the old names. Owner tooling migrates registrations and permission
@@ -368,6 +374,24 @@ The first public release, to be tagged 0.1.0.
 
 ### Fixed
 
+- A chat removed during a move and still absent when the reply arrives shows the
+  no-longer-listed message instead of reappearing with a success confirmation.
+  A chat restored before the reply applies the move normally.
+- Each Hermes chat accepts one move at a time, through the listing refresh.
+  Attempted moves refresh connected clients from Hermes storage even after a
+  failed or discarded reply. Listing refreshes have a deadline and one pending
+  retry on failure; coalescing with an ordinary refresh preserves the retry's
+  complete-listing requirement.
+- Hermes moves honor every source's recent-write flag and wait for the current
+  activity poll, then fetch the chat row afresh within one eight-second admission
+  deadline. Detail replies without the recent-write flag use a fresh listing
+  lookup. Superseding polls are bounded; unavailable checks refuse cleanly.
+  Archive, tidy, delete and listing invalidation win over in-flight move replies,
+  keeping removed chats out of clients. Open idle interactive chats can move without an end stamp.
+  Unfinished one-shots stay running and out of moves, tidy-up and folder sweeps
+  for six hours after their freshest stored activity/start stamp; crashed old
+  runs eventually become idle and sweepable, including beyond the listing window.
+  Sweeps use their fetched row and correct cached activity flags after a run ends.
 - Hermes: two inbox refreshes that overlapped (the one after connecting, and
   yours) each fetched the sub-agent run list; they now share one request.
 

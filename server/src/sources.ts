@@ -153,6 +153,8 @@ export interface HermesCreateOptions extends BridgeCreateOptions {
 }
 
 export interface HermesSource extends ConversationSource {
+  /** Move an idle top-level chat to an existing folder without resuming it. */
+  moveToFolder?(id: string, cwd: string, beforeMove?: () => void): Promise<ConversationSummary>;
   createConversation(
     text: string,
     cwd?: string,

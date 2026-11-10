@@ -112,10 +112,12 @@ export class HermesAuth {
 
   /** fetch() against the dashboard with auth; retries once after a 401. */
   async fetch(path: string, init: RequestInit = {}, signal = deviceSignal()): Promise<Response> {
+    let sentToken: string | undefined;
     const send = async () => {
       checkDeviceSignal(signal);
       const token = await this.token(signal);
       checkDeviceSignal(signal);
+      sentToken = token;
       return fetch(`${this.baseUrl}${path}`, {
         ...init,
         redirect: 'manual',
@@ -125,7 +127,8 @@ export class HermesAuth {
     };
     let res = await send();
     if (res.status === 401) {
-      this.accessToken = undefined; // force refresh / re-login
+      // A late response must not invalidate a token another request already renewed.
+      if (this.accessToken === sentToken) this.accessToken = undefined;
       res = await send();
     }
     return res;

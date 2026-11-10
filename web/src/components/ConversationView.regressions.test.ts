@@ -130,3 +130,39 @@ it('activates a shadow chat only after Open live chat is clicked', async () => {
   await click('Open live chat');
   expect(loadConversation).toHaveBeenCalledWith('hermes', 'demo-thread', true);
 });
+
+describe('moving from the thread menu', () => {
+  const openMenu = async () => {
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Thread actions"]')!.click());
+  };
+  const moveButton = () => [...container.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent?.includes('Move to folder…'));
+
+  it('opens the folder picker for an idle Hermes chat using the menu', async () => {
+    await openMenu();
+    expect(moveButton()?.disabled).toBe(false);
+    await click('Move to folder…');
+    expect(container.querySelector('[role="dialog"][aria-label="Move to folder"]')?.textContent).toContain('Move to folder');
+    expect(container.querySelector('[role="radiogroup"]')).not.toBeNull();
+  });
+
+  it.each(['running', 'needs_approval'] as const)('disables the action and explains the %s state', async (status) => {
+    await act(async () => setState((s) => ({ ...s, conversations: { 'hermes:demo-thread': { ...s.conversations['hermes:demo-thread']!, status } } })));
+    await openMenu();
+    expect(moveButton()?.disabled).toBe(true);
+    expect(moveButton()?.textContent).toContain('finishes working');
+  });
+
+  it('does not offer a move for Paseo agents or standalone sub-agents', async () => {
+    await act(async () => {
+      setState((s) => ({ ...s, conversations: { 'paseo:demo-agent': { ...s.conversations['hermes:demo-thread']!, source: 'paseo', id: 'demo-agent' } } }));
+      root.render(h(ConversationView, { source: 'paseo', id: 'demo-agent', offline: false, onNew: vi.fn() }));
+    });
+    await openMenu();
+    expect(moveButton()).toBeUndefined();
+    await act(async () => {
+      setState((s) => ({ ...s, conversations: { 'hermes:demo-thread': { source: 'hermes', id: 'demo-thread', title: 'Demo run', status: 'idle', updatedAt: 1, pendingApprovals: 0, subagent: true } } }));
+      root.render(h(ConversationView, { source: 'hermes', id: 'demo-thread', offline: false, onNew: vi.fn() }));
+    });
+    expect(moveButton()).toBeUndefined();
+  });
+});

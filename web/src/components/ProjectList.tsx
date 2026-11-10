@@ -1,13 +1,15 @@
 import { Archive, ChevronDown, ChevronRight, Feather, Folder, Plus, SquareTerminal } from 'lucide-react';
-import { Fragment, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import type { ConversationSummary, Source } from '../../../shared/protocol';
-import { api, dropThreads, reportTidy } from '../api';
+import { api, dropThreads, moveChat, reportTidy } from '../api';
+import { CHAT_DRAG_TYPE, COLLAPSED_PROJECTS, EXPANDED_PROJECTS, FOLDER_MOVED, canDropChat, moveDisabledReason } from '../move';
 import { homeRelative } from '../format';
 import {
   NO_PROJECT,
   chatKey,
   paseoProjectRoots,
   type ProjectGroup,
+  type ProjectFolder,
   type SubagentEntry,
   type ThreadNode,
 } from '../projects';
@@ -15,7 +17,8 @@ import { convKey, toast, useStore } from '../store';
 import { ConfirmDialog } from './common';
 import { ConversationRow } from './ConversationRow';
 
-const COLLAPSED_KEY = 'signalbox:collapsed-projects';
+const COLLAPSED_KEY = COLLAPSED_PROJECTS;
+const EXPANDED_KEY = EXPANDED_PROJECTS;
 const OPEN_SUBAGENTS_KEY = 'signalbox:open-subagents';
 
 function readSet(key: string): Set<string> {
@@ -72,13 +75,56 @@ export function ProjectList({
   needsYou,
   onNewIn,
 }: {
-  groups: ProjectGroup[];
+  groups: ProjectFolder[];
   activeKey: string | null;
   needsYou: (c: ConversationSummary) => boolean;
   onNewIn: (path: string | null) => void;
 }) {
-  const [collapsed, toggleProject] = useStoredSet(COLLAPSED_KEY);
+  const [collapsed, setCollapsed] = useState(() => readSet(COLLAPSED_KEY));
+  const [expanded, setExpanded] = useState(() => readSet(EXPANDED_KEY));
+  useEffect(() => {
+    const reveal = () => {
+      setCollapsed(readSet(COLLAPSED_KEY));
+      setExpanded(readSet(EXPANDED_KEY));
+    };
+    window.addEventListener(FOLDER_MOVED, reveal);
+    return () => window.removeEventListener(FOLDER_MOVED, reveal);
+  }, []);
+  const [dragged, setDragged] = useState<string | null>(null);
+  const [target, setTarget] = useState<string | null>(null);
+  const [moving, setMoving] = useState(false);
+  const toggleProject = (id: string, open: boolean) => {
+    const closed = new Set(collapsed);
+    const opened = new Set(expanded);
+    if (open) {
+      closed.add(id);
+      opened.delete(id);
+    } else {
+      closed.delete(id);
+      opened.add(id);
+    }
+    setCollapsed(closed);
+    setExpanded(opened);
+    writeSet(COLLAPSED_KEY, closed);
+    writeSet(EXPANDED_KEY, opened);
+  };
   const conversations = useStore((s) => s.conversations);
+  const draggedChat = dragged ? conversations[dragged] : undefined;
+  const accepts = (types: readonly string[], path: string | null) =>
+    !moving && canDropChat(types, draggedChat, path) && !!draggedChat && !needsYou(draggedChat);
+  const drop = async (path: string) => {
+    setTarget(null);
+    setDragged(null);
+    if (!draggedChat) return;
+    setMoving(true);
+    try {
+      await moveChat(draggedChat, path);
+    } catch (err) {
+      toast((err as Error).message);
+    } finally {
+      setMoving(false);
+    }
+  };
   // "Archive folder": every thread it shows (sub-agent runs go with theirs).
   const [archiving, setArchiving] = useState<ProjectGroup | null>(null);
   const [busy, setBusy] = useState(false);
@@ -106,6 +152,14 @@ export function ProjectList({
       compact
       active={convKey(c.source, c.id) === activeKey}
       needsYou={needsYou(c)}
+      {...(!moving && !moveDisabledReason(c) && !needsYou(c) ? {
+        onChatDragStart: (e: import('react').DragEvent<HTMLButtonElement>) => {
+          e.dataTransfer.setData(CHAT_DRAG_TYPE, chatKey(c));
+          e.dataTransfer.effectAllowed = 'move';
+          setDragged(chatKey(c));
+        },
+        onChatDragEnd: () => { setDragged(null); setTarget(null); },
+      } : {})}
       {...extra}
     />
   );
@@ -164,54 +218,76 @@ export function ProjectList({
     );
   };
 
+  const folder = (g: ProjectFolder, depth = 0) => {
+    // Subfolders start folded, unless a descendant is working or needs you.
+    const open = !collapsed.has(g.key) && (expanded.has(g.key) || depth === 0 || g.attention > 0 || g.running > 0);
+    // Each chat counts for its own backend, whichever lane it's nested in.
+    const counts = [
+      g.counts.hermes ? count(g.counts.hermes, 'Hermes chat', 'Hermes chats') : '',
+      g.counts.paseo ? count(g.counts.paseo, 'Paseo agent', 'Paseo agents') : '',
+      g.counts.subagents ? count(g.counts.subagents, 'sub-agent', 'sub-agents') : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    return (
+      <section key={g.key} className="project" aria-label={g.name}>
+        <div className={`project-head${target === g.key ? ' move-target' : ''}`}
+          onDragOver={(e) => {
+            if (!accepts(Array.from(e.dataTransfer.types), g.path)) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            setTarget(g.key);
+          }}
+          onDragLeave={(e) => {
+            if (!(e.relatedTarget instanceof Node) || !e.currentTarget.contains(e.relatedTarget)) setTarget(null);
+          }}
+          onDrop={(e) => {
+            if (!accepts(Array.from(e.dataTransfer.types), g.path) || e.dataTransfer.getData(CHAT_DRAG_TYPE) !== dragged) return;
+            e.preventDefault();
+            void drop(g.path!);
+          }}>
+          <button type="button" className="project-toggle" aria-expanded={open} onClick={() => toggleProject(g.key, open)}>
+            <span className="project-icon">
+              <Folder size={18} />
+            </span>
+            <span className="grow">
+              <span className="project-name">{g.name}</span>
+              <span className="project-path">
+                {g.path ? `${homeRelative(g.path)} · ` : ''}
+                {counts}
+              </span>
+            </span>
+            {g.attention > 0 && <span className="pill approval">{g.attention}</span>}
+            <ChevronDown size={18} className={`chev${open ? '' : ' closed'}`} />
+          </button>
+          {g.key !== NO_PROJECT && (
+            <button
+              type="button"
+              className="icon-btn"
+              aria-label={`New conversation in ${g.name}`}
+              onClick={() => onNewIn(g.path)}
+            >
+              <Plus size={20} />
+            </button>
+          )}
+          {g.group && (
+            <button type="button" className="icon-btn" aria-label={`Archive ${g.name}`} onClick={() => setArchiving(g.group)}>
+              <Archive size={18} />
+            </button>
+          )}
+        </div>
+        {open && g.group && lane('hermes', g.group.hermes)}
+        {open && g.group && lane('paseo', g.group.paseo)}
+        {open && g.children.length > 0 && (
+          <div className="project-children">{g.children.map((child) => folder(child, depth + 1))}</div>
+        )}
+      </section>
+    );
+  };
+
   return (
     <>
-      {groups.map((g) => {
-        const open = !collapsed.has(g.key);
-        // Each chat counts for its own backend, whichever lane it's nested in.
-        const counts = [
-          g.counts.hermes ? count(g.counts.hermes, 'Hermes chat', 'Hermes chats') : '',
-          g.counts.paseo ? count(g.counts.paseo, 'Paseo agent', 'Paseo agents') : '',
-          g.counts.subagents ? count(g.counts.subagents, 'sub-agent', 'sub-agents') : '',
-        ]
-          .filter(Boolean)
-          .join(' · ');
-        return (
-          <section key={g.key} className="project" aria-label={g.name}>
-            <div className="project-head">
-              <button type="button" className="project-toggle" aria-expanded={open} onClick={() => toggleProject(g.key)}>
-                <span className="project-icon">
-                  <Folder size={18} />
-                </span>
-                <span className="grow">
-                  <span className="project-name">{g.name}</span>
-                  <span className="project-path">
-                    {g.path ? `${homeRelative(g.path)} · ` : ''}
-                    {counts}
-                  </span>
-                </span>
-                {g.attention > 0 && <span className="pill approval">{g.attention}</span>}
-                <ChevronDown size={18} className={`chev${open ? '' : ' closed'}`} />
-              </button>
-              {g.key !== NO_PROJECT && (
-                <button
-                  type="button"
-                  className="icon-btn"
-                  aria-label={`New conversation in ${g.name}`}
-                  onClick={() => onNewIn(g.path)}
-                >
-                  <Plus size={20} />
-                </button>
-              )}
-              <button type="button" className="icon-btn" aria-label={`Archive ${g.name}`} onClick={() => setArchiving(g)}>
-                <Archive size={18} />
-              </button>
-            </div>
-            {open && lane('hermes', g.hermes)}
-            {open && lane('paseo', g.paseo)}
-          </section>
-        );
-      })}
+      {groups.map((g) => folder(g))}
       {archiving && (
         <ConfirmDialog
           title={`Archive ${archiving.name}?`}

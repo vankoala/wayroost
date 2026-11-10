@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ConversationSummary } from '../../shared/protocol';
-import { NO_PROJECT, canonicalFolder, chatIndex, groupByProject, isBareFolder, parentOf, type ProjectGroup } from './projects';
+import { NO_PROJECT, canonicalFolder, chatIndex, groupByProject, isBareFolder, parentOf, projectTree, type ProjectGroup } from './projects';
 
 const conv = (partial: Partial<ConversationSummary> & Pick<ConversationSummary, 'source' | 'id'>): ConversationSummary => ({
   title: partial.id,
@@ -11,6 +11,77 @@ const conv = (partial: Partial<ConversationSummary> & Pick<ConversationSummary, 
 });
 
 const garden = { path: '/home/me/garden-app', name: 'garden-app' };
+
+describe('project display tree', () => {
+  const at = (path: string, extra: Partial<ConversationSummary> = {}) =>
+    conv({ source: 'hermes', id: path, project: { path, name: '' }, ...extra });
+  const tree = (list: ConversationSummary[]) => projectTree(groupByProject(list, (c) => c.status === 'needs_approval'));
+  const base = '/home/me/research';
+
+  it('creates branching ancestors at multiple levels even without a parent chat', () => {
+    const [root] = tree([at(`${base}/coverage/alpha`), at(`${base}/coverage/beta`), at(`${base}/coverage-desk`)]);
+    expect(root).toMatchObject({ path: base, name: 'research', group: null });
+    expect(root!.children.map((c) => c.name)).toEqual(['coverage', 'coverage-desk']);
+    expect(root!.children[0]!.children.map((c) => c.name)).toEqual(['alpha', 'beta']);
+    expect(root!.children[0]!.group).toBeNull();
+  });
+
+  it.each(['/', '/home', '/root', '/home/me'])('never synthesizes the bare ancestor %s', (base) => {
+    const prefix = base === '/' ? '' : base;
+    expect(tree([at(`${prefix}/first/leaf`), at(`${prefix}/second/leaf`)])).toHaveLength(2);
+  });
+
+  it('keeps a real parent and its own chats separate from descendant membership', () => {
+    const list = [at(base), at(`${base}/coverage/alpha`), at(`${base}/coverage/beta`)];
+    const groups = groupByProject(list, () => false);
+    const [root] = projectTree(groups);
+    expect(root!.group).toBe(groups.find((g) => g.path === base));
+    expect(root!.group!.members.map((c) => c.id)).toEqual([base]);
+    expect(root!.counts.hermes).toBe(3);
+    expect(root!.group!.counts.hermes).toBe(1);
+    expect(root!.children[0]!.path).toBe(`${base}/coverage`);
+  });
+
+  it('uses relative labels across unary directories and preserves backend names', () => {
+    const [root] = tree([
+      at(base), at(`${base}/reviews/full-reports`),
+      at(`${base}/custom/deep`, { project: { path: `${base}/custom/deep`, name: 'Editorial' } }),
+    ]);
+    expect(root!.children.map((c) => c.name)).toEqual(['reviews/full-reports', 'Editorial']);
+    expect(tree([at(`${base}/only/deep`)])[0]!.name).toBe('deep');
+  });
+
+  it('rolls up counts, attention, running and recency through every ancestor', () => {
+    const [root] = tree([
+      at(`${base}/coverage/alpha`, { status: 'running', updatedAt: 20 }),
+      at(`${base}/coverage/beta`, { status: 'needs_approval', updatedAt: 30 }),
+      at(`${base}/desk`, { source: 'paseo', updatedAt: 40 }),
+      conv({ source: 'hermes', id: 'run', parent: { source: 'hermes', id: `${base}/coverage/alpha` }, subagent: true, status: 'running', updatedAt: 50 }),
+    ]);
+    expect(root).toMatchObject({ counts: { hermes: 2, paseo: 1, subagents: 1 }, attention: 1, running: 2, updatedAt: 50 });
+    expect(root!.children[0]).toMatchObject({ path: `${base}/coverage`, counts: { hermes: 2, paseo: 0, subagents: 1 }, attention: 1, running: 2, updatedAt: 50 });
+  });
+
+  it('sorts siblings by rolled-up importance and leaves Other chats last', () => {
+    const [root, other] = tree([
+      at(`${base}/idle`, { updatedAt: 100 }), at(`${base}/older`, { updatedAt: 90 }),
+      at(`${base}/working/deep`, { status: 'running', updatedAt: 2 }),
+      at(`${base}/waiting/deep`, { status: 'needs_approval', updatedAt: 1 }),
+      conv({ source: 'hermes', id: 'free', status: 'needs_approval', updatedAt: 200 }),
+    ]);
+    expect(root!.children.map((c) => c.name)).toEqual(['waiting/deep', 'working/deep', 'idle', 'older']);
+    expect(other!.key).toBe(NO_PROJECT);
+    expect(other!.children).toEqual([]);
+    expect(tree([at('/home/me/quiet', { updatedAt: 100 }), at(`${base}/a`, { status: 'running' }), at(`${base}/b`)])[0]!.path).toBe(base);
+  });
+
+  it('still collapses Hermes subfolders into their Paseo project before building the tree', () => {
+    const [root] = tree([at(base, { source: 'paseo', project: { path: base, name: 'Research' } }), at(`${base}/coverage/alpha`), at(`${base}/coverage/beta`)]);
+    expect(root!.name).toBe('Research');
+    expect(root!.children).toEqual([]);
+    expect(root!.group!.members).toHaveLength(3);
+  });
+});
 
 describe('groupByProject', () => {
   const conversations = [

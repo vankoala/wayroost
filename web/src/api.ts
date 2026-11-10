@@ -1,3 +1,4 @@
+import { pendingMoves, revealMovedFolder } from './move';
 import {
   REQUEST_MARKER_HEADER,
   type Approval,
@@ -34,6 +35,7 @@ import {
   type ControlChange,
   type ControlChangeResponse,
   type ConversationControls,
+  type ConversationSummary,
   type ConversationDetail,
   type CreateResponse,
   type DeviceInfo,
@@ -63,7 +65,7 @@ import type { SettingsChecksResponse } from '../../shared/settings-checks.js';
 import type { DrainRestartComponent } from '../../shared/settings.js';
 import type { SettingsCredentialPayload, SettingsRefusal, SettingsRestartPayload, SettingsSectionPayload, SettingsUsagePayload } from './settingsModel.js';
 import { isApprovalDetail, isApprovalSnapshot } from '../../shared/approval-validation';
-import { captureRollout, approvalKey, convKey, getAuthenticationGeneration, markUnpaired, setState, toast, withEarlyItems } from './store.js';
+import { applyEvent, captureRollout, approvalKey, convKey, getAuthenticationGeneration, getState, markUnpaired, setState, toast, withEarlyItems } from './store.js';
 import { ApiError, beginAuthenticatedRequest, checkAuthentication, checkAuthenticationGeneration, reportAuthenticationAnomaly } from './authentication';
 import { authenticationEndpoint } from '../../shared/authentication';
 import { speechRequest } from './voice/request';
@@ -382,6 +384,8 @@ export const api = {
   setWorkerUpdates: (patch: { enabled?: boolean; defaultMinutes?: number }) =>
     request<WorkerUpdatesStatus>('PUT', '/api/worker-updates', patch),
   cloudAgents: () => request<CloudAgentsStatus>('GET', '/api/cloud-agents'),
+  moveThread: (thread: ThreadRef, cwd: string) =>
+    request<{ conversation: ConversationSummary }>('POST', '/api/threads/move', { thread: { source: thread.source, id: thread.id }, cwd }),
   archiveThreads: (threads: ThreadRef[], folder?: FolderScope) =>
     request<ThreadActionResult>('POST', '/api/threads/archive', { threads, ...(folder ? { folder } : {}) }),
   restoreThreads: (threads: ThreadRef[]) => request<ThreadActionResult>('POST', '/api/threads/restore', { threads }),
@@ -593,4 +597,18 @@ export async function loadConversation(source: Source, id: string, deliberateOpe
       },
     }));
   }
+}
+
+export async function moveChat(thread: ThreadRef, cwd: string): Promise<void> {
+  const move = { key: convKey(thread.source, thread.id), removed: false };
+  pendingMoves.add(move);
+  try {
+    const { conversation } = await api.moveThread(thread, cwd);
+    if (move.removed && !getState().conversations[move.key]) {
+      throw new ApiError('This Hermes chat is no longer listed. Refresh and try again.', 'http', 404);
+    }
+    applyEvent({ type: 'conversation_upsert', conversation });
+    revealMovedFolder(conversation.project?.path ?? cwd);
+    toast('Chat moved to folder.', 'info');
+  } finally { pendingMoves.delete(move); }
 }

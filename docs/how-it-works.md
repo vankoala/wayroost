@@ -109,6 +109,95 @@ agents started by another agent are nested under the thread that started them.
 Hermes agents running inside Paseo carry a "Hermes · in Paseo" badge, and their
 Hermes-side session is not listed twice.
 
+Project nesting is a display tree over those flat groups. Real folders keep their
+own chats and actions. Branching ancestors become synthetic folders; bare homes
+and system roots do not. Each folder rolls up counts, attention, running status
+and recency from its descendants. Siblings keep the inbox's priority order and
+Other chats stays last. Subfolders start collapsed unless something inside is
+working or needs attention; explicit open and closed choices persist by path.
+Synthetic folders offer new chat through the usual folder check, but no archive.
+
+Hermes lists the newest 60 ordinary chats separately from the newest 100 one-shot
+runs. The runs have a 10-second cache and retain their launch lineage. Delegate
+queries exclude one-shots so automated runs cannot crowd them out either. Tidy-up
+and folder archive still page through all eligible runs; archived listing includes
+them for restoration. Activity and maintenance quiet checks still inspect their
+complete backend listings.
+
+Hermes' `is_active: true` recent-write flag means running for every source, even
+if an end stamp is present. Otherwise, a one-shot without a valid `ended_at`
+counts as running only for six hours after its freshest valid `last_active` or
+`started_at` (Unix seconds), measured against the server clock. The row model
+carries no separate update stamp. This allowance is named
+`UNFINISHED_ONESHOT_WINDOW_MS`; it extends Hermes' 300-second recent-write signal
+without leaving crashed runs running forever. Runs past the window (or with no
+valid activity/start stamp) can become idle, move, and enter tidy-up and folder
+sweeps, including beyond the listing window. Dashboard activity and approvals
+still keep a run busy regardless of age. Sweeps judge each row their pagination
+just fetched, together with live dashboard activity, turns and approvals. They
+also replace cached row flags, so a finished run previously listed as active
+cannot remain running or evade a sweep after falling outside the newest 100 runs.
+
+An idle top-level Hermes chat can move to an existing folder using **This thread →
+Move to folder…**, or by dragging its Projects row onto any folder header. The
+picker includes real and synthetic folders plus a checked absolute path; it never
+creates folders. Paseo agents and sub-agents cannot move independently. Running
+chats and pending approvals block a move. After Hermes confirms the move, connected
+clients receive the new summary, the destination and its ancestors open, and the
+caller sees a confirmation. A refusal preserves the previous folder and expansion
+choices. File drops retain the attachment flow.
+
+While a browser move request is outstanding, it remembers removal events for
+that chat. If the chat is still absent when the reply arrives, the browser shows
+the no-longer-listed message without applying the returned summary or confirming
+success. If the chat was restored before the reply, the move applies normally.
+This tracking ends with the request.
+
+Interactive chats (dashboard, desktop, TUI and messaging sources) do not need an
+end stamp to move: open idle chats commonly have none. Moves check dashboard
+activity, local turns, pending approvals, `is_active`, and the bounded one-shot
+rule above. Admission first joins the current activity poll, then fetches that
+id's row from Hermes; cached listing rows never authorize a move. A failed fetch
+returns 503, an absent or archived chat returns 404, and a non-movable kind is
+refused. If detail omits the listing's `is_active` flag, admission also finds the
+id in a fresh listing of its source (at most 50 pages of 100 rows); automated runs
+cannot crowd an ordinary chat out of that lookup. An unverified id refuses.
+A superseding poll requires another join and another fresh row. All
+admission steps share `MOVE_ADMISSION_WAIT_MS` (eight seconds on the server clock),
+joining at most three polls. Expiry, an unavailable current read or newer chat
+activity invalidating the read returns the same couldn't-check 503 without
+calling the native move. These clock and timer reads can be replaced in tests.
+
+Move completion checks the listing revision and removal marker before publishing
+and after refreshing. If archive, tidy, deletion or listing invalidation occurred
+while the move waited, the caller receives the existing no-longer-listed 404;
+no removed summary is republished. The native folder change may already have
+happened, so refresh before retrying. Keeping the existing error response avoids
+returning a removed chat that the caller would reinsert into its list. Background
+summary publication also respects removal markers.
+
+Each chat accepts one move at a time through reconciliation. After every native
+move attempt, the server refreshes from Hermes storage even when the native reply
+fails or is discarded. Reconciliation requires both ordinary and one-shot listings
+within the listing deadline. An incomplete refresh schedules one bounded pending
+retry; an ordinary refresh coalescing with it retains the complete-listing
+requirement. A failed retry ends without scheduling another retry.
+
+A silent external one-shot older than six hours, or an interactive chat running
+in another process without a write for 300 seconds, can therefore be moved if
+the dashboard reports no activity or approval. Hermes exposes no live registry
+for those external processes here. This bounded heuristic accepts that residual
+so normal open chats and crashed runs remain usable; moves use Hermes' native
+workspace RPC and never cold-resume a run to probe it (which could restart it).
+
+`POST /api/threads/move` accepts `{ thread: { source: "hermes", id }, cwd }` and
+returns `{ conversation }`. Like thread archive, it uses the shared host, Access,
+paired-device and CSRF checks, checks live authorization after awaits, and logs
+only the thread id and outcome. A maintenance hold refuses the move with 503,
+including a hold that arrives while folder or live-status checks are pending.
+These chat behaviors are enabled by default; they do not change settings or use
+the rollout switches for settings writes and new-chat defaults.
+
 ## Starting something new
 
 "New conversation" — and **New task** on Home — opens one box: say the thing,

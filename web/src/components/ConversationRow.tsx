@@ -1,3 +1,4 @@
+import type { DragEvent } from 'react';
 import { Bot, CornerDownRight, Feather } from 'lucide-react';
 import type { ConversationSummary } from '../../../shared/protocol';
 import { readableBridgeText } from '../bridge';
@@ -30,6 +31,8 @@ export function ConversationRow({
   from,
   nested,
   compact,
+  onChatDragStart,
+  onChatDragEnd,
 }: {
   c: ConversationSummary;
   active: boolean;
@@ -40,6 +43,8 @@ export function ConversationRow({
   nested?: boolean;
   /** Inside a project card: the folder is already shown, so lead with the agent. */
   compact?: boolean;
+  onChatDragStart?: (e: DragEvent<HTMLButtonElement>) => void;
+  onChatDragEnd?: () => void;
 }) {
   const filter = parseChatsFilter(useUrl());
   const preview = readableBridgeText(c.preview);
@@ -51,6 +56,9 @@ export function ConversationRow({
   return (
     <button
       type="button"
+      draggable={!!onChatDragStart}
+      onDragStart={onChatDragStart}
+      onDragEnd={onChatDragEnd}
       className={`row${nested ? ' nested' : ''}`}
       aria-current={active ? 'page' : undefined}
       onClick={() => navigate(conversationPath(c.source, c.id, filter))}

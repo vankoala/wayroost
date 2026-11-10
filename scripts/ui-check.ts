@@ -752,14 +752,16 @@ try {
     act: async (page) => {
       await page.click('.view-toggle button:has-text("Projects")');
       await page.waitForSelector('.project');
-      const webapp = page.locator('.project', { hasText: 'webapp' });
+      const webapp = page.locator('.project[aria-label="webapp"]');
       if ((await webapp.locator('.lane-hermes .row').count()) !== 1) problems.push('hermes chat in project folder not grouped');
       // Everything the login agent started sits under it, the Hermes chat it started through the bridge too.
       const login = webapp.locator('.lane-paseo .thread', { hasText: 'Fix flaky login test' });
       const under = (await login.locator('.thread-children .row-title').allInnerTexts()).sort();
       if (under.join() !== 'Collect CI logs,Dig through flaky-test history,Release notes: session fixes') problems.push(`login thread: ${under.join()}`);
       // Started through the real bridge by the billing agent (Paseo → Hermes): nested under it.
-      const billing = page.locator('.project', { hasText: 'billing' });
+      const billing = page.locator('.project[aria-label="billing"]');
+      const billingToggle = billing.locator('> .project-head .project-toggle');
+      if (await billingToggle.getAttribute('aria-expanded') === 'false') await billingToggle.click();
       if (!(await billing.locator('.lane-paseo .thread-children .row', { hasText: 'Slowest invoice tests' }).count())) {
         problems.push('bridge-started chat not under its starter');
       }
@@ -774,6 +776,21 @@ try {
     act: async (page) => {
       const bar = await page.locator('.links-bar').innerText();
       if (!bar.includes('Fix flaky login test') || !bar.includes('Collect CI logs')) problems.push(`links bar: ${bar}`);
+    },
+  });
+  await shoot('12a-phone-move-picker', {
+    ...phone,
+    dark: true,
+    path: '/c/hermes/20260927_080000_abcdef',
+    ready: '.timeline',
+    act: async (page) => {
+      await page.getByRole('button', { name: 'Thread actions', exact: true }).click();
+      await page.getByRole('button', { name: /^Move to folder…/ }).click();
+      await page.getByRole('dialog', { name: 'Move to folder', exact: true }).waitFor();
+      if (await page.locator('html').evaluate((element) => element.scrollWidth > element.clientWidth)) problems.push('move picker overflows phone width');
+      if (!(await page.getByRole('radiogroup', { name: 'Project folders' }).getByRole('radio').count())) {
+        problems.push('move picker has no project folders');
+      }
     },
   });
   await shoot('09-phone-hidden-payload', {
@@ -2250,7 +2267,7 @@ try {
   });
 
   // ---- Everything nested under whatever started it ----
-  const notesApp = (page: Page) => page.locator('.project', { hasText: 'notes-app' });
+  const notesApp = (page: Page) => page.locator('.project[aria-label="notes-app"]');
   await shoot('35-phone-projects-nested', {
     ...phone,
     dark: true,

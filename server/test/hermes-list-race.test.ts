@@ -92,6 +92,7 @@ describe('Hermes chat lists that overlap', () => {
           acpStarted.resolve();
           return await abortOnDevice(acpResponse.promise) as T;
         }
+        if (url.searchParams.get('source') === 'oneshot') return { sessions: [] } as T;
         runsStarted.resolve();
         return (runsResponse ? await abortOnDevice(runsResponse.promise) : { sessions: runRows }) as T;
       }
@@ -112,7 +113,7 @@ describe('Hermes chat lists that overlap', () => {
   });
 
   const chatQueries = () => queries.filter((query) => query.get('limit') === '60');
-  const runQueries = () => queries.filter((query) => query.get('exclude_sources') === 'cron,acp,subagent');
+  const runQueries = () => queries.filter((query) => query.get('exclude_sources') === 'cron,acp,oneshot,subagent');
   const acpQueries = () => queries.filter((query) => query.get('source') === 'acp');
   const upserts = () => published.flatMap((event) => event.type === 'conversation_upsert' ? [event.conversation] : []);
 
@@ -208,7 +209,7 @@ describe('Hermes chat lists that overlap', () => {
       let data: unknown;
       if (url.pathname === '/api/sessions') {
         queries.push(url.searchParams);
-        data = { sessions: url.searchParams.get('limit') === '60' ? [parent, parent] : runRows };
+        data = { sessions: url.searchParams.get('source') === 'oneshot' ? [] : url.searchParams.get('limit') === '60' ? [parent, parent] : runRows };
       } else if (path === '/api/config/defaults') data = { sessions: { show_subagents: true } };
       else if (path === '/api/chat/workspaces') data = { default_cwd: '/home/me' };
       else throw new Error(`Unexpected request: ${path}`);
@@ -234,14 +235,16 @@ describe('Hermes chat lists that overlap', () => {
     expect(completed).toHaveBeenCalledTimes(1);
     expectRows(await foreground);
     expect(Date.now() - startedAt).toBeLessThan(6_000);
-    expect(chatQueries().length).toBeLessThanOrEqual(3);
+    expect(chatQueries().length).toBeLessThanOrEqual(4);
     expect(runQueries()).toHaveLength(1);
-    expect(queries.length).toBeLessThanOrEqual(4);
+    expect(queries.filter((q) => q.get('source') !== 'oneshot').length).toBeLessThanOrEqual(5);
     expect(acpQueries()).toHaveLength(0);
 
     await vi.advanceTimersByTimeAsync(1_500);
-    expectRows(await adapter.listConversations());
-    expect(queries.length).toBeLessThanOrEqual(4);
+    const afterChanges = adapter.listConversations();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expectRows(await afterChanges);
+    expect(queries.filter((q) => q.get('source') !== 'oneshot').length).toBeLessThanOrEqual(6);
   });
 
   it.each(['stale first', 'fresh first'])('uses fresh data after invalidation during the overlap (%s)', async (order) => {

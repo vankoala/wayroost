@@ -49,6 +49,8 @@ export interface ProjectGroup {
   key: string;
   name: string;
   path: string | null;
+  /** A name supplied by a backend, rather than the path basename. */
+  named: boolean;
   /** Threads whose root is a Hermes chat… */
   hermes: ThreadNode[];
   /** …and those whose root is a Paseo agent. */
@@ -241,6 +243,7 @@ export function groupByProject(
         key,
         name: path ? (names.get(path) ?? path.split('/').pop() ?? path) : 'Other chats',
         path,
+        named: path !== null && names.has(path),
         hermes: [],
         paseo: [],
         members: [],
@@ -277,11 +280,81 @@ export function groupByProject(
     group.paseo.sort(byThread);
   }
 
-  return [...groups.values()].sort(
-    (a, b) =>
-      Number(a.key === NO_PROJECT) - Number(b.key === NO_PROJECT) ||
-      Number(b.attention > 0) - Number(a.attention > 0) ||
-      Number(b.running > 0) - Number(a.running > 0) ||
-      b.updatedAt - a.updatedAt,
-  );
+  return [...groups.values()].sort(byProjectImportance);
+}
+
+/** Display folders only: each real group's membership and actions stay unchanged. */
+export interface ProjectFolder {
+  key: string;
+  name: string;
+  path: string | null;
+  group: ProjectGroup | null;
+  children: ProjectFolder[];
+  counts: ProjectGroup['counts'];
+  attention: number;
+  running: number;
+  updatedAt: number;
+}
+
+type ProjectOrder = Pick<ProjectFolder, 'key' | 'attention' | 'running' | 'updatedAt'>;
+const byProjectImportance = (a: ProjectOrder, b: ProjectOrder) =>
+  Number(a.key === NO_PROJECT) - Number(b.key === NO_PROJECT) ||
+  Number(b.attention > 0) - Number(a.attention > 0) ||
+  Number(b.running > 0) - Number(a.running > 0) ||
+  b.updatedAt - a.updatedAt;
+
+/** Keep real folders and branching ancestors; skip unary directories and bare homes. */
+export function projectTree(groups: readonly ProjectGroup[]): ProjectFolder[] {
+  interface Directory {
+    path: string;
+    group: ProjectGroup | null;
+    children: Map<string, Directory>;
+  }
+  const root: Directory = { path: '/', group: null, children: new Map() };
+  for (const group of groups) {
+    if (!group.path) continue;
+    let dir = root;
+    for (const part of group.path.split('/').filter(Boolean)) {
+      let child = dir.children.get(part);
+      if (!child) {
+        child = { path: `${dir.path === '/' ? '' : dir.path}/${part}`, group: null, children: new Map() };
+        dir.children.set(part, child);
+      }
+      dir = child;
+    }
+    dir.group = group;
+  }
+  const folder = (path: string | null, group: ProjectGroup | null, children: ProjectFolder[]): ProjectFolder => {
+    const node: ProjectFolder = {
+      key: path ?? NO_PROJECT,
+      name: group?.name ?? path!.split('/').pop()!,
+      path,
+      group,
+      children: children.sort(byProjectImportance),
+      counts: { hermes: group?.counts.hermes ?? 0, paseo: group?.counts.paseo ?? 0, subagents: group?.counts.subagents ?? 0 },
+      attention: group?.attention ?? 0,
+      running: group?.running ?? 0,
+      updatedAt: group?.updatedAt ?? 0,
+    };
+    for (const child of children) {
+      node.counts.hermes += child.counts.hermes;
+      node.counts.paseo += child.counts.paseo;
+      node.counts.subagents += child.counts.subagents;
+      node.attention += child.attention;
+      node.running += child.running;
+      node.updatedAt = Math.max(node.updatedAt, child.updatedAt);
+      if (!child.group?.named) child.name = child.path!.slice(path!.length + 1);
+    }
+    return node;
+  };
+  const visit = (dir: Directory): ProjectFolder[] => {
+    const children = [...dir.children.values()].flatMap(visit);
+    return dir.group || (children.length > 1 && !isBareFolder(dir.path))
+      ? [folder(dir.path, dir.group, children)]
+      : children;
+  };
+  const nodes = visit(root);
+  const other = groups.find((g) => g.key === NO_PROJECT);
+  if (other) nodes.push(folder(null, other, []));
+  return nodes.sort(byProjectImportance);
 }

@@ -45,18 +45,18 @@
     "migrate:settings": "esbuild scripts/migrate-settings.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/migrate-settings.mjs && node dist/migrate-settings.mjs"
   },
   "dependencies": {
-    "@fastify/static": "10.1.5",
+    "@fastify/static": "10.1.10",
     "@fastify/websocket": "11.3.1",
     "@fontsource/figtree": "5.3.0",
     "@fontsource/outfit": "5.3.0",
     "@fontsource/young-serif": "5.3.0",
     "@getpaseo/client": "0.9.2",
     "@getpaseo/protocol": "0.9.2",
-    "fastify": "5.12.5",
+    "fastify": "5.12.8",
     "jose": "6.2.12",
     "ws": "8.22.0",
     "yaml": "2.9.1",
-    "zod": "4.6.5"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/jsdom": "30.0.0",

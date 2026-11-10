@@ -177,20 +177,29 @@ const LIST_TTL_MS = 3_000;
  */
 const LIST_WAIT_MS = 30_000;
 const ACTIVE_POLL_MS = 5_000;
+/** One activity poll interval plus time to read the stored row. Shared by every admission step. */
+const MOVE_ADMISSION_WAIT_MS = ACTIVE_POLL_MS + 3_000;
+const MOVE_ACTIVITY_POLLS = 3;
 /** After a turn ends or a session stops: long enough for Hermes to settle it. */
 const ACTIVE_CHECK_DELAY_MS = 300;
-const LIST_QUERY = '/api/sessions?limit=60&order=recent&archived=exclude&min_messages=1&exclude_sources=cron,acp';
+const LIST_QUERY = '/api/sessions?limit=60&order=recent&archived=exclude&min_messages=1&exclude_sources=cron,acp,oneshot';
 /**
  * The same list with delegate_task runs in it: excluding `subagent` is how a list asks for them,
  * and Hermes adds them when `sessions.show_subagents` is on (hermes_cli/session_listing.py).
  */
-const SUBAGENT_QUERY = '/api/sessions?limit=100&order=recent&archived=exclude&min_messages=1&exclude_sources=cron,acp,subagent';
+const SUBAGENT_QUERY = '/api/sessions?limit=100&order=recent&archived=exclude&min_messages=1&exclude_sources=cron,acp,oneshot,subagent';
 /** Hermes-in-Paseo (ACP) sessions, for runs whose parent is one under a later id. */
+const ONESHOT_QUERY = '/api/sessions?source=oneshot&limit=100&order=recent&archived=exclude&min_messages=1';
+const ONESHOT_TTL_MS = 10_000;
+/** External runs have no live registry here. Allow six hours without a stored write before expiring them. */
+const UNFINISHED_ONESHOT_WINDOW_MS = 6 * 60 * 60_000;
 const ACP_QUERY = '/api/sessions?source=acp&limit=100&order=recent&archived=include';
 /** Tidying up pages through every top-level chat, this many at a time, up to TIDY_PAGES pages. */
 const TIDY_PAGE = 100;
 const TIDY_PAGES = 50;
 const TIDY_QUERY = `/api/sessions?limit=${TIDY_PAGE}&order=recent&archived=exclude&min_messages=1&exclude_sources=cron,acp`;
+/** Detail replies need not carry the listing's recent-write flag. Look up that id afresh. */
+const MOVE_ROW_QUERY = `/api/sessions?limit=${TIDY_PAGE}&order=recent&archived=include&min_messages=0`;
 const SUBAGENT_TTL_MS = 10_000;
 const ACP_TTL_MS = 60_000;
 /** Where Hermes runs a chat with no folder of its own (its dashboard's `default_cwd` for new chats). */
@@ -245,6 +254,17 @@ function priceLabel(price: { input?: string; output?: string; free?: boolean } |
 function sameFolder(a: string, b: string): boolean {
   const clean = (path: string) => posix.normalize(path).replace(/(.)\/+$/, '$1');
   return clean(a) === clean(b);
+}
+
+/** Open interactive chats need not end; unfinished one-shots get a bounded liveness allowance. */
+function storedRunMayBeRunning(row: HermesSessionRow, now: number): boolean {
+  if (row.is_active === true) return true;
+  if (row.source !== 'oneshot') return false;
+  if (typeof row.ended_at === 'number' && Number.isFinite(row.ended_at) && row.ended_at >= 0) return false;
+  // These are the activity/start stamps HermesSessionRow actually carries (Unix seconds).
+  const stamps = [row.last_active, row.started_at]
+    .filter((at): at is number => typeof at === 'number' && Number.isFinite(at) && at >= 0);
+  return stamps.length > 0 && now - Math.max(...stamps) * 1000 < UNFINISHED_ONESHOT_WINDOW_MS;
 }
 
 /** The model picker's options: each signed-in provider's usable models, id = [provider, model]. */
@@ -335,12 +355,15 @@ export class HermesAdapter implements HermesSource {
   /** The chat list being fetched, shared by lists that overlap within one revision. */
   private listFetch: Promise<void> | undefined;
   private listRevision = 0;
+  private readonly moving = new Set<string>();
   /** delegate_task runs from the last listing, by id, with the chat each nests under. */
   private subagents = new Map<string, SubagentEntry>();
   private subagentRows: { at: number; rows: HermesSessionRow[] } | undefined;
   /** The run list being fetched, shared by lists that overlap (the one after connecting, and yours). */
   private subagentFetch: Promise<HermesSessionRow[]> | undefined;
   private subagentRevision = 0;
+  private oneshotRows: { at: number; rows: HermesSessionRow[] } | undefined;
+  private oneshotFetch: Promise<void> | undefined;
   private acpRows: { at: number; rows: HermesSessionRow[] } | undefined;
   private acpFetch: Promise<HermesSessionRow[]> | undefined;
   /** The folder Hermes runs a chat with no folder of its own in (see refreshDefaultFolder). */
@@ -352,6 +375,7 @@ export class HermesAdapter implements HermesSource {
   /** Chats a detail row showed to be delegate_task runs (read-only here). */
   private readonly delegateRuns = new Set<string>();
   private listRefresh: ReturnType<typeof setTimeout> | undefined;
+  private listRefreshRequiresComplete = false;
   private activeTimer: ReturnType<typeof setInterval> | undefined;
   private activeCheck: ReturnType<typeof setTimeout> | undefined;
   private credentialAttempts: number[] = [];
@@ -429,6 +453,7 @@ export class HermesAdapter implements HermesSource {
     clearInterval(this.activeTimer);
     this.activeTimer = undefined;
     clearTimeout(this.listRefresh);
+    this.listRefreshRequiresComplete = false;
     clearTimeout(this.activeCheck);
     this.activeCheck = undefined;
     this.gateway.stop();
@@ -487,10 +512,14 @@ export class HermesAdapter implements HermesSource {
 
   // ---- inbox ----------------------------------------------------------------
 
-  async listConversations(): Promise<ConversationSummary[]> {
+  async listConversations(requireComplete = false): Promise<ConversationSummary[]> {
     const signal = deviceSignal();
     checkDeviceSignal(signal);
-    if (this.statusValue.state === 'needs_credentials') return [];
+    const incomplete = new UserFacingError('Hermes could not fetch the complete conversation list. Try again in a moment.', 503);
+    if (this.statusValue.state === 'needs_credentials') {
+      if (requireComplete) throw incomplete;
+      return [];
+    }
     const deadline = Date.now() + LIST_WAIT_MS;
     const expired = new UserFacingError('Hermes took too long to list conversations. Try again in a moment.', 503);
     let timer!: ReturnType<typeof setTimeout>;
@@ -501,7 +530,10 @@ export class HermesAdapter implements HermesSource {
     try {
       for (;;) {
         checkDeviceSignal(signal);
-        if (this.status().state === 'needs_credentials') return [];
+        if (this.status().state === 'needs_credentials') {
+          if (requireComplete) throw incomplete;
+          return [];
+        }
         if (Date.now() >= deadline) throw expired;
         if (!this.listCache || Date.now() - this.listCache.at >= LIST_TTL_MS) {
           // Shared work belongs to the adapter; each device cancels only its own wait.
@@ -511,17 +543,31 @@ export class HermesAdapter implements HermesSource {
           continue;
         }
         const cache = this.listCache;
-        await wait(withDeviceSignal(undefined, () => this.refreshDefaultFolder()));
+        await wait(withDeviceSignal(undefined, () => Promise.all([
+          this.refreshDefaultFolder(),
+          this.refreshOneshots().catch((err: unknown) => {
+            if (requireComplete) throw err;
+            this.log.warn({}, "couldn't list hermes one-shot runs");
+          }),
+        ])));
         checkDeviceSignal(signal);
-        if (this.status().state === 'needs_credentials') return [];
+        if (this.status().state === 'needs_credentials') {
+          if (requireComplete) throw incomplete;
+          return [];
+        }
+        const listed = [...new Set([...cache.ids, ...(this.oneshotRows?.rows ?? []).map((r) => r.id)])];
         // Sub-agent runs come on top; they never take a chat's place, and never break the list.
-        await wait(withDeviceSignal(undefined, () => this.refreshSubagents(cache.ids)
+        await wait(withDeviceSignal(undefined, () => this.refreshSubagents(listed)
           .catch((err) => this.log.warn({ err: String(err) }, "couldn't list hermes sub-agents"))));
         checkDeviceSignal(signal);
-        if (this.status().state === 'needs_credentials') return [];
+        if (this.status().state === 'needs_credentials') {
+          if (requireComplete) throw incomplete;
+          return [];
+        }
         if (Date.now() >= deadline) throw expired;
+        if (requireComplete && (this.listCache !== cache || !this.oneshotRows)) continue;
         // Archived or deleted from here while this list waited: not brought back.
-        const chats = cache.ids.filter((id) => !this.tidied.has(id));
+        const chats = listed.filter((id) => !this.tidied.has(id));
         return [...chats, ...[...this.subagents.keys()].filter((id) => !chats.includes(id))].map((id) => this.summaryFor(id));
       }
     } finally {
@@ -556,8 +602,28 @@ export class HermesAdapter implements HermesSource {
     return fetch;
   }
 
+  private refreshOneshots(): Promise<void> {
+    if (this.oneshotRows && Date.now() - this.oneshotRows.at < ONESHOT_TTL_MS) return Promise.resolve();
+    if (!this.oneshotFetch) {
+      const revision = this.listRevision;
+      const fetch = this.auth.json<{ sessions?: HermesSessionRow[] }>(ONESHOT_QUERY).then((data) => {
+        if (revision !== this.listRevision) return;
+        const rows = data.sessions ?? [];
+        for (const row of rows) {
+          this.rows.set(row.id, row);
+          this.tidied.delete(row.id);
+        }
+        this.oneshotRows = { at: Date.now(), rows };
+      }).finally(() => { if (this.oneshotFetch === fetch) this.oneshotFetch = undefined; });
+      this.oneshotFetch = fetch;
+    }
+    return this.oneshotFetch;
+  }
+
   private invalidateList(): void {
     this.listRevision++;
+    this.oneshotRows = undefined;
+    this.oneshotFetch = undefined;
     this.listCache = undefined;
     this.listFetch = undefined;
   }
@@ -674,11 +740,177 @@ export class HermesAdapter implements HermesSource {
     return result;
   }
 
+  /**
+   * Admission uses only the row fetched for this id after joining current activity;
+   * cached listing rows and summaries never authorize a move. Missing, archived, nested,
+   * active or approval-blocked chats refuse. Open interactive chats need no end
+   * stamp; unfinished one-shots use the bounded stored-run allowance.
+   * If detail omits the recent-write flag, a fresh, bounded listing lookup supplies
+   * its activity row. Both reads belong to this admission, never to the list cache.
+   * Tidy and folder sweeps pass their freshly paged row to the same busy check,
+   * and replace cached flags so a stored completion also clears listing status.
+   *
+   * Poll joins, the fresh fetch and final checks share one server-clock deadline,
+   * with at most MOVE_ACTIVITY_POLLS reads joined. Supersession during the fetch
+   * requires joining again and fetching again; uncertainty or expiry returns 503.
+   * No cold resume is needed. Authorization and maintenance are checked last.
+   *
+   * The listing revision and removal marker must survive the native operation
+   * and refresh. Archive, tidy, delete or invalidation wins: return the existing
+   * no-longer-listed error, never a removed summary. Every attempted native move
+   * reconciles through a fresh, bounded listing, even when its reply is rejected
+   * or lost. Removed chats remain suppressed. Overlapping moves of the same chat
+   * refuse as busy until reconciliation finishes; other chats move independently.
+   */
+  async moveToFolder(stored: string, cwd: string, beforeMove?: () => void): Promise<ConversationSummary> {
+    if (this.moving.has(stored)) {
+      throw new UserFacingError('This chat is running or waiting for approval. Wait until it finishes working and has no pending approval before moving it.', 409);
+    }
+    this.moving.add(stored);
+    try {
+      return await this.moveToFolderOnce(stored, cwd, beforeMove);
+    } finally { this.moving.delete(stored); }
+  }
+
+  private async moveToFolderOnce(stored: string, cwd: string, beforeMove?: () => void): Promise<ConversationSummary> {
+    const unavailable = new UserFacingError("Couldn't check whether the chat is idle. Try again when Hermes is connected.", 503);
+    const noLongerListed = new UserFacingError('This Hermes chat is no longer listed. Refresh and try again.', 404);
+    const listingRevision = this.listRevision;
+    const stillListed = (revision: number) => {
+      if (revision !== this.listRevision || this.tidied.has(stored)) throw noLongerListed;
+    };
+    const deadline = Date.now() + MOVE_ADMISSION_WAIT_MS;
+    const checkDeadline = () => { if (Date.now() >= deadline) throw unavailable; };
+    const fetchDeadline = new AbortController();
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => { reject(unavailable); fetchDeadline.abort(); }, MOVE_ADMISSION_WAIT_MS).unref();
+    });
+    const wait = <T>(pending: Promise<T>) => abortOnDevice(Promise.race([pending, timeout]));
+    const read = async <T>(path: string): Promise<T> => {
+      checkDeviceSignal();
+      checkDeadline();
+      try {
+        const value = await wait(this.auth.json<T>(path, { signal: fetchDeadline.signal }));
+        checkDeadline();
+        return value;
+      } catch (err) {
+        checkDeviceSignal();
+        checkDeadline();
+        if (err instanceof HermesAuthError && err.status === 404) throw noLongerListed;
+        throw unavailable;
+      }
+    };
+    const movableRow = (row: HermesSessionRow | null | undefined): HermesSessionRow => {
+      if (!row || row.archived) throw noLongerListed;
+      if (row.id !== stored) throw unavailable;
+      // Detail config identifies native delegates; launch lineage identifies shell runs.
+      if (isDelegateRun(row) || row.source === 'subagent' ||
+          this.options.lineage?.launchOf([stored, ...(row._lineage_ids ?? [])])) {
+        throw new UserFacingError('A sub-agent follows its parent chat and cannot be moved on its own.', 400);
+      }
+      if (row.source === 'acp' || row.source === 'cron') {
+        throw new UserFacingError('Only top-level Hermes chats can be moved.', 400);
+      }
+      return row;
+    };
+    const generation = this.gateway.generation;
+    let row!: HermesSessionRow;
+    try {
+      void this.refreshActive();
+      let poll = this.activityPoll!;
+      let admitted = false;
+      const validPoll = () => {
+        const revision = this.activityRevisions.get(stored);
+        if (this.gateway.state !== 'ready' || generation !== this.gateway.generation ||
+            poll.attachmentGeneration !== this.attachmentGeneration || this.attaching.size > 0 ||
+            revision !== undefined && revision !== poll.revision) throw unavailable;
+      };
+      for (let joined = 0; joined < MOVE_ACTIVITY_POLLS; joined++) {
+        const live = await wait(poll.result);
+        checkDeadline();
+        if (this.activityPoll !== poll) { poll = this.activityPoll!; continue; }
+        if (!live) throw unavailable;
+        validPoll();
+        stillListed(listingRevision);
+        row = await read<HermesSessionRow>(`/api/sessions/${encodeURIComponent(stored)}`);
+        if (this.activityPoll !== poll) { poll = this.activityPoll!; continue; }
+        validPoll();
+        stillListed(listingRevision);
+        row = movableRow(row);
+        if (row.is_active == null) {
+          let listed: HermesSessionRow | undefined;
+          const source = row.source ? `&source=${encodeURIComponent(row.source)}` : '';
+          for (let page = 0; page < TIDY_PAGES; page++) {
+            const data = await read<{ sessions?: HermesSessionRow[] }>(`${MOVE_ROW_QUERY}&offset=${page * TIDY_PAGE}${source}`);
+            if (!Array.isArray(data.sessions)) throw unavailable;
+            listed = data.sessions.find((candidate) => candidate?.id === stored);
+            if (listed || data.sessions.length < TIDY_PAGE) break;
+          }
+          checkDeadline();
+          if (!listed) throw noLongerListed;
+          row = { ...row, ...listed };
+        }
+        checkDeadline();
+        if (this.activityPoll !== poll) { poll = this.activityPoll!; continue; }
+        validPoll();
+        stillListed(listingRevision);
+        row = movableRow(row);
+        if (this.workingNow(stored, row)) {
+          throw new UserFacingError('This chat is running or waiting for approval. Wait until it finishes working and has no pending approval before moving it.', 409);
+        }
+        beforeMove?.();
+        checkDeviceSignal();
+        checkDeadline();
+        if (this.activityPoll !== poll) throw unavailable;
+        validPoll();
+        stillListed(listingRevision);
+        admitted = true;
+        break;
+      }
+      if (!admitted) throw unavailable;
+    } finally {
+      clearTimeout(timer);
+      fetchDeadline.abort();
+    }
+    let refreshRevision = listingRevision;
+    try {
+      const result = await this.call<{ cwd: string; branch?: string | null; git_repo_root?: string | null }>(
+        'session.workspace.move', { session_key: stored, cwd }, 30_000,
+      );
+      stillListed(listingRevision);
+      row.cwd = result.cwd;
+      // Keep only listing fields; the raw detail config is not needed after admission.
+      const { model_config: _config, ...listedRow } = row;
+      this.rows.set(stored, listedRow);
+      this.publishSummary(stored);
+    } finally {
+      // Backend storage can change even when the reply fails or authorization ends.
+      refreshRevision = await withDeviceSignal(undefined, () => this.reconcileMove());
+    }
+    stillListed(refreshRevision);
+    return this.summaryFor(stored);
+  }
+
+  private async reconcileMove(): Promise<number> {
+    this.invalidateList();
+    const revision = this.listRevision;
+    try {
+      // Reconciliation needs both ordinary and one-shot listings within the shared deadline.
+      for (const c of await this.listConversations(true)) this.publishSummary(c.id);
+    } catch {
+      // A lost listing must not replace the native outcome. Retry from a fresh revision.
+      this.scheduleListRefresh(800, true);
+    }
+    return revision;
+  }
+
   async restoreThreads(ids: string[], signal = deviceSignal()): Promise<ThreadActionResult> {
     const result = await eachThread('hermes', ids, async (id) => {
       await this.patchSession(id, { archived: false }, signal);
       this.tidied.delete(id);
     }, signal);
+    this.invalidateList();
     this.scheduleListRefresh(0);
     return result;
   }
@@ -719,7 +951,7 @@ export class HermesAdapter implements HermesSource {
   async idleThreads(before: number): Promise<string[]> {
     const ids: string[] = [];
     await this.eachChatPage('', (row) => {
-      if (sessionSummary(row, 'idle', 0).updatedAt < before && !this.workingNow(row.id)) ids.push(row.id);
+      if (sessionSummary(row, 'idle', 0).updatedAt < before && !this.workingNow(row.id, row)) ids.push(row.id);
     });
     return ids;
   }
@@ -737,26 +969,31 @@ export class HermesAdapter implements HermesSource {
     const ids: string[] = [];
     await this.eachChatPage(`&cwd_prefix=${encodeURIComponent(path)}`, (row) => {
       const at = canonicalFolder(sessionSummary(row, 'idle', 0).project?.path);
-      if (at && !isBareFolder(at) && projectOf(at) === path && !this.workingNow(row.id)) ids.push(row.id);
+      if (at && !isBareFolder(at) && projectOf(at) === path && !this.workingNow(row.id, row)) ids.push(row.id);
     });
     return ids;
   }
 
   /** Every non-archived top-level chat, a page at a time. Collect first, act after: acting shifts the pages. */
   private async eachChatPage(extra: string, visit: (row: HermesSessionRow) => void): Promise<void> {
+    const revision = this.listRevision;
     for (let page = 0; page < TIDY_PAGES; page++) {
       const data = await this.auth.json<{ sessions?: HermesSessionRow[] }>(
         `${TIDY_QUERY}&offset=${page * TIDY_PAGE}${extra}`,
       );
       const rows = data.sessions ?? [];
-      rows.forEach(visit);
+      for (const row of rows) {
+        // A fetched completion also replaces stale recent-write flags in listing summaries.
+        if (revision === this.listRevision && !this.tidied.has(row.id)) this.rows.set(row.id, row);
+        visit(row);
+      }
       if (rows.length < TIDY_PAGE) return;
     }
   }
 
-  private workingNow(stored: string): boolean {
-    const { status } = this.summaryFor(stored);
-    return status === 'running' || status === 'needs_approval';
+  private workingNow(stored: string, row: HermesSessionRow): boolean {
+    return storedRunMayBeRunning(row, Date.now()) || activeStatus(this.activeByStored.get(stored)) !== 'idle' ||
+      this.turns.has(stored) || this.approvalsFor(stored).length > 0;
   }
 
   /** Every id of a compressed chat's lineage, as Hermes reports it. */
@@ -789,7 +1026,9 @@ export class HermesAdapter implements HermesSource {
       this.hub.publish({ type: 'conversation_removed', source: 'hermes', id: stored });
     }
     if (this.listCache) this.listCache = { ...this.listCache, ids: this.listCache.ids.filter((x) => x !== id) };
-    if (this.listFetch) this.invalidateList();
+    if (this.listFetch || this.oneshotFetch) this.invalidateList();
+    else this.listRevision++; // Removal also invalidates moves when no listing request is in flight.
+    if (this.oneshotRows) this.oneshotRows.rows = this.oneshotRows.rows.filter((r) => r.id !== id && !runs.includes(r.id));
     this.invalidateSubagents();
   }
 
@@ -861,6 +1100,7 @@ export class HermesAdapter implements HermesSource {
     if (this.delegateRuns.has(stored)) return subagentSummary({ row }, this.defaultFolder);
     const approvals = this.approvalsFor(stored).length;
     let status: ConversationStatus = activeStatus(this.activeByStored.get(stored));
+    if (status === 'idle' && storedRunMayBeRunning(row, Date.now())) status = 'running';
     if (this.turns.has(stored) && status === 'idle') status = 'running';
     if (approvals > 0) status = 'needs_approval';
     const summary = sessionSummary(row, status, approvals, this.defaultFolder);
@@ -880,6 +1120,7 @@ export class HermesAdapter implements HermesSource {
   }
 
   private publishSummary(stored: string, turnOutcome?: TurnOutcome): void {
+    if (this.tidied.has(stored)) return;
     const conversation = this.summaryFor(stored);
     const json = JSON.stringify(conversation);
     if (turnOutcome === undefined && this.lastPublished.get(stored) === json) return;
@@ -887,12 +1128,16 @@ export class HermesAdapter implements HermesSource {
     this.hub.publish({ type: 'conversation_upsert', conversation, ...(turnOutcome ? { turnOutcome } : {}) });
   }
 
-  private scheduleListRefresh(delay = 800): void {
+  private scheduleListRefresh(delay = 800, requireComplete = false): void {
+    this.listRefreshRequiresComplete ||= requireComplete;
     clearTimeout(this.listRefresh);
     this.listRefresh = setTimeout(async () => {
+      const complete = this.listRefreshRequiresComplete;
+      this.listRefreshRequiresComplete = false;
+      this.listRefresh = undefined;
       this.invalidateList();
       try {
-        for (const c of await this.listConversations()) this.publishSummary(c.id);
+        for (const c of await this.listConversations(complete)) this.publishSummary(c.id);
       } catch {
         // surfaced through status
       }

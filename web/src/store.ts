@@ -1,3 +1,4 @@
+import { pendingMoves, revealMovedFolder } from './move';
 import { useSyncExternalStore } from 'react';
 import type { Rollout } from '../../shared/rollout.js';
 import type {
@@ -486,11 +487,15 @@ export function applyEvent(event: ServerEvent): void {
       return;
     case 'conversation_upsert': {
       const key = convKey(event.conversation.source, event.conversation.id);
+      const old = getState().conversations[key];
       setState((s) => ({ ...s, conversations: { ...s.conversations, [key]: event.conversation } }));
+      const path = event.conversation.project?.path;
+      if (old && path && old.project?.path !== path) revealMovedFolder(path);
       return;
     }
     case 'conversation_removed': {
       const key = convKey(event.source, event.id);
+      for (const move of pendingMoves) if (move.key === key) move.removed = true;
       setState((s) => {
         if (!(key in s.conversations)) return s;
         const conversations = { ...s.conversations };

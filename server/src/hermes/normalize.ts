@@ -27,6 +27,7 @@ export interface HermesSessionRow {
   parent_session_id?: string | null;
   ended_at?: number | null;
   end_reason?: string | null;
+  archived?: boolean | number | null;
   /** List rows: not ended, and written in the last 300 s. */
   is_active?: boolean | null;
   /** A compressed chat listed under its latest id: every id in the chain, and the first. */

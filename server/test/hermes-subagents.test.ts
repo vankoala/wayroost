@@ -200,7 +200,7 @@ describe('hermes sub-agents against the fake dashboard', () => {
     await expect.poll(() => adapter.status().state).toBe('connected');
   }
   const byId = (list: ConversationSummary[]) => Object.fromEntries(list.map((c) => [c.id, c]));
-  const runQueries = () => fake.listQueries.filter((q) => q.exclude_sources === 'cron,acp,subagent');
+  const runQueries = () => fake.listQueries.filter((q) => q.exclude_sources === 'cron,acp,oneshot,subagent');
   const acpQueries = () => fake.listQueries.filter((q) => q.source === 'acp');
   const calls = (method: string) => fake.calls.filter((c) => c.method === method);
 

@@ -151,6 +151,20 @@ export class FakeHermes {
   /** What `GET /api/chat/workspaces` says a chat with no folder runs in; null: an older Hermes without it. */
   defaultCwd: string | null = '/home/me';
   workspaceRequests = 0;
+  workspaceMoves: Array<{ session_key: string; cwd: string }> = [];
+  moveRefusal: string | undefined;
+
+  /** Native workspace move, also usable by socket-free adapter tests. */
+  moveWorkspace(params: Record<string, unknown>): { cwd: string; branch: null; git_repo_root: null } {
+    if (this.moveRefusal) throw new Error(this.moveRefusal);
+    const session_key = String(params.session_key);
+    const cwd = String(params.cwd);
+    const row = this.topLevel.find((r) => r.id === session_key);
+    if (!row) throw new Error('session not found');
+    this.workspaceMoves.push({ session_key, cwd });
+    row.cwd = cwd;
+    return { cwd, branch: null, git_repo_root: null };
+  }
   logins = 0;
   private seq = 0;
   private tokens = new Set<string>();
@@ -218,6 +232,27 @@ export class FakeHermes {
   private authed(req: IncomingMessage): boolean {
     const token = (req.headers.authorization ?? '').replace(/^Bearer /, '');
     return this.tokens.has(token);
+  }
+
+  /** The same list response for HTTP tests and socket-free adapter tests. */
+  sessionList(query: Record<string, string>): { sessions: Array<Record<string, unknown>>; total: number } {
+    if (query.source === 'acp') return { sessions: this.acpSessions, total: this.acpSessions.length };
+    // hermes_cli/session_listing.py: excluding `subagent` asks for the runs, given show_subagents.
+    const wantsRuns = (query.exclude_sources ?? '').split(',').includes('subagent') && this.showSubagents;
+    const excluded = (query.exclude_sources ?? '').split(',').filter((s) => s !== 'subagent');
+    const archived = query.archived ?? 'exclude';
+    const offset = Number(query.offset ?? 0);
+    const sessions = [...this.topLevel, ...(wantsRuns ? this.subagentRuns : [])]
+      .filter((row) => {
+        const isArchived = this.archived.has(String(row.id));
+        return archived === 'include' || (archived === 'only' ? isArchived : !isArchived);
+      })
+      .filter((row) => !excluded.includes(String(row.source)))
+      .filter((row) => !query.source || row.source === query.source)
+      .filter((row) => Number(row.message_count ?? 1) >= Number(query.min_messages ?? 0))
+      .filter((row) => !query.cwd_prefix || String(row.cwd ?? '').startsWith(query.cwd_prefix))
+      .slice(offset, offset + Number(query.limit ?? 20));
+    return { sessions, total: sessions.length };
   }
 
   private async http(req: IncomingMessage, res: import('node:http').ServerResponse): Promise<void> {
@@ -314,18 +349,7 @@ export class FakeHermes {
         const runs = profile && Object.hasOwn(this.profileCronRuns, profile) ? this.profileCronRuns[profile]! : this.cronRuns;
         return json(200, { sessions: runs.slice(offset, offset + Number(query.limit ?? 20)), total: runs.length });
       }
-      // hermes_cli/session_listing.py: excluding `subagent` asks for the runs, given show_subagents.
-      const wantsRuns = (query.exclude_sources ?? '').split(',').includes('subagent') && this.showSubagents;
-      const archived = query.archived ?? 'exclude';
-      const offset = Number(query.offset ?? 0);
-      const sessions = [...this.topLevel, ...(wantsRuns ? this.subagentRuns : [])]
-        .filter((row) => {
-          const isArchived = this.archived.has(String(row.id));
-          return archived === 'include' || (archived === 'only' ? isArchived : !isArchived);
-        })
-        .filter((row) => !query.cwd_prefix || String(row.cwd ?? '').startsWith(query.cwd_prefix))
-        .slice(offset, offset + Number(query.limit ?? 20));
-      return json(200, { sessions, total: sessions.length });
+      return json(200, this.sessionList(query));
     }
     const one = /^\/api\/sessions\/([^/]+)$/.exec(url.pathname);
     const oneId = one ? decodeURIComponent(one[1]!) : '';
@@ -432,6 +456,12 @@ export class FakeHermes {
           return reply({ server_requests: ['approval', 'clarify'] });
         case 'gateway.ping':
           return reply({ ok: true });
+        case 'session.workspace.move':
+          try {
+            return reply(this.moveWorkspace(frame.params ?? {}));
+          } catch (err) {
+            return ws.send(JSON.stringify({ jsonrpc: '2.0', id: frame.id, error: { code: 4017, message: (err as Error).message } }));
+          }
         case 'session.active_list':
           // Live sessions in this process only (methods_session.py `session.active_list`).
           return reply({ sessions: this.live ? [{ id: RUNTIME, session_key: this.sessionKey, status: this.status() }] : [] });
